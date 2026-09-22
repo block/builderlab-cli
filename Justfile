@@ -27,7 +27,12 @@ protos:
 
   # Download all protos without transitive deps (-i) to avoid pulling in
   # ~250 arcade/UI/franklin protos via client_renderable.proto
-  bin/schema-registry get --save-to=protos -i \
+  if ! command -v schema-registry >/dev/null 2>&1; then
+    echo "schema-registry is not a public Hermit package; install the internal CLI separately to refresh protos." >&2
+    exit 1
+  fi
+
+  schema-registry get --save-to=protos -i \
     google/api/annotations.proto \
     google/api/http.proto \
     squareup/cash/kgoose/api/v3/tool_endpoint_service.proto \
