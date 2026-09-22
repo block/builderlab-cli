@@ -17,7 +17,6 @@ concurrency:
 env:
   CI: "true"
   FORCE_COLOR: "1"
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   ci:
@@ -31,13 +30,20 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Activate Hermit
-        uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
-
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: . -> target
+
+      # Public GitHub runners cannot read Block's private hermit-packages repo.
+      # Use the pinned repository toolchain until Actions access is provisioned.
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.91.1 --profile minimal --component clippy --component rustfmt
+
+      - name: Install just
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+        with:
+          tool: just@1.48.0
 
       - name: Run repository CI
         run: just ci
