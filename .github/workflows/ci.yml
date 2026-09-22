@@ -18,10 +18,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install Hermit tools
-        run: ./bin/hermit install rustup just
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.91.1 --profile minimal --component clippy --component rustfmt
+
+      - name: Install just
+        run: cargo +1.91.1 install just --locked
 
       - name: Run repository CI
-        run: |
-          eval "$(./bin/hermit env --activate)"
-          just ci
+        run: just ci
