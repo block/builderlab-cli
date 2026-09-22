@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Hermit tools
+        run: ./bin/hermit install rustup just
+
+      - name: Run repository CI
+        run: |
+          eval "$(./bin/hermit env --activate)"
+          just ci
