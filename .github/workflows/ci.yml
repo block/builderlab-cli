@@ -10,19 +10,33 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  FORCE_COLOR: "1"
+
 jobs:
   ci:
+    name: Rust checks
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.91.1 --profile minimal --component clippy --component rustfmt
+      - name: Activate Hermit
+        uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
-      - name: Install just
-        run: cargo +1.91.1 install just --locked
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
 
       - name: Run repository CI
         run: just ci
