@@ -1,4 +1,12 @@
+# The normal GitHub UI does not offer a blank issue: a well-formed issue is the
+# supported way to participate in BuilderLab CLI, so the templates ask for what
+# we need to act on it.
+blank_issues_enabled: false
+
 contact_links:
-    - name: ❓ Questions and Help 🤔
-      url: https://discord.gg/block-opensource (/add your discord channel if applicable)
-      about: This issue tracker is not for support questions. Please refer to the community for more help. 
+  - name: Questions about using BuilderLab CLI
+    url: https://github.com/block/builderlab-cli/blob/main/README.md
+    about: The README covers setup and usage. Use an issue for a reproducible bug or actionable feature request.
+  - name: Security vulnerabilities
+    url: https://github.com/block/builderlab-cli/blob/main/SECURITY.md
+    about: Please report vulnerabilities privately, never as a public issue.
