@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/builderlab-auth"]
+resolver = "2"
+
 [package]
 name = "sq-kgoose"
 version = "0.7.12"
