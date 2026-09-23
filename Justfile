@@ -106,13 +106,15 @@ fmt-check:
   cargo fmt --all -- --check
 
 lint: fmt-check
-  cargo clippy --locked --all-targets --all-features -- -D warnings
+  cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 test:
-  cargo test --locked --all-features
+  cargo test --locked --workspace --all-features
 
 package-smoke: build-sq
   ./sqbin/{{BIN_NAME}}.exoskeleton --version
+  ./target/release/bl --version
+  ./target/release/bl --help
 
 # Build and run the isolated, deterministic Docker acceptance harness for bl skills.
 bl-cli-docker-acceptance:

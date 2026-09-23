@@ -42,3 +42,6 @@ jobs:
 
       - name: Run repository CI
         run: just ci
+
+      - name: Run isolated Docker acceptance tests
+        run: just bl-cli-docker-acceptance
