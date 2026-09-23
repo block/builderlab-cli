@@ -54,7 +54,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if self.expected_playpen:
             baggage = self.headers.get("Baggage", "")
-            if f"kgoose-builderlab-playpen={self.expected_playpen}" not in baggage:
+            if f"kgoose-builderbot-playpen={self.expected_playpen}" not in baggage:
                 self.send_error(400)
                 return False
         if self.expected_service_path and not self.path.startswith(f"{self.expected_service_path}/v1/marketplace/"):

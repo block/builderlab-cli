@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn build_query_does_not_scope_to_access_group() {
-        let query = build_query("com.squareup.builderlab.cli-auth", "default@example");
+        let query = build_query("com.squareup.builderbot.cli-auth", "default@example");
 
         assert_eq!(query.len(), 3);
         assert!(

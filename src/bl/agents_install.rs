@@ -17,7 +17,7 @@ use super::skills_archive::{extract_zip_safely, sha256_hex, verify_agent_artifac
 use super::skills_config::{default_agents_agents_dir, kgoose_service_url, SkillsConfig};
 use super::skills_targets::iso8601_utc;
 
-const RECORD_SCHEMA: &str = "bl-agent-install/v1";
+const RECORD_SCHEMA: &str = "bb-agent-install/v1";
 const LOCK_STALE_SECS: u64 = 15 * 60;
 
 #[derive(Debug, Clone)]

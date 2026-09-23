@@ -19,7 +19,7 @@
   about: Searches Square's public support-center articles (Bookshelf semantic search).
 - name: bugsnag
   about: Browse and triage Bugsnag error reports for mobile and client apps.
-- name: builderlab
+- name: builderbot
   about: BuilderLab — Block's task orchestration system for engineering automation.
 - name: ci-results
   about: Fetch CI build analysis and diagnose build failures.

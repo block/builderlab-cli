@@ -13,9 +13,9 @@ use sha2::{Digest, Sha256};
 use crate::config::kgoose_service_url;
 
 #[cfg(target_os = "macos")]
-const KEYRING_SERVICE: &str = "com.squareup.builderlab.cli-auth";
+const KEYRING_SERVICE: &str = "com.squareup.builderbot.cli-auth";
 #[cfg(target_os = "macos")]
-const LEGACY_PURPOSE_TOKEN_KEYRING_SERVICE: &str = "com.squareup.builderlab.cli-auth-purpose-token";
+const LEGACY_PURPOSE_TOKEN_KEYRING_SERVICE: &str = "com.squareup.builderbot.cli-auth-purpose-token";
 pub const BL_AUTH_STORAGE_ENV_VAR: &str = "BL_AUTH_STORAGE";
 pub const BL_AUTH_STORAGE_FILE_ENV_VAR: &str = "BL_AUTH_STORAGE_FILE";
 
@@ -561,14 +561,14 @@ mod tests {
         let key =
             SessionStorageKey::new("default", "https://kgoose.stage.sqprod.co/cash-app/goose/");
 
-        assert_eq!(KEYRING_SERVICE, "com.squareup.builderlab.cli-auth");
+        assert_eq!(KEYRING_SERVICE, "com.squareup.builderbot.cli-auth");
         assert_eq!(
             key.account(),
             "default@https://kgoose.stage.sqprod.co/cash-app/goose"
         );
         assert_eq!(
             LEGACY_PURPOSE_TOKEN_KEYRING_SERVICE,
-            "com.squareup.builderlab.cli-auth-purpose-token"
+            "com.squareup.builderbot.cli-auth-purpose-token"
         );
         assert_eq!(
             legacy_compose_token_account(&key),

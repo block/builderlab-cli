@@ -99,5 +99,5 @@ KGOOSE_BASE_URL="https://blockstaging.build" \
 - The dynamic Java app port is the port that serves `/cash-app/goose`; `8080` is the health/admin listener.
 - Non-local-dev `bl` commands require `org`; set it with `bl config set org <org>` or let interactive `bl auth login` prompt for it.
 - `KGOOSE_BASE_URL` is the pure base URL. For non-local commands, the CLI derives the org-routed host and uses the public `/api/goose` BFF prefix; set `KGOOSE_SERVICE_PATH=/cash-app/goose` when calling kgoose directly.
-- `BL_KGOOSE_PLAYPEN` routes bl backend requests with `Baggage: kgoose-builderlab-playpen=<playpen-route>`.
+- `BL_KGOOSE_PLAYPEN` routes bl backend requests with `Baggage: kgoose-builderbot-playpen=<playpen-route>`.
 - Do not log callback query strings, cookies, or returned session credentials.

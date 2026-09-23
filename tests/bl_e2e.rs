@@ -220,7 +220,7 @@ fn agent_state(bl_home: &Path, slug: &str) -> PathBuf {
 
 fn managed_agent_metadata(slug: &str, document: &[u8]) -> Value {
     json!({
-        "schema_version": "bl-agent-install/v1",
+        "schema_version": "bb-agent-install/v1",
         "kind": "agent",
         "slug": slug,
         "version_id": "agent-v1",
@@ -578,7 +578,7 @@ fn bl_agents_lifecycle_is_idempotent_and_local_queries_stay_offline() {
     );
     let persisted = serde_json::from_slice::<Value>(&fs::read(&state).expect("read state"))
         .expect("parse persisted state");
-    assert_eq!(persisted["schema_version"], "bl-agent-install/v1");
+    assert_eq!(persisted["schema_version"], "bb-agent-install/v1");
     assert_eq!(persisted["kind"], "agent");
     assert_eq!(persisted["slug"], "release-notes");
     assert_eq!(persisted["version_id"], "agent-v2");
@@ -1168,9 +1168,9 @@ fn write_installed_package(skills_home: &Path, slug: &str, content_sha: &str, ta
     fs::create_dir_all(&package).expect("create package dir");
     fs::write(package.join("SKILL.md"), "# BuilderLab Tools\n").expect("write SKILL.md");
     fs::write(
-        package.join(".bl-skills-meta.json"),
+        package.join(".bb-skills-meta.json"),
         serde_json::to_vec_pretty(&json!({
-            "schema_version": "bl-skills-install/v1",
+            "schema_version": "bb-skills-install/v1",
             "server_url": "http://marketplace.local",
             "slug": slug,
             "version_id": "ver_builtin_builderlab_tools_0_1_0",
@@ -1714,11 +1714,11 @@ fn bl_skills_env_playpen_adds_baggage_header() {
     assert_eq!(requests.len(), 2);
     assert_eq!(
         requests[0].headers.get("baggage").map(String::as_str),
-        Some("kgoose-builderlab-playpen=baxen")
+        Some("kgoose-builderbot-playpen=baxen")
     );
     assert_eq!(
         requests[1].headers.get("baggage").map(String::as_str),
-        Some("kgoose-builderlab-playpen=baxen")
+        Some("kgoose-builderbot-playpen=baxen")
     );
 }
 
@@ -2006,7 +2006,7 @@ fn bl_auth_login_env_playpen_adds_baggage_to_stored_session_check() {
     assert_eq!(requests[0].path, "/api/goose/v1/auth/me");
     assert_eq!(
         requests[0].headers.get("baggage").map(String::as_str),
-        Some("kgoose-builderlab-playpen=baxen")
+        Some("kgoose-builderbot-playpen=baxen")
     );
     fs::remove_dir_all(temp).expect("remove temp dir");
 }
@@ -2701,7 +2701,7 @@ fn bl_skills_install_downloads_verifies_and_installs_into_isolated_home() {
     let package = skills_home.join("packages/builderlab-tools");
     assert!(package.join("SKILL.md").is_file());
     let metadata = serde_json::from_slice::<Value>(
-        &fs::read(package.join(".bl-skills-meta.json")).expect("read metadata"),
+        &fs::read(package.join(".bb-skills-meta.json")).expect("read metadata"),
     )
     .expect("parse metadata");
     assert_eq!(metadata["slug"], json!("builderlab-tools"));
@@ -2951,7 +2951,7 @@ fn bl_skills_install_canonical_agents_dir_holds_real_package() {
     // The agents entry is the real package directory, not a symlink.
     let package = agents_dir.join("builderlab-tools");
     assert!(package.join("SKILL.md").is_file());
-    assert!(package.join(".bl-skills-meta.json").is_file());
+    assert!(package.join(".bb-skills-meta.json").is_file());
     assert!(!fs::symlink_metadata(&package)
         .expect("package metadata")
         .file_type()
@@ -3233,7 +3233,7 @@ fn bl_skills_install_backs_up_unmanaged_package_before_replacing_it() {
         fs::read_to_string(unmanaged.join("SKILL.md")).expect("read unmanaged skill"),
         "# BuilderLab Tools\n"
     );
-    assert!(unmanaged.join(".bl-skills-meta.json").is_file());
+    assert!(unmanaged.join(".bb-skills-meta.json").is_file());
     let backup_root = unmanaged
         .parent()
         .expect("packages directory")
@@ -3417,7 +3417,7 @@ fn bl_skills_install_local_path_installs_without_marketplace() {
     let package = temp.join("skills-home/packages/local-skill");
     assert!(package.join("SKILL.md").is_file());
     let metadata = serde_json::from_slice::<Value>(
-        &fs::read(package.join(".bl-skills-meta.json")).expect("read metadata"),
+        &fs::read(package.join(".bb-skills-meta.json")).expect("read metadata"),
     )
     .expect("parse metadata");
     assert_eq!(metadata["local_source"], json!(true));
@@ -3647,8 +3647,8 @@ fn bl_apps_help_distinguishes_external_and_internal_paths() {
     assert!(output.status.success(), "stderr was: {stderr}");
     for expected in [
         "Apps Platform",
-        "bl-block",
-        "bl-public",
+        "bb-block",
+        "bb-public",
         "Cloudflare-backed internal App Kit",
         "bl tools appkit",
         "separate internal Compose workflow",

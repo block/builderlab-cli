@@ -112,6 +112,13 @@ mod tests {
             .expect("parse embedded catalog");
 
         assert!(!extensions.is_empty());
+        // Catalog names are backend extension IDs, independent of CLI branding.
+        assert!(extensions
+            .iter()
+            .any(|extension| extension.name == "builderbot"));
+        assert!(!extensions
+            .iter()
+            .any(|extension| extension.name == "builderlab"));
     }
 
     #[test]
