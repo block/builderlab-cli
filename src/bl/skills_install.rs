@@ -426,7 +426,7 @@ fn execute_install_operation(
     persist_download(config, slug, &operation.skill.version_id, &download.bytes);
 
     let metadata = InstalledSkillMetadata {
-        schema_version: "bl-skills-install/v1".to_string(),
+        schema_version: "bb-skills-install/v1".to_string(),
         server_url: kgoose_service_url(&config.kgoose_base_url, &config.kgoose_service_path),
         slug: slug.clone(),
         version_id: operation.skill.version_id.clone(),
@@ -691,7 +691,7 @@ pub fn install_local_path(
 
     let content_sha = hash_directory(&staging)?;
     let metadata = InstalledSkillMetadata {
-        schema_version: "bl-skills-install/v1".to_string(),
+        schema_version: "bb-skills-install/v1".to_string(),
         server_url: kgoose_service_url(&config.kgoose_base_url, &config.kgoose_service_path),
         slug: slug.clone(),
         version_id: format!("local-{}", &content_sha[..12]),

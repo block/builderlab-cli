@@ -1,12 +1,12 @@
 //! External BuilderLab Apps Platform control-plane commands.
 //!
-//! This module serves only the external pilot: first in `bl-block` staging,
-//! then in the multi-tenant `bl-public` environment. It does not replace the
+//! This module serves only the external pilot: first in `bb-block` staging,
+//! then in the multi-tenant `bb-public` environment. It does not replace the
 //! existing Cloudflare-backed internal Block App Kit CLI exposed through
 //! `bl tools appkit`, and it does not migrate the separate internal Compose
 //! workflow. Both internal paths remain unchanged.
 //!
-//! The CLI sends its stored blidentity session only to the allowlisted Compose
+//! The CLI sends its stored bbidentity session only to the allowlisted Compose
 //! control-plane origins. Public ingress authorizes that session through kgoose
 //! `ext_authz` and removes it before forwarding the request internally. Compose
 //! never receives the session credential.
@@ -64,7 +64,7 @@ pub fn command() -> Command {
         .about("Manage apps through Apps Platform")
         .long_about(
             "Manage apps through the BuilderLab Apps Platform control plane on Compose, first in \
-             `bl-block` staging and then in multi-tenant `bl-public`. This does not replace the \
+             `bb-block` staging and then in multi-tenant `bb-public`. This does not replace the \
              Cloudflare-backed internal App Kit CLI (`bl tools appkit`) or migrate the separate internal \
              Compose workflow.",
         )
@@ -987,7 +987,8 @@ impl ComposeSessionCredential {
     }
 
     fn new(secret: String) -> Result<Self> {
-        let authorization = HeaderValue::from_str(&format!("BLIdentity {secret}"))
+        // Authorization scheme is a backend contract, independent of CLI branding.
+        let authorization = HeaderValue::from_str(&format!("BBIdentity {secret}"))
             .context("stored BuilderLab CLI auth session is invalid; run `bl auth login`")?;
         Ok(Self {
             authorization,
@@ -1968,7 +1969,7 @@ mod tests {
         assert_eq!(request.path, path);
         assert_eq!(
             request.headers.get("authorization").map(String::as_str),
-            Some(format!("BLIdentity {credential}").as_str())
+            Some(format!("BBIdentity {credential}").as_str())
         );
         assert_eq!(
             request
@@ -3855,7 +3856,7 @@ mod tests {
                 .authorization_header()
                 .to_str()
                 .expect("authorization text"),
-            format!("BLIdentity {secret}")
+            format!("BBIdentity {secret}")
         );
         for invalid in ["credential\r\nInjected: header", "credential\nheader"] {
             let error = ComposeSessionCredential::new(invalid.to_string())
@@ -3879,7 +3880,7 @@ mod tests {
                 .authorization_header()
                 .to_str()
                 .expect("authorization text"),
-            format!("BLIdentity {secret}")
+            format!("BBIdentity {secret}")
         );
     }
 
@@ -3923,7 +3924,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_uses_blidentity_authorization_without_identity_headers() {
+    fn control_plane_uses_bbidentity_authorization_without_identity_headers() {
         let secret = "opaque_session_credential_1234567890";
         let server = Server::http("127.0.0.1:0").expect("bind control-plane server");
         let base_url = format!("http://{}", server.server_addr());
@@ -3937,7 +3938,7 @@ mod tests {
                     .iter()
                     .find(|header| header.field.equiv("Authorization"))
                     .map(|header| header.value.as_str()),
-                Some("BLIdentity opaque_session_credential_1234567890")
+                Some("BBIdentity opaque_session_credential_1234567890")
             );
             for forbidden in [
                 "Cookie",

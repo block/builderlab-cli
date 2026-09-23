@@ -33,7 +33,8 @@ pub const BL_SKILLS_CONFIG_ENV_VAR: &str = "BL_SKILLS_CONFIG";
 pub const BL_KGOOSE_PLAYPEN_ENV_VAR: &str = "BL_KGOOSE_PLAYPEN";
 pub const KGOOSE_PLAYPEN_ENV_VAR: &str = "KGOOSE_PLAYPEN";
 pub const DEFAULT_CONFIG_FILE_NAME: &str = "skills.yaml";
-pub const META_FILE_NAME: &str = ".bl-skills-meta.json";
+// Persistent ownership marker shared with existing bb installs; not a product name.
+pub const META_FILE_NAME: &str = ".bb-skills-meta.json";
 #[derive(Debug, Clone, Default)]
 pub struct SkillsProfileResolveOptions {
     pub local_dev: bool,

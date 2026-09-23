@@ -139,7 +139,7 @@ impl MarketplaceClient {
         if let Some(playpen) = &config.playpen {
             headers.insert(
                 "Baggage",
-                HeaderValue::from_str(&format!("kgoose-builderlab-playpen={playpen}"))
+                HeaderValue::from_str(&format!("kgoose-builderbot-playpen={playpen}"))
                     .context("build marketplace Baggage header")?,
             );
         }

@@ -35,6 +35,13 @@ cargo build --locked --bin bl
 ./target/debug/bl --version
 ```
 
+Service access requires an existing BuilderLab account and a reachable backend.
+The inherited default is Block's internal `https://kgoose.sqprod.co`; building
+this public repository does not grant access to that service. For another
+BuilderLab installation, set `KGOOSE_BASE_URL` to the base URL supplied by its
+operator before logging in. Organization configuration does not replace that
+base URL.
+
 Authenticate before using commands that access BuilderLab services:
 
 ```bash
@@ -143,3 +150,20 @@ integration.
 - [Security policy](SECURITY.md)
 - [Block Open Source governance](GOVERNANCE.md)
 - [Apache License 2.0](LICENSE)
+
+## Moving from `bb`
+
+The executable and environment variables now use `bl` and `BL_`. The default
+state directory is `~/.bl`; existing `~/.bb` preferences and agent installation
+records are not automatically moved. To continue using that state, explicitly
+set `BL_HOME="$HOME/.bb"` before running `bl`, and translate any `BB_` overrides
+to their `BL_` equivalents. Keep the same backend URL and profile to reuse a
+stored session. macOS keychain IDs and skill/agent ownership metadata retain
+their legacy names so existing credentials and managed installs remain usable.
+Do not use `--force` just to adopt an existing installation.
+
+The backend `X-BB-Session-Credential` header, `BBIdentity` authorization scheme,
+`builderbot` extension ID, and
+Playpen routing key are protocol identifiers and retain their existing names.
+On Linux and Windows, keyring login storage is not implemented; the explicit
+`BL_AUTH_STORAGE=file` option is available as described in the local auth guide.

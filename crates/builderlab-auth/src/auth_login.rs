@@ -195,8 +195,9 @@ pub fn auth_url(server_url: &str, path: &str) -> Result<Url> {
     Ok(url)
 }
 
+// Backend routing contract; preserve this key across CLI product renames.
 pub fn playpen_baggage(playpen: Option<&str>) -> Option<String> {
-    playpen.map(|playpen| format!("kgoose-builderlab-playpen={playpen}"))
+    playpen.map(|playpen| format!("kgoose-builderbot-playpen={playpen}"))
 }
 
 #[cfg(test)]

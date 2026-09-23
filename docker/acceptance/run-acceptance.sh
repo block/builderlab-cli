@@ -78,9 +78,9 @@ PY
 assert_mock_result() {
   package="$BL_SKILLS_PACKAGES_DIR/docker-harness"
   test -f "$package/SKILL.md" || fail "mock install did not create the skills-only package"
-  test -f "$package/.bl-skills-meta.json" || fail "mock install did not create BL metadata"
-  grep -q 'bl-skills-install/v1' "$package/.bl-skills-meta.json" || fail "mock metadata has unexpected schema"
-  grep -q 'bundle:default' "$package/.bl-skills-meta.json" || fail "mock metadata lacks bundle provenance"
+  test -f "$package/.bb-skills-meta.json" || fail "mock install did not create BL metadata"
+  grep -q 'bb-skills-install/v1' "$package/.bb-skills-meta.json" || fail "mock metadata has unexpected schema"
+  grep -q 'bundle:default' "$package/.bb-skills-meta.json" || fail "mock metadata lacks bundle provenance"
   test -f "$BL_SKILLS_PACKAGES_DIR/unmanaged/sentinel.txt" || fail "mock install removed unmanaged sentinel"
   assert_idempotent_result "$RUN_ROOT/repeat-install.json" "repeat install"
   assert_idempotent_result "$RUN_ROOT/update.json" "update"
