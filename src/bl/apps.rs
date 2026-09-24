@@ -56,7 +56,8 @@ const CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const CONTROL_PLANE_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
     "compose-ctrl.test.blockstaging.build",
-    "compose-ctrl.app.builderlab.xyz",
+    "compose-ctrl.apps.builderlab.xyz",
+    "compose-ctrl.apps.builderlabstaging.xyz",
 ];
 
 pub fn command() -> Command {
@@ -3890,7 +3891,10 @@ mod tests {
 
         for trusted in [
             "https://compose-ctrl.test.blockstaging.build",
-            "https://compose-ctrl.app.builderlab.xyz",
+            "https://compose-ctrl.apps.builderlab.xyz",
+            "https://compose-ctrl.apps.builderlab.xyz:443",
+            "https://compose-ctrl.apps.builderlabstaging.xyz",
+            "https://compose-ctrl.apps.builderlabstaging.xyz:443",
             "https://compose-ctrl.test.blockstaging.build:443",
         ] {
             assert!(
@@ -3904,10 +3908,19 @@ mod tests {
             "https://attacker.example",
             "https://test.blockstaging.build",
             "https://app.builderlab.xyz",
+            "https://compose-ctrl.app.builderlab.xyz",
+            "https://compose-ctrl.app.builderlabstaging.xyz",
+            "http://compose-ctrl.apps.builderlab.xyz",
+            "https://user@compose-ctrl.apps.builderlab.xyz",
             "https://compose-ctrl.test.blockstaging.build.attacker.example",
             "https://compose-ctrl.test.blockstaging.build:444",
-            "https://compose-ctrl.app.builderlab.xyz.attacker.example",
-            "https://compose-ctrl.app.builderlab.xyz:444",
+            "https://compose-ctrl.apps.builderlab.xyz.attacker.example",
+            "https://compose-ctrl.apps.builderlab.xyz:444",
+            "http://compose-ctrl.apps.builderlabstaging.xyz",
+            "https://compose-ctrl.apps.builderlabstaging.xyz.attacker.example",
+            "https://compose-ctrl.apps.builderlabstaging.xyz:444",
+            "https://user@compose-ctrl.apps.builderlabstaging.xyz",
+            "https://app.builderlabstaging.xyz",
             "https://user@compose-ctrl.test.blockstaging.build",
             "http://localhost:8080",
             "https://localhost:8080",
