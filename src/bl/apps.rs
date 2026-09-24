@@ -376,6 +376,11 @@ pub fn command() -> Command {
                 ))
                 .subcommand(control_plane_args(
                     Command::new("set")
+                        .arg(Arg::new("expected-revision")
+                            .long("expected-revision")
+                            .value_name("REVISION")
+                            .value_parser(clap::value_parser!(u64))
+                            .help("Require the access_revision from access get; fail if the policy changed or the server lacks revision protection"))
                         .about("Replace an app's visibility and explicit viewer list")
                         .long_about(
                             "Replace an app's complete access policy. For restricted visibility, \
@@ -859,6 +864,7 @@ fn run_access_set(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         );
     }
     let request = AccessRequest {
+        expected_revision: matches.get_one::<u64>("expected-revision").copied(),
         visibility,
         viewers,
         environment: matches.get_one::<String>("environment").map(String::as_str),
@@ -913,6 +919,8 @@ struct DeleteAppRequest<'a> {
 
 #[derive(Serialize)]
 struct AccessRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<u64>,
     visibility: &'a str,
     viewers: Vec<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1350,6 +1358,16 @@ impl ControlPlaneClient {
         app_id: &str,
         request: &AccessRequest<'_>,
     ) -> Result<Value> {
+        if request.expected_revision.is_some() {
+            let contract = self.contract(credential)?;
+            if contract
+                .pointer("/access_policy/expected_revision")
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                anyhow::bail!("this Apps Platform server does not advertise access revision protection; no access update was sent");
+            }
+        }
         let url = self.app_resource_url(app_id, "access", &[])?;
         let path = url.path().to_string();
         self.authorized_json_request(credential, "PUT", &path, |authorization| {
@@ -4530,6 +4548,70 @@ mod tests {
     }
 
     #[test]
+    fn access_revision_guard_requires_support_and_never_retries_conflicts() {
+        for supported in [false, true] {
+            let server = Server::http("127.0.0.1:0").expect("bind server");
+            let base_url = format!("http://{}", server.server_addr());
+            let server_thread = thread::spawn(move || {
+                let request = server.recv().expect("contract request");
+                assert_eq!(request.method().as_str(), "GET");
+                assert_eq!(request.url(), "/v1/agent/contract");
+                request
+                    .respond(
+                        Response::from_string(
+                            json!({"access_policy": {"expected_revision": supported}}).to_string(),
+                        )
+                        .with_header(
+                            Header::from_bytes("Content-Type", "application/json").unwrap(),
+                        ),
+                    )
+                    .unwrap();
+                if supported {
+                    let mut request = server.recv().expect("conditional update");
+                    assert_eq!(request.method().as_str(), "PUT");
+                    let mut body = String::new();
+                    request.as_reader().read_to_string(&mut body).unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&body).unwrap(),
+                        json!({"visibility":"restricted", "viewers":["auth0|alice"], "expected_revision":7})
+                    );
+                    request
+                        .respond(
+                            Response::from_string(r#"{"error":"access_revision_conflict"}"#)
+                                .with_status_code(409),
+                        )
+                        .unwrap();
+                }
+                assert!(
+                    server
+                        .recv_timeout(Duration::from_millis(300))
+                        .unwrap()
+                        .is_none(),
+                    "must not send an unguarded update or retry"
+                );
+            });
+            let client = test_control_plane_client(&base_url, Duration::from_secs(2));
+            let credential = test_credential("revision_test_credential_123456");
+            let error = client
+                .set_access(
+                    &credential,
+                    "app",
+                    &AccessRequest {
+                        expected_revision: Some(7),
+                        visibility: "restricted",
+                        viewers: vec!["auth0|alice"],
+                        environment: None,
+                    },
+                )
+                .unwrap_err();
+            if !supported {
+                assert!(error.to_string().contains("no access update was sent"));
+            }
+            server_thread.join().unwrap();
+        }
+    }
+
+    #[test]
     fn access_get_and_set_support_each_environment_and_viewer_shape() {
         let server = Server::http("127.0.0.1:0").expect("bind control-plane server");
         let base_url = format!("http://{}", server.server_addr());
@@ -4588,11 +4670,13 @@ mod tests {
         let credential = test_credential("access_environment_session_credential_123456");
 
         let organization = AccessRequest {
+            expected_revision: None,
             visibility: "organization",
             viewers: vec![],
             environment: None,
         };
         let restricted = AccessRequest {
+            expected_revision: None,
             visibility: "restricted",
             viewers: vec!["auth0|alice", "auth0|bob"],
             environment: Some("staging/west?cell=1"),
