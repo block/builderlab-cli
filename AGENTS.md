@@ -79,7 +79,7 @@ sq agent-tools linear --help
 - `docs/sq-overview.md` covers the repo and packaged CLI at a high level.
 - `docs/sq-integration.md` covers how `sq` discovers and integrates the packaged module.
 - `docs/RELEASING-sq.md` covers the Homebrew-backed `sq` command-pack release path.
-- `docs/RELEASING-bl.md` covers building the `bl` CLI binary consumed by Berd.app.
+- `docs/RELEASING-bl.md` covers building `bl` and the current distribution status.
 
 External docs: https://clig.dev/llms.txt -> guide you can consult to write better command-line programs, taking traditional UNIX principles and updating them for the modern day.
 

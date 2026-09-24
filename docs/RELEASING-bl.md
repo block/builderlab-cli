@@ -1,12 +1,12 @@
-# Building `bl`
+# Building and distributing `bl`
 
-`bl-cli` owns the Rust `bl` binary. It no longer owns standalone app,
-installer, archive, DMG, MSI, package, or platform-specific distribution.
-Berd.app bundles the `bl` binary and manages the `/usr/local/bin/bl` command
-link from the app.
+This repository owns the BuilderLab CLI. It can be built and used independently
+of Berd or Buzz. The intended distribution options include standalone downloads
+and installation or updates assisted by those applications. The release and
+update mechanisms are still being worked out.
 
 The Homebrew-backed `sq` command-pack release path is separate and documented in
-`docs/RELEASING-sq.md`.
+[RELEASING-sq.md](RELEASING-sq.md).
 
 ## Local Build
 
@@ -31,32 +31,12 @@ target/release/bl --version
 target/release/bl --help
 ```
 
-## Berd Integration
+## Distribution status
 
-Berd packages `bl` by copying a built binary into the app resources during the
-Berd bundle flow. In the parent app repo, this is handled by:
+For now, build `bl` from source using the commands above. This repository does
+not yet provide a standalone installer or published binary release workflow.
 
-```text
-scripts/prepare-bl-cli-resource.sh
-```
-
-The packaged app exposes the command from:
-
-```text
-Berd.app/Contents/Resources/bl
-```
-
-Berd.app owns installing or repairing:
-
-```text
-/usr/local/bin/bl -> /Applications/Berd.app/Contents/Resources/bl
-```
-
-## Ownership
-
-Do not add standalone `bl` app, installer, platform archive, DMG, MSI, package,
-or Homebrew distribution back to this package. Distribution flows through
-Berd.app.
-
-When changing `bl`, update and merge the version in `Cargo.toml`, run the normal
-`bl-cli` checks, and validate the Berd bundle path that consumes the binary.
+Future distribution should support users who want BuilderLab capabilities
+without installing Berd or Buzz. App-assisted installation and updates are
+also planned; packaging, signing, installation paths, and update behavior
+are not specified here yet.

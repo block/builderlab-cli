@@ -137,11 +137,10 @@ just build-bl-release
 target/release/bl --version
 ```
 
-This repository owns the `bl` binary. Application packaging and the installed
-command link are managed by the consuming BuilderLab application; this repo
-does not provide standalone installers or platform archives. See
-[RELEASING-bl.md](docs/RELEASING-bl.md) for the release boundary and packaging
-integration.
+This repository owns the `bl` binary, which can be used independently of Berd
+or Buzz. Standalone downloads and app-assisted installation or updates are
+planned; for now, build from source. See [RELEASING-bl.md](docs/RELEASING-bl.md)
+for the current build and distribution status.
 
 ## Contributing
 
