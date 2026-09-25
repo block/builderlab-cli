@@ -874,7 +874,8 @@ fn run_share(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         .context("expected workspace id")?;
     let (client, credential) = control_plane_context(config, action_matches)?;
     let current = client.get_access(&credential, app_id, None)?;
-    if current.get("visibility").and_then(Value::as_str) != Some("restricted") {
+    if action == "grant" && current.get("visibility").and_then(Value::as_str) != Some("restricted")
+    {
         anyhow::bail!("workspace sharing requires restricted app visibility");
     }
     let lifecycle_id = current
