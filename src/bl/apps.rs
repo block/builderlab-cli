@@ -1443,13 +1443,22 @@ impl ControlPlaneClient {
             })?
             .extend(["sharing", "workspaces", workspace_id]);
         let path = request_path(&url);
+        let method = match action {
+            "grant" => "POST",
+            "revoke" => "DELETE",
+            _ => anyhow::bail!("unsupported workspace sharing action"),
+        };
         let body = json!({
             "lifecycle_id": lifecycle_id,
-            "action": action,
             "expected_revision": expected_revision,
         });
-        self.authorized_json_request(credential, "POST", &path, |authorization| {
-            self.standard_request(self.client.post(url.clone()), authorization)
+        self.authorized_json_request(credential, method, &path, |authorization| {
+            let request = if method == "POST" {
+                self.client.post(url.clone())
+            } else {
+                self.client.delete(url.clone())
+            };
+            self.standard_request(request, authorization)
                 .json(&body)
                 .build()
                 .context("build Apps Platform workspace sharing request")
@@ -4711,29 +4720,31 @@ mod tests {
         let server = Server::http("127.0.0.1:0").expect("bind control-plane server");
         let base_url = format!("http://{}", server.server_addr());
         let server_thread = thread::spawn(move || {
-            let mut request = server.recv().expect("receive sharing request");
-            assert_eq!(request.method().as_str(), "POST");
-            assert_eq!(
-                request.url(),
-                "/v1/agent/apps/my-app/sharing/workspaces/team-workspace"
-            );
-            let mut body = String::new();
-            request
-                .as_reader()
-                .read_to_string(&mut body)
-                .expect("read body");
-            assert_eq!(
-                serde_json::from_str::<Value>(&body).expect("parse body"),
-                json!({"lifecycle_id":"life-123","action":"grant","expected_revision":4})
-            );
-            request
-                .respond(
-                    Response::from_string(r#"{"ok":true}"#).with_header(
-                        Header::from_bytes("Content-Type", "application/json")
-                            .expect("build content type"),
-                    ),
-                )
-                .expect("respond to sharing request");
+            for method in ["POST", "DELETE"] {
+                let mut request = server.recv().expect("receive sharing request");
+                assert_eq!(request.method().as_str(), method);
+                assert_eq!(
+                    request.url(),
+                    "/v1/agent/apps/my-app/sharing/workspaces/team-workspace"
+                );
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("read body");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&body).expect("parse body"),
+                    json!({"lifecycle_id":"life-123","expected_revision":if method == "POST" { 4 } else { 5 }})
+                );
+                request
+                    .respond(
+                        Response::from_string(r#"{"ok":true}"#).with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("build content type"),
+                        ),
+                    )
+                    .expect("respond to sharing request");
+            }
         });
         let client = test_control_plane_client(&base_url, Duration::from_secs(2));
         let credential = test_credential("sharing_session_credential_123456789012345");
@@ -4747,6 +4758,17 @@ mod tests {
                 4,
             )
             .expect("update workspace grant");
+        assert_eq!(response["ok"], true);
+        let response = client
+            .update_workspace_grant(
+                &credential,
+                "my-app",
+                "team-workspace",
+                "life-123",
+                "revoke",
+                5,
+            )
+            .expect("revoke workspace grant");
         assert_eq!(response["ok"], true);
         server_thread.join().expect("join control-plane server");
     }
