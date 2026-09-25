@@ -61,6 +61,69 @@ Use `--json` for machine-readable output and `--verbose` for request
 diagnostics. Do not include credentials or other sensitive data when sharing
 verbose output.
 
+## Apps quota and recovery
+
+Use the same control plane and account for inspection, deletion, and retry.
+An app's Compose environment is part of its deletion target; do not substitute
+a workspace or a different environment.
+
+```bash
+bl apps list --scope owned --include-deleted --base-url <control-plane-url> --json
+bl apps get <app-id> --environment <environment> --base-url <control-plane-url> --json
+```
+
+The owned list preserves the server's optional `quota` metadata:
+
+- `current_count` is authoritative owner usage, including reservations. The
+  list's `count` describes visible apps, not quota usage.
+- `enforcement_enabled: true` means the server enforces the current tier's
+  `max_sites` for new app lifecycles. When accounting is enabled but enforcement
+  is off, those values are informational. The CLI does not enforce a local limit.
+- A resolved tier includes `tier`, `max_sites`, `remaining`, and `over_limit`.
+  These describe the owner's current tier, not a past admission decision.
+- With `tier_status: unavailable`, apps and `current_count` remain available,
+  but tier-derived fields are absent. Do not reuse a previously reported limit.
+- If accounting is disabled or its inventory is not ready, `quota` is absent.
+  Its absence does not mean zero usage or unlimited capacity.
+
+Existing apps continue serving and remain manageable above the limit. Inspect
+them before choosing what to delete; publishing and deployment timestamps do
+not establish when an app was last used. A downgrade can require several
+deletions before another admission fits. Refresh the owned list rather than
+subtracting deletions from a local count.
+
+With `--json`, errors on stderr retain the backend `error.code`,
+`error.details`, and top-level `next_action` when supplied. Use these fields,
+not message matching. Reflected session credentials are redacted and terminal
+control characters are escaped. Unsafe object keys cause the affected recovery
+field to be omitted. The CLI does not echo raw backend error messages.
+
+| Error code | What to do |
+| --- | --- |
+| `owner_site_limit_reached` | Inspect your owned sites. The details include current usage, the limit, and `owned_sites_url` on the same control plane. Delete only an app you no longer need, then refresh usage before an explicit retry. |
+| `tier_resolution_unavailable` | The current tier could not be resolved. Keep inspecting and managing existing apps; retry new creation explicitly after recovery. |
+| `owner_site_quota_unavailable` | The server could not determine quota safely. Inspect current state before deciding whether to retry. |
+| `owner_site_quota_maintenance` | Quota maintenance temporarily blocks mutations, which can include deletion. Serving and read-only inspection remain available. Wait for recovery before an explicit retry. |
+| `owner_site_quota_misconfigured` | Contact the installation operator. Repeated creation attempts will not correct the configuration. |
+
+Deletion requires the exact app ID and environment twice:
+
+```bash
+bl apps delete <app-id> --environment <environment> \
+  --confirm-app-id <app-id> --confirm-environment <environment> \
+  --base-url <control-plane-url> --json
+```
+
+Logical deletion retires the route immediately. Durable logical deletion
+releases quota before later physical cleanup. Cleanup can remain incomplete
+without the app still serving or holding a slot. After success, an error, or a
+timeout, inspect the exact app/environment and refresh the owned list, including
+deleted apps. Do not assume an uncertain response released quota or that the
+app is still active. Retry creation explicitly only after the server confirms
+capacity. The CLI does not automatically delete apps or retry ambiguous writes.
+For an interrupted creation that reserved an app, repeating the same create
+command retains the existing reservation-reconciliation behavior.
+
 ## Local development
 
 Install the repository tools and git hooks once:

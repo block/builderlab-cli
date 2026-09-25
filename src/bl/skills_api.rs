@@ -38,6 +38,7 @@ pub struct CliFailure {
     pub code: String,
     pub message: String,
     pub details: Option<Value>,
+    pub next_action: Option<Value>,
 }
 
 impl CliFailure {
@@ -47,18 +48,23 @@ impl CliFailure {
             code: code.to_string(),
             message: message.into(),
             details: None,
+            next_action: None,
         }
     }
 
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut payload = json!({
             "error": {
                 "code": self.code,
                 "message": self.message,
                 "exit_code": self.exit_code,
                 "details": self.details,
             }
-        })
+        });
+        if let Some(next_action) = &self.next_action {
+            payload["next_action"] = next_action.clone();
+        }
+        payload
     }
 }
 
@@ -347,6 +353,7 @@ impl MarketplaceClient {
             details: serde_json::from_slice::<Value>(body)
                 .ok()
                 .and_then(|value| value.get("error").cloned()),
+            next_action: None,
         }))
     }
 }
