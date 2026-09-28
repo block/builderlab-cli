@@ -325,6 +325,7 @@ fn agent_conflict(slug: &str, path: &std::path::Path, reason: String) -> anyhow:
             "path": path,
             "reason": reason,
         })),
+        next_action: None,
     })
 }
 

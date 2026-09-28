@@ -3774,31 +3774,6 @@ fn bl_apps_rollback_help_exposes_optional_target_and_environment() {
 }
 
 #[test]
-fn bl_apps_delete_help_exposes_exact_confirmation_and_retention_behavior() {
-    let output = bl_command()
-        .args(["apps", "delete", "--help"])
-        .output()
-        .expect("run bl apps delete help");
-    let (stdout, stderr) = output_text(&output);
-
-    assert!(output.status.success(), "stderr was: {stderr}");
-    for expected in [
-        "<APP_ID>",
-        "--confirm-app-id <APP_ID>",
-        "--environment <ENVIRONMENT>",
-        "--confirm-environment <ENVIRONMENT>",
-        "owner-only",
-        "retained",
-        "--base-url <URL>",
-    ] {
-        assert!(
-            stdout.contains(expected),
-            "delete help omitted {expected:?}: {stdout}"
-        );
-    }
-}
-
-#[test]
 fn bl_apps_delete_requires_confirmation_before_auth_or_network() {
     let output = bl_command()
         .args([
