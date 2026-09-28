@@ -45,3 +45,38 @@ jobs:
 
       - name: Run isolated Docker acceptance tests
         run: just bl-cli-docker-acceptance
+
+  staging-test-binary:
+    name: Staging test binary (${{ matrix.arch }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Activate Hermit
+        uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+        with:
+          cache: "true"
+
+      - name: Build bl
+        run: cargo build --locked --release --bin bl
+
+      - name: Upload short-lived staging test binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bl-linux-${{ matrix.arch }}-${{ github.sha }}
+          path: target/release/bl
+          if-no-files-found: error
+          retention-days: 3
