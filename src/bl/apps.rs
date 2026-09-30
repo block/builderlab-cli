@@ -1,7 +1,7 @@
 //! External BuilderLab Apps Platform control-plane commands.
 //!
-//! This module serves only the external pilot: first in `bb-block` staging,
-//! then in the multi-tenant `bb-public` environment. It does not replace the
+//! This module serves only the external BuilderLab Apps Platform pilot in
+//! `bb-block` and the multi-tenant `bb-public` environment. It does not replace the
 //! existing Cloudflare-backed internal Block App Kit CLI exposed through
 //! `bl tools appkit`, and it does not migrate the separate internal Compose
 //! workflow. Both internal paths remain unchanged.
@@ -56,6 +56,7 @@ const CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const CONTROL_PLANE_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
     "compose-ctrl.test.blockstaging.build",
+    "compose-ctrl.block.builderlab.xyz",
     "compose-ctrl.apps.builderlab.xyz",
     "compose-ctrl.apps.builderlabstaging.xyz",
 ];
@@ -64,8 +65,8 @@ pub fn command() -> Command {
     Command::new("apps")
         .about("Manage apps through Apps Platform")
         .long_about(
-            "Manage apps through the BuilderLab Apps Platform control plane on Compose, first in \
-             `bb-block` staging and then in multi-tenant `bb-public`. This does not replace the \
+            "Manage apps through the BuilderLab Apps Platform control plane on Compose in \
+             `bb-block` and multi-tenant `bb-public`. This does not replace the \
              Cloudflare-backed internal App Kit CLI (`bl tools appkit`) or migrate the separate internal \
              Compose workflow.",
         )
@@ -4067,6 +4068,8 @@ mod tests {
 
         for trusted in [
             "https://compose-ctrl.test.blockstaging.build",
+            "https://compose-ctrl.block.builderlab.xyz",
+            "https://compose-ctrl.block.builderlab.xyz:443",
             "https://compose-ctrl.apps.builderlab.xyz",
             "https://compose-ctrl.apps.builderlab.xyz:443",
             "https://compose-ctrl.apps.builderlabstaging.xyz",
@@ -4090,6 +4093,10 @@ mod tests {
             "https://user@compose-ctrl.apps.builderlab.xyz",
             "https://compose-ctrl.test.blockstaging.build.attacker.example",
             "https://compose-ctrl.test.blockstaging.build:444",
+            "http://compose-ctrl.block.builderlab.xyz",
+            "https://user@compose-ctrl.block.builderlab.xyz",
+            "https://compose-ctrl.block.builderlab.xyz.attacker.example",
+            "https://compose-ctrl.block.builderlab.xyz:444",
             "https://compose-ctrl.apps.builderlab.xyz.attacker.example",
             "https://compose-ctrl.apps.builderlab.xyz:444",
             "http://compose-ctrl.apps.builderlabstaging.xyz",
