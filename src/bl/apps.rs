@@ -648,20 +648,28 @@ fn reconcile_create_reservation(
                 Ok(existing)
                     if is_matching_incomplete_reservation(&existing, app_id, mutation_request) =>
                 {
-                    Ok((
-                        json!({
-                            "ok": true,
-                            "app_id": app_id,
-                            "external_url": plan.get("external_url").cloned().unwrap_or(Value::Null),
-                            "reconciled": true,
-                            "app": existing.get("app").cloned().unwrap_or(Value::Null),
-                        }),
-                        true,
-                    ))
+                    let mut reservation = json!({
+                        "ok": true,
+                        "app_id": app_id,
+                        "external_url": plan.get("external_url").cloned().unwrap_or(Value::Null),
+                        "reconciled": true,
+                        "app": existing.get("app").cloned().unwrap_or(Value::Null),
+                    });
+                    retain_response_trace_id(
+                        &mut reservation,
+                        response_value_trace_id(&existing).as_deref(),
+                    );
+                    if let Some(trace_id) = failure_trace_id(&reserve_error) {
+                        reservation["reserve_trace_id"] = json!(trace_id);
+                    }
+                    Ok((reservation, true))
                 }
-                Ok(_) if reservation_outcome_is_unknown(&reserve_error) => {
-                    let mismatch = anyhow::anyhow!(
-                        "the inspected app was not the same caller-owned, incomplete reservation"
+                Ok(existing) if reservation_outcome_is_unknown(&reserve_error) => {
+                    let mismatch = correlate_response_error(
+                        anyhow::anyhow!(
+                            "the inspected app was not the same caller-owned, incomplete reservation"
+                        ),
+                        &existing,
                     );
                     Err(reservation_outcome_unknown(
                         app_id,
@@ -3286,8 +3294,8 @@ mod tests {
         let auth_server = ProcessServer::start(vec![process_auth_response()]);
         let control_plane = ProcessServer::start(vec![
             ProcessResponse::json(plan),
-            ProcessResponse::raw(201, "{"),
-            ProcessResponse::json(existing_reservation),
+            ProcessResponse::raw(201, "{").with_trace_id(DEPLOYMENT_TRACE_ID),
+            ProcessResponse::json(existing_reservation).with_trace_id(REQUEST_TRACE_ID),
             ProcessResponse::json(initialized),
         ]);
         let mut command = process_command(
@@ -3320,6 +3328,11 @@ mod tests {
         let value = serde_json::from_str::<Value>(&process_stdout(&output))
             .expect("parse reconciled create output");
         assert_eq!(value["reservation_reconciled"], true);
+        assert_eq!(value["reservation"]["trace_id"], REQUEST_TRACE_ID);
+        assert_eq!(
+            value["reservation"]["reserve_trace_id"],
+            DEPLOYMENT_TRACE_ID
+        );
         assert_eq!(value["initialized"], true);
         let auth_requests = auth_server.finish();
         let requests = control_plane.finish();
@@ -3371,7 +3384,7 @@ mod tests {
         let control_plane = ProcessServer::start(vec![
             ProcessResponse::json(plan),
             ProcessResponse::raw(201, "{"),
-            ProcessResponse::json(existing_reservation),
+            ProcessResponse::json(existing_reservation).with_trace_id(REQUEST_TRACE_ID),
         ]);
         let mut command = process_command(
             &auth_server,
@@ -3405,6 +3418,7 @@ mod tests {
         let value = serde_json::from_str::<Value>(&process_stdout(&output))
             .expect("parse reconciled reserve-only output");
         assert_eq!(value["reservation_reconciled"], true);
+        assert_eq!(value["reservation"]["trace_id"], REQUEST_TRACE_ID);
         assert_eq!(value["initialized"], false);
         assert_eq!(value["initialize"], Value::Null);
         let auth_requests = auth_server.finish();
@@ -3475,6 +3489,64 @@ mod tests {
                 "merchant-lookup",
                 &mutation_request
             ));
+        }
+    }
+
+    #[test]
+    fn bl_apps_create_retains_inspection_id_on_reservation_mismatch() {
+        for reserve_trace_id in [None, Some(DEPLOYMENT_TRACE_ID)] {
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let mut reserve = ProcessResponse::raw(201, "{");
+            if let Some(trace_id) = reserve_trace_id {
+                reserve = reserve.with_trace_id(trace_id);
+            }
+            let control_plane = ProcessServer::start(vec![
+                ProcessResponse::json(json!({
+                    "app_id": "app",
+                    "initialize": {"required": false, "recommended": false}
+                })),
+                reserve,
+                ProcessResponse::json(json!({
+                    "ok": true,
+                    "app": {"app_id": "app", "role": "publisher"},
+                    "versions": []
+                }))
+                .with_trace_id(REQUEST_TRACE_ID),
+            ]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "create",
+                    "--app-id",
+                    "app",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--client-version",
+                    "0.2.0",
+                    "--json",
+                ],
+                "apps-e2e-only.reservation-mismatch.trace",
+            )
+            .output()
+            .expect("run create with mismatched inspected reservation");
+            let payload = process_error(&output);
+            assert_eq!(payload["error"]["code"], "reservation_outcome_unknown");
+            assert_eq!(payload["error"]["exit_code"], exit_codes::NETWORK);
+            assert_eq!(
+                payload["error"]["trace_id"],
+                reserve_trace_id.unwrap_or(REQUEST_TRACE_ID)
+            );
+            let message = payload["error"]["message"].as_str().unwrap();
+            assert!(message.contains(&format!("trace_id={REQUEST_TRACE_ID}")));
+            assert!(message.contains("not the same caller-owned, incomplete reservation"));
+            auth_server.finish();
+            assert_eq!(
+                control_plane.finish().len(),
+                3,
+                "do not initialize a mismatched reservation"
+            );
         }
     }
 

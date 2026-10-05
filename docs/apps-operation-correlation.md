@@ -34,6 +34,11 @@ overwriting it. A later `ready` or `debug` request has its own `trace_id`; use
 individual response IDs inside its `plan`, `reservation`, and `initialize`
 objects rather than assigning one ID to several HTTP requests. A server that
 does not return correlation metadata produces the existing output shape.
+For a reconciled reservation, `reservation.trace_id` identifies the inspection
+request that confirmed the existing reservation. `reservation.reserve_trace_id`
+retains the original reserve response ID when it was available, even if its body
+was unreadable. Unknown-outcome failures
+prefer the original reserve response ID, falling back to the inspection ID.
 
 ## Boundaries and rollout
 
