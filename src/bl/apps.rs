@@ -35,7 +35,7 @@ use super::display::{print_json, terminal_safe_text, Style};
 use super::runner;
 #[cfg(test)]
 use super::skills_api::failure_info;
-use super::skills_api::{exit_codes, failure, CliFailure};
+use super::skills_api::{exit_codes, failure, failure_trace_id, with_failure_trace_id, CliFailure};
 use super::skills_config::SkillsConfig;
 
 const APPS_BASE_URL_ENV_VAR: &str = "BL_APPS_CONTROL_PLANE_URL";
@@ -50,6 +50,7 @@ const APPS_CONTRACT_PATH: &str = "/v1/agent/contract";
 const APPS_PLAN_PATH: &str = "/v1/agent/apps/plan";
 const MAX_DEBUG_TAIL_LINES: u16 = 1000;
 const HOTPOD_AGENT_CLIENT_VERSION_HEADER: &str = "X-Hotpod-Agent-Client-Version";
+const HOTPOD_TRACE_ID_HEADER: &str = "X-Hotpod-Trace-Id";
 // Compose may synchronously wait up to two minutes for an initialize or
 // deploy rollout. Leave enough headroom for the response to traverse ingress.
 const CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3 * 60);
@@ -566,20 +567,23 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let plan = client.plan(&credential, &request)?;
     let app_id = required_response_string(&plan, "app_id", "Apps Platform plan")?.to_string();
     if let Some(requested_app_id) = requested_app_id {
-        require_exact_app_id("plan", requested_app_id, &app_id)?;
+        require_exact_app_id("plan", requested_app_id, &app_id)
+            .map_err(|error| correlate_response_error(error, &plan))?;
     }
     let initialize_required = plan
         .pointer("/initialize/required")
         .and_then(Value::as_bool)
         .context(
             "Apps Platform plan response did not include boolean initialize.required; refusing to reserve the app",
-        )?;
+        )
+        .map_err(|error| correlate_response_error(error, &plan))?;
     let initialize_recommended = plan
         .pointer("/initialize/recommended")
         .and_then(Value::as_bool)
         .context(
             "Apps Platform plan response did not include boolean initialize.recommended; refusing to reserve the app",
-        )?;
+        )
+        .map_err(|error| correlate_response_error(error, &plan))?;
     let plan_requests_initialize = initialize_required || initialize_recommended;
     let mutation_request = mutation_request_from_plan(&plan);
     let (reservation, reservation_reconciled) =
@@ -594,7 +598,8 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
             })?;
         let initialized_app_id =
             required_response_string(&response, "app_id", "Apps Platform initialize")?;
-        require_exact_app_id("initialize", &app_id, initialized_app_id)?;
+        require_exact_app_id("initialize", &app_id, initialized_app_id)
+            .map_err(|error| correlate_response_error(error, &response))?;
         Some(response)
     } else {
         None
@@ -633,7 +638,8 @@ fn reconcile_create_reservation(
         Ok(reservation) => {
             let reserved_app_id =
                 required_response_string(&reservation, "app_id", "Apps Platform reserve")?;
-            require_exact_app_id("reserve", app_id, reserved_app_id)?;
+            require_exact_app_id("reserve", app_id, reserved_app_id)
+                .map_err(|error| correlate_response_error(error, &reservation))?;
             Ok((reservation, false))
         }
         Err(reserve_error) => {
@@ -741,7 +747,7 @@ fn reservation_outcome_unknown(
     let environment_argument = environment
         .map(|value| format!(" --environment {value}"))
         .unwrap_or_default();
-    failure(
+    let error = failure(
         exit_codes::NETWORK,
         "reservation_outcome_unknown",
         format!(
@@ -750,6 +756,10 @@ fn reservation_outcome_unknown(
              inspection_error: {inspect_error:#}\n\
              next_action: Run `bl apps get {app_id}{environment_argument}`. If it reports a caller-owned app with route_status `idle`, retry the same `bl apps create` command; the retry will reconcile that reservation and continue initialization."
         ),
+    );
+    with_failure_trace_id(
+        error,
+        failure_trace_id(reserve_error).or_else(|| failure_trace_id(inspect_error)),
     )
 }
 
@@ -881,17 +891,22 @@ fn run_share(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     };
     if action == "grant" && current.get("visibility").and_then(Value::as_str) != Some("restricted")
     {
-        anyhow::bail!("workspace sharing requires restricted app visibility");
+        return Err(correlate_response_error(
+            anyhow::anyhow!("workspace sharing requires restricted app visibility"),
+            &current,
+        ));
     }
     let lifecycle_id = current
         .get("lifecycle_id")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .context("app has no active sharing lifecycle")?;
+        .context("app has no active sharing lifecycle")
+        .map_err(|error| correlate_response_error(error, &current))?;
     let expected_revision = current
         .get("workspace_grant_revision")
         .and_then(Value::as_u64)
-        .context("app sharing response has no workspace grant revision")?;
+        .context("app sharing response has no workspace grant revision")
+        .map_err(|error| correlate_response_error(error, &current))?;
     let response = client.update_workspace_grant(
         &credential,
         app_id,
@@ -1026,6 +1041,7 @@ fn required_response_string<'a>(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .with_context(|| format!("{description} response did not include {field}"))
+        .map_err(|error| correlate_response_error(error, value))
 }
 
 fn validate_artifact_path(path: &Path) -> Result<()> {
@@ -1086,6 +1102,7 @@ struct ControlPlaneClient {
     base_url: String,
     client_version: HeaderValue,
     client_version_text: String,
+    traceparent: Option<HeaderValue>,
     style: Style,
 }
 
@@ -1174,6 +1191,10 @@ impl ControlPlaneClient {
             base_url: base_url.to_string(),
             client_version,
             client_version_text,
+            traceparent: std::env::var("TRACEPARENT")
+                .ok()
+                .as_deref()
+                .and_then(inherited_traceparent),
             style,
         })
     }
@@ -1351,21 +1372,37 @@ impl ControlPlaneClient {
             .execute_request(http_request)
             .map_err(|_| delete_outcome_unknown())?;
         let status = response.status();
+        let trace_id = response_header_trace_id(&response)
+            .filter(|trace_id| credential.redact(trace_id) == *trace_id);
         let body = read_limited_response_body(
             response,
             CONTROL_PLANE_RESPONSE_MAX_BYTES,
             "Apps Platform control-plane",
         )
-        .map_err(|_| delete_outcome_unknown())?;
+        .map_err(|_| with_failure_trace_id(delete_outcome_unknown(), trace_id.as_deref()))?;
+        let trace_id = trace_id.or_else(|| {
+            response_body_trace_id(&body)
+                .filter(|trace_id| credential.redact(trace_id) == *trace_id)
+        });
         self.style
             .verbose(&format!("DELETE {path} -> {status} ({} bytes)", body.len()));
         if !status.is_success() {
-            return Err(control_plane_http_failure(
-                "DELETE", &path, status, &body, credential,
+            return Err(with_failure_trace_id(
+                control_plane_http_failure("DELETE", &path, status, &body, credential),
+                trace_id.as_deref(),
             ));
         }
-        let mut value = serde_json::from_str(&body).map_err(|_| delete_outcome_unknown())?;
-        redact_json_value(&mut value, credential).map_err(|_| delete_outcome_unknown())?;
+        let mut value: Value = serde_json::from_str(&body)
+            .map_err(|_| with_failure_trace_id(delete_outcome_unknown(), trace_id.as_deref()))?;
+        if !value.is_object() {
+            return Err(with_failure_trace_id(
+                delete_outcome_unknown(),
+                trace_id.as_deref(),
+            ));
+        }
+        redact_json_value(&mut value, credential)
+            .map_err(|_| with_failure_trace_id(delete_outcome_unknown(), trace_id.as_deref()))?;
+        retain_response_trace_id(&mut value, trace_id.as_deref());
         Ok(value)
     }
 
@@ -1555,14 +1592,18 @@ impl ControlPlaneClient {
         request: RequestBuilder,
         authorization: HeaderValue,
     ) -> RequestBuilder {
-        request
+        let request = request
             .header(USER_AGENT, apps_user_agent())
             .header(ACCEPT, "application/json")
             .header(
                 HOTPOD_AGENT_CLIENT_VERSION_HEADER,
                 self.client_version.clone(),
             )
-            .header(AUTHORIZATION, authorization)
+            .header(AUTHORIZATION, authorization);
+        match &self.traceparent {
+            Some(traceparent) => request.header("traceparent", traceparent.clone()),
+            None => request,
+        }
     }
 
     fn authorized_json_request<F>(
@@ -1576,26 +1617,38 @@ impl ControlPlaneClient {
         F: Fn(HeaderValue) -> Result<Request>,
     {
         let authorization = credential.authorization_header();
-        let (status, body) = self.request_response(method, path, &send, authorization)?;
+        let (status, body, trace_id) =
+            self.request_response(credential, method, path, &send, authorization)?;
         if !status.is_success() {
-            return Err(control_plane_http_failure(
-                method, path, status, &body, credential,
+            return Err(with_failure_trace_id(
+                control_plane_http_failure(method, path, status, &body, credential),
+                trace_id.as_deref(),
             ));
         }
-        let mut value = serde_json::from_str(&body)
-            .with_context(|| format!("parse Apps Platform {method} {path} response"))?;
+        let mut value: Value = serde_json::from_str(&body)
+            .with_context(|| format!("parse Apps Platform {method} {path} response"))
+            .map_err(|error| with_failure_trace_id(error, trace_id.as_deref()))?;
+        if !value.is_object() {
+            return Err(with_failure_trace_id(
+                anyhow::anyhow!("Apps Platform {method} {path} response was not a JSON object"),
+                trace_id.as_deref(),
+            ));
+        }
         redact_json_value(&mut value, credential)
-            .with_context(|| format!("sanitize Apps Platform {method} {path} response"))?;
+            .with_context(|| format!("sanitize Apps Platform {method} {path} response"))
+            .map_err(|error| with_failure_trace_id(error, trace_id.as_deref()))?;
+        retain_response_trace_id(&mut value, trace_id.as_deref());
         Ok(value)
     }
 
     fn request_response<F>(
         &self,
+        credential: &ComposeSessionCredential,
         method: &str,
         path: &str,
         send: &F,
         authorization: HeaderValue,
-    ) -> Result<(StatusCode, String)>
+    ) -> Result<(StatusCode, String, Option<String>)>
     where
         F: Fn(HeaderValue) -> Result<Request>,
     {
@@ -1605,16 +1658,24 @@ impl ControlPlaneClient {
             .execute_request(request)
             .map_err(|error| network_failure(method, path, error))?;
         let status = response.status();
+        // Capture correlation before the bounded reader consumes the response.
+        let trace_id = response_header_trace_id(&response)
+            .filter(|trace_id| credential.redact(trace_id) == *trace_id);
         let body = read_limited_response_body(
             response,
             CONTROL_PLANE_RESPONSE_MAX_BYTES,
             "Apps Platform control-plane",
-        )?;
+        )
+        .map_err(|error| with_failure_trace_id(error, trace_id.as_deref()))?;
+        let trace_id = trace_id.or_else(|| {
+            response_body_trace_id(&body)
+                .filter(|trace_id| credential.redact(trace_id) == *trace_id)
+        });
         self.style.verbose(&format!(
             "{method} {path} -> {status} ({} bytes)",
             body.len()
         ));
-        Ok((status, body))
+        Ok((status, body, trace_id))
     }
 
     fn execute_request(&self, request: Request) -> reqwest::Result<Response> {
@@ -1631,6 +1692,72 @@ fn request_path(url: &url::Url) -> String {
         Some(query) => format!("{}?{query}", url.path()),
         None => url.path().to_string(),
     }
+}
+
+// Forward context without creating a CLI span or changing the caller's sampling
+// decision. Future versions retain the known W3C prefix and opaque suffix.
+fn inherited_traceparent(value: &str) -> Option<HeaderValue> {
+    let bytes = value.as_bytes();
+    if !(55..=512).contains(&bytes.len())
+        || !bytes.iter().all(|byte| (b'!'..=b'~').contains(byte))
+        || bytes[2] != b'-'
+        || bytes[35] != b'-'
+        || bytes[52] != b'-'
+        || !lowercase_hex(&bytes[..2])
+        || &bytes[..2] == b"ff"
+        || !lowercase_hex(&bytes[3..35])
+        || bytes[3..35].iter().all(|byte| *byte == b'0')
+        || !lowercase_hex(&bytes[36..52])
+        || bytes[36..52].iter().all(|byte| *byte == b'0')
+        || !lowercase_hex(&bytes[53..55])
+        || (bytes.len() > 55 && (&bytes[..2] == b"00" || bytes[55] != b'-'))
+    {
+        return None;
+    }
+    HeaderValue::from_str(value).ok()
+}
+
+fn lowercase_hex(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn canonical_trace_id(value: &str) -> Option<String> {
+    (value.len() == 32
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value.bytes().any(|byte| byte != b'0'))
+    .then(|| value.to_ascii_lowercase())
+}
+
+fn response_header_trace_id(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get(HOTPOD_TRACE_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(canonical_trace_id)
+}
+
+fn response_value_trace_id(value: &Value) -> Option<String> {
+    [value.get("trace_id"), value.pointer("/error/trace_id")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find_map(canonical_trace_id)
+}
+
+fn response_body_trace_id(body: &str) -> Option<String> {
+    response_value_trace_id(&serde_json::from_str::<Value>(body).ok()?)
+}
+
+fn retain_response_trace_id(value: &mut Value, trace_id: Option<&str>) {
+    if let (Some(object), Some(trace_id)) = (value.as_object_mut(), trace_id) {
+        object.insert("trace_id".to_string(), json!(trace_id));
+    }
+}
+
+fn correlate_response_error(error: anyhow::Error, response: &Value) -> anyhow::Error {
+    with_failure_trace_id(error, response_value_trace_id(response).as_deref())
 }
 
 fn build_control_plane_http_client(timeout: Duration) -> Result<Client> {
@@ -1843,6 +1970,7 @@ mod tests {
     struct ProcessResponse {
         status: u16,
         body: String,
+        trace_id: Option<String>,
     }
 
     impl ProcessResponse {
@@ -1850,6 +1978,7 @@ mod tests {
             Self {
                 status: 200,
                 body: body.to_string(),
+                trace_id: None,
             }
         }
 
@@ -1857,6 +1986,7 @@ mod tests {
             Self {
                 status,
                 body: body.to_string(),
+                trace_id: None,
             }
         }
 
@@ -1864,7 +1994,13 @@ mod tests {
             Self {
                 status,
                 body: body.into(),
+                trace_id: None,
             }
+        }
+
+        fn with_trace_id(mut self, trace_id: &str) -> Self {
+            self.trace_id = Some(trace_id.to_string());
+            self
         }
     }
 
@@ -1930,15 +2066,20 @@ mod tests {
                             body,
                             body_bytes,
                         });
+                    let mut http_response = Response::from_string(response.body)
+                        .with_status_code(response.status)
+                        .with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("build Apps process content type"),
+                        );
+                    if let Some(trace_id) = response.trace_id {
+                        http_response.add_header(
+                            Header::from_bytes(HOTPOD_TRACE_ID_HEADER, trace_id)
+                                .expect("build Apps process trace header"),
+                        );
+                    }
                     request
-                        .respond(
-                            Response::from_string(response.body)
-                                .with_status_code(response.status)
-                                .with_header(
-                                    Header::from_bytes("Content-Type", "application/json")
-                                        .expect("build Apps process content type"),
-                                ),
-                        )
+                        .respond(http_response)
                         .expect("respond to Apps process request");
                 }
             });
@@ -2057,6 +2198,7 @@ mod tests {
             .env_remove("KGOOSE_BASE_URL")
             .env_remove("BL_SKILLS_PROFILE")
             .env_remove("KGOOSE_PLAYPEN");
+        command.env_remove("TRACEPARENT");
         command
     }
 
@@ -3631,6 +3773,8 @@ mod tests {
             credential,
         );
 
+        let traceparent = format!("00-{REQUEST_TRACE_ID}-1234567890abcdef-00");
+        command.env("TRACEPARENT", &traceparent);
         let output = command.output().expect("run Apps deploy process command");
         assert!(output.status.success());
         assert_eq!(
@@ -3648,6 +3792,8 @@ mod tests {
             "/v1/agent/apps/merchant-lookup/deploy",
             credential,
         );
+        assert_eq!(requests[0].headers.get("traceparent"), Some(&traceparent));
+        assert!(!auth_requests[0].headers.contains_key("traceparent"));
         let body = String::from_utf8_lossy(&requests[0].body_bytes);
         for expected in [
             "test-hotpod-artifact-marker",
@@ -4021,6 +4167,484 @@ mod tests {
 
     fn test_credential(secret: &str) -> ComposeSessionCredential {
         ComposeSessionCredential::new(secret.to_string()).expect("build test credential")
+    }
+
+    const REQUEST_TRACE_ID: &str = "1234567890abcdef1234567890abcdef";
+    const DEPLOYMENT_TRACE_ID: &str = "abcdef1234567890abcdef1234567890";
+
+    fn process_error(output: &std::process::Output) -> Value {
+        assert!(!output.status.success());
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .find_map(|line| serde_json::from_str::<Value>(line).ok())
+            .expect("structured CLI error on stderr")
+    }
+
+    #[test]
+    fn bl_apps_process_preserves_inherited_context_only_on_compose_requests() {
+        for flags in ["00", "01"] {
+            let credential = "apps-e2e-only.trace-success.session+credential";
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![ProcessResponse::json(json!({
+                "ok": true,
+                "trace_id": DEPLOYMENT_TRACE_ID,
+                "deployment_trace_id": DEPLOYMENT_TRACE_ID,
+                "version_id": "ver-123"
+            }))
+            .with_trace_id(REQUEST_TRACE_ID)]);
+            let traceparent = format!("00-{REQUEST_TRACE_ID}-1234567890abcdef-{flags}");
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "ready",
+                    "app",
+                    "--version-id",
+                    "ver-123",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--client-version",
+                    "0.2.0",
+                    "--json",
+                ],
+                credential,
+            )
+            .env("TRACEPARENT", &traceparent)
+            .output()
+            .expect("run correlated readiness command");
+            assert!(output.status.success(), "{output:?}");
+            let value: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
+            assert_eq!(value["trace_id"], REQUEST_TRACE_ID);
+            assert_eq!(value["deployment_trace_id"], DEPLOYMENT_TRACE_ID);
+            assert_eq!(value["version_id"], "ver-123");
+            let auth_requests = auth_server.finish();
+            assert_process_auth(&auth_requests[0], credential);
+            assert!(!auth_requests[0].headers.contains_key("traceparent"));
+            let requests = control_plane.finish();
+            assert_process_control_plane(
+                &requests[0],
+                "GET",
+                "/v1/agent/apps/app/ready?version_id=ver-123",
+                credential,
+            );
+            assert_eq!(requests[0].headers.get("traceparent"), Some(&traceparent));
+        }
+    }
+
+    #[test]
+    fn bl_apps_process_retains_header_and_body_error_ids_and_ignores_bad_context() {
+        let credential = "apps-e2e-only.trace-failure.session+credential";
+        for (header, body, expected_id, expected_exit) in [
+            (
+                Some(REQUEST_TRACE_ID),
+                json!({"error":{"code":"not_found"}, "trace_id":DEPLOYMENT_TRACE_ID}),
+                Some(REQUEST_TRACE_ID),
+                exit_codes::GENERAL,
+            ),
+            (
+                None,
+                json!({"error":{"code":"not_found"}, "trace_id":DEPLOYMENT_TRACE_ID}),
+                Some(DEPLOYMENT_TRACE_ID),
+                exit_codes::GENERAL,
+            ),
+            (
+                Some("malformed"),
+                json!({"error":{"code":"not_found", "trace_id":REQUEST_TRACE_ID}}),
+                Some(REQUEST_TRACE_ID),
+                exit_codes::GENERAL,
+            ),
+            (
+                Some("00000000000000000000000000000000"),
+                json!({"trace_id":"bad-id"}),
+                None,
+                exit_codes::GENERAL,
+            ),
+            (
+                Some(REQUEST_TRACE_ID),
+                json!({"error":{"code":"session_expired"}}),
+                Some(REQUEST_TRACE_ID),
+                exit_codes::AUTH_REQUIRED,
+            ),
+        ] {
+            let status = if expected_exit == exit_codes::AUTH_REQUIRED {
+                401
+            } else {
+                404
+            };
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let mut response = ProcessResponse::json_status(status, body);
+            if let Some(header) = header {
+                response = response.with_trace_id(header);
+            }
+            let control_plane = ProcessServer::start(vec![response]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "get",
+                    "app",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--client-version",
+                    "0.2.0",
+                    "--json",
+                ],
+                credential,
+            )
+            .env("TRACEPARENT", "00-invalid-context")
+            .output()
+            .expect("run correlated failing command");
+            let error = process_error(&output);
+            assert_eq!(error["error"]["exit_code"], expected_exit);
+            assert_eq!(
+                error["error"]["trace_id"],
+                expected_id.map(Value::from).unwrap_or(Value::Null)
+            );
+            if let Some(id) = expected_id {
+                assert!(error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("trace_id={id}")));
+            }
+            auth_server.finish();
+            let requests = control_plane.finish();
+            assert_eq!(requests.len(), 1, "no auth retry");
+            assert!(!requests[0].headers.contains_key("traceparent"));
+        }
+    }
+
+    #[test]
+    fn bl_apps_create_process_retains_ids_through_protocol_and_domain_errors() {
+        for body in [
+            "not-json".to_string(),
+            "[]".to_string(),
+            json!({}).to_string(),
+            json!({"app_id":"replacement"}).to_string(),
+            json!({"app_id":"app", "initialize":{"required":false}}).to_string(),
+        ] {
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![
+                ProcessResponse::raw(200, body).with_trace_id(REQUEST_TRACE_ID)
+            ]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "create",
+                    "--app-id",
+                    "app",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--client-version",
+                    "0.2.0",
+                    "--json",
+                ],
+                "apps-e2e-only.trace-protocol.session",
+            )
+            .output()
+            .expect("run protocol failure command");
+            let error = process_error(&output);
+            assert_eq!(error["error"]["trace_id"], REQUEST_TRACE_ID);
+            assert_eq!(error["error"]["exit_code"], exit_codes::GENERAL);
+            auth_server.finish();
+            assert_eq!(
+                control_plane.finish().len(),
+                1,
+                "never reserve invalid plan"
+            );
+        }
+    }
+
+    #[test]
+    fn bl_apps_share_process_retains_trace_on_validation_failures() {
+        for body in [
+            json!({"visibility":"organization"}),
+            json!({"visibility":"restricted"}),
+            json!({"visibility":"restricted", "lifecycle_id":"life-123"}),
+        ] {
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![
+                ProcessResponse::json(body).with_trace_id(REQUEST_TRACE_ID)
+            ]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "share",
+                    "grant",
+                    "app",
+                    "test-workspace",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--client-version",
+                    "0.2.0",
+                    "--json",
+                ],
+                "apps-e2e-only.trace-share.session",
+            )
+            .output()
+            .expect("run invalid share command");
+            assert_eq!(
+                process_error(&output)["error"]["trace_id"],
+                REQUEST_TRACE_ID
+            );
+            auth_server.finish();
+            assert_eq!(
+                control_plane.finish().len(),
+                1,
+                "never mutate invalid sharing state"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_retains_response_id_through_http_and_unknown_outcome_failures() {
+        for (status, body, expected_code, expected_exit) in [
+            (
+                200,
+                vec![b'x'; CONTROL_PLANE_RESPONSE_MAX_BYTES + 1],
+                "delete_outcome_unknown",
+                exit_codes::NETWORK,
+            ),
+            (
+                200,
+                b"[]".to_vec(),
+                "delete_outcome_unknown",
+                exit_codes::NETWORK,
+            ),
+            (
+                403,
+                json!({"error":{"code":"access_denied"}, "trace_id":DEPLOYMENT_TRACE_ID})
+                    .to_string()
+                    .into_bytes(),
+                "access_denied",
+                exit_codes::FORBIDDEN,
+            ),
+        ] {
+            let server = Server::http("127.0.0.1:0").unwrap();
+            let client = test_control_plane_client(
+                &format!("http://{}", server.server_addr()),
+                Duration::from_secs(2),
+            );
+            let server_thread = thread::spawn(move || {
+                server
+                    .recv()
+                    .unwrap()
+                    .respond(
+                        Response::from_data(body)
+                            .with_status_code(status)
+                            .with_header(
+                                Header::from_bytes(HOTPOD_TRACE_ID_HEADER, REQUEST_TRACE_ID)
+                                    .unwrap(),
+                            ),
+                    )
+                    .unwrap();
+            });
+            let error = client
+                .delete_app(
+                    &test_credential("delete_trace_session_credential"),
+                    "app",
+                    &DeleteAppRequest {
+                        environment: "staging",
+                    },
+                )
+                .expect_err("delete failure");
+            let (exit_code, payload) = failure_info(&error);
+            assert_eq!(exit_code, expected_exit);
+            assert_eq!(payload["error"]["code"], expected_code);
+            assert_eq!(payload["error"]["trace_id"], REQUEST_TRACE_ID);
+            server_thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn response_correlation_cannot_echo_a_session_credential() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let client = test_control_plane_client(
+            &format!("http://{}", server.server_addr()),
+            Duration::from_secs(2),
+        );
+        let server_thread = thread::spawn(move || {
+            server
+                .recv()
+                .unwrap()
+                .respond(
+                    Response::from_string(json!({"trace_id":REQUEST_TRACE_ID}).to_string())
+                        .with_status_code(403)
+                        .with_header(
+                            Header::from_bytes(HOTPOD_TRACE_ID_HEADER, REQUEST_TRACE_ID).unwrap(),
+                        ),
+                )
+                .unwrap();
+        });
+        let error = client
+            .contract(&test_credential(REQUEST_TRACE_ID))
+            .expect_err("request failure");
+        let payload = failure_info(&error).1;
+        assert!(payload["error"].get("trace_id").is_none());
+        assert!(!payload.to_string().contains(REQUEST_TRACE_ID));
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn inherited_traceparent_validation_preserves_flags_and_rejects_invalid_headers() {
+        for flags in ["00", "01", "09", "ff"] {
+            let value = format!("00-{REQUEST_TRACE_ID}-1234567890abcdef-{flags}");
+            assert_eq!(
+                inherited_traceparent(&value).unwrap().to_str().unwrap(),
+                value
+            );
+        }
+        let valid = format!("00-{REQUEST_TRACE_ID}-1234567890abcdef-00");
+        for value in [
+            String::new(),
+            valid.to_uppercase(),
+            format!("{valid}-extra"),
+            valid.replace(REQUEST_TRACE_ID, "00000000000000000000000000000000"),
+            valid.replace("-1234567890abcdef-", "-0000000000000000-"),
+            valid.replacen("00-", "ff-", 1),
+            valid.replace("-00", "-gg"),
+            format!(" {valid}"),
+            format!("{valid}\r\nx-secret: value"),
+            valid.replace(REQUEST_TRACE_ID, "é234567890abcdef1234567890abcdef"),
+        ] {
+            assert!(
+                inherited_traceparent(&value).is_none(),
+                "accepted {value:?}"
+            );
+        }
+        let future = valid.replacen("00-", "01-", 1) + "-opaque";
+        assert_eq!(
+            inherited_traceparent(&future).unwrap().to_str().unwrap(),
+            future
+        );
+        assert!(inherited_traceparent(&(future + &"a".repeat(512))).is_none());
+    }
+
+    #[test]
+    fn control_plane_retains_trace_id_on_bounded_decode_and_sanitize_failures() {
+        let credential = test_credential("trace_read_session_credential_123456");
+        for (status, body, expected_message) in [
+            (
+                200,
+                vec![b'x'; CONTROL_PLANE_RESPONSE_MAX_BYTES + 1],
+                "exceeded",
+            ),
+            (
+                503,
+                vec![b'x'; CONTROL_PLANE_RESPONSE_MAX_BYTES + 1],
+                "exceeded",
+            ),
+            (200, vec![0xff], "UTF-8"),
+            (200, b"not-json".to_vec(), "parse Apps Platform"),
+            (
+                200,
+                json!({"trace_read_session_credential_123456":"secret"})
+                    .to_string()
+                    .into_bytes(),
+                "sanitize Apps Platform",
+            ),
+        ] {
+            let server = Server::http("127.0.0.1:0").unwrap();
+            let client = test_control_plane_client(
+                &format!("http://{}", server.server_addr()),
+                Duration::from_secs(2),
+            );
+            let server_thread = thread::spawn(move || {
+                server
+                    .recv()
+                    .unwrap()
+                    .respond(
+                        Response::from_data(body)
+                            .with_status_code(status)
+                            .with_header(
+                                Header::from_bytes(HOTPOD_TRACE_ID_HEADER, REQUEST_TRACE_ID)
+                                    .unwrap(),
+                            ),
+                    )
+                    .unwrap();
+            });
+            let error = client
+                .contract(&credential)
+                .expect_err("reject unreadable response");
+            let (exit_code, payload) = failure_info(&error);
+            assert_eq!(exit_code, exit_codes::GENERAL);
+            assert_eq!(payload["error"]["trace_id"], REQUEST_TRACE_ID);
+            assert!(format!("{error:#}").contains(expected_message));
+            assert!(!payload.to_string().contains(&credential.secret));
+            server_thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn control_plane_retains_trace_id_after_response_body_connection_closes() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = test_control_plane_client(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            Duration::from_secs(2),
+        );
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() <= 8192);
+            }
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n{HOTPOD_TRACE_ID_HEADER}: {REQUEST_TRACE_ID}\r\nConnection: close\r\n\r\n{{").unwrap();
+        });
+        let error = client
+            .contract(&test_credential("read_failure_session_credential"))
+            .expect_err("incomplete body fails");
+        assert_eq!(
+            failure_info(&error).1["error"]["trace_id"],
+            REQUEST_TRACE_ID
+        );
+        assert!(format!("{error:#}").contains("read Apps Platform"));
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn trace_context_does_not_change_failure_classification_or_wrapped_ids() {
+        let error = with_failure_trace_id(
+            failure(exit_codes::FORBIDDEN, "access_denied", "denied"),
+            Some(REQUEST_TRACE_ID),
+        )
+        .context("initialization failed");
+        let (exit_code, payload) = failure_info(&error);
+        assert_eq!(exit_code, exit_codes::FORBIDDEN);
+        assert_eq!(payload["error"]["code"], "access_denied");
+        assert_eq!(payload["error"]["trace_id"], REQUEST_TRACE_ID);
+        assert!(payload["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("initialization failed"));
+        assert!(!reservation_outcome_is_unknown(&error));
+        let reserve_error =
+            with_failure_trace_id(anyhow::anyhow!("bad response"), Some(REQUEST_TRACE_ID));
+        assert!(reservation_outcome_is_unknown(&reserve_error));
+        let wrapped = reservation_outcome_unknown("app", None, &reserve_error, &error);
+        assert_eq!(
+            failure_info(&wrapped).1["error"]["trace_id"],
+            REQUEST_TRACE_ID
+        );
+        assert_eq!(
+            canonical_trace_id(&REQUEST_TRACE_ID.to_uppercase()).as_deref(),
+            Some(REQUEST_TRACE_ID)
+        );
+        for invalid in [
+            "bad",
+            "00000000000000000000000000000000",
+            "1234567890abcdef1234567890abcde\n",
+        ] {
+            assert!(canonical_trace_id(invalid).is_none());
+        }
     }
 
     #[test]
@@ -4511,7 +5135,9 @@ mod tests {
             let request = server.recv().expect("receive delete request");
             assert_eq!(request.method().as_str(), "DELETE");
             request
-                .respond(Response::from_string("not-json"))
+                .respond(Response::from_string("not-json").with_header(
+                    Header::from_bytes(HOTPOD_TRACE_ID_HEADER, REQUEST_TRACE_ID).unwrap(),
+                ))
                 .expect("respond with unreadable success body");
         });
         let client = test_control_plane_client(&base_url, Duration::from_secs(2));
@@ -4529,6 +5155,7 @@ mod tests {
             .expect_err("reject unreadable delete success response");
         let (exit_code, payload) = failure_info(&error);
         assert_eq!(exit_code, exit_codes::NETWORK);
+        assert_eq!(payload["error"]["trace_id"], REQUEST_TRACE_ID);
         assert_eq!(payload["error"]["code"], "delete_outcome_unknown");
         let message = payload["error"]["message"]
             .as_str()
