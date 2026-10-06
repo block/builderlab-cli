@@ -90,6 +90,39 @@ impl std::error::Error for SilentJsonExit {}
 
 /// Finds the exit code and JSON payload for an error chain, defaulting to 1.
 pub fn failure_info(error: &anyhow::Error) -> (i32, Value) {
+    let (exit_code, mut payload) = uncorrelated_failure_info(error);
+    if let Some(trace_id) = failure_trace_id(error) {
+        payload["error"]["trace_id"] = json!(trace_id);
+    }
+    (exit_code, payload)
+}
+
+pub fn failure_trace_id(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<FailureTraceId>()
+        .map(|trace_id| trace_id.0.as_str())
+}
+
+/// Attach a server correlation ID without replacing an error's type or exit code.
+pub fn with_failure_trace_id(error: anyhow::Error, trace_id: Option<&str>) -> anyhow::Error {
+    match trace_id {
+        Some(trace_id) => error.context(FailureTraceId(trace_id.to_string())),
+        None => error,
+    }
+}
+
+#[derive(Debug)]
+struct FailureTraceId(String);
+
+impl std::fmt::Display for FailureTraceId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "trace_id={}", self.0)
+    }
+}
+
+impl std::error::Error for FailureTraceId {}
+
+fn uncorrelated_failure_info(error: &anyhow::Error) -> (i32, Value) {
     for cause in error.chain() {
         if let Some(cli) = cause.downcast_ref::<CliFailure>() {
             let mut payload = cli.to_json();

@@ -61,6 +61,9 @@ Use `--json` for machine-readable output and `--verbose` for request
 diagnostics. Do not include credentials or other sensitive data when sharing
 verbose output.
 
+For inherited Apps Platform trace context and failure correlation, see
+[Apps operation correlation](docs/apps-operation-correlation.md).
+
 ## Local development
 
 Install the repository tools and git hooks once:
