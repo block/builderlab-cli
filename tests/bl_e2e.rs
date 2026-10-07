@@ -4062,6 +4062,72 @@ fn bl_apps_access_help_points_to_visibility_and_keeps_hidden_replacement_working
 }
 
 #[test]
+fn bl_apps_publishers_help_explains_roles_and_exact_subjects() {
+    let group_output = bl_command()
+        .args(["apps", "publishers", "--help"])
+        .output()
+        .expect("run bl apps publishers help");
+    let (group_stdout, group_stderr) = output_text(&group_output);
+    assert!(group_output.status.success(), "stderr was: {group_stderr}");
+    for expected in [
+        "list",
+        "add",
+        "remove",
+        "deploy, roll back, and inspect",
+        "Only the original owner",
+        "publishers, access, sharing, and deletion",
+        "workspace-scoped installations",
+        "bl apps list --json",
+        "bb-public",
+        "publishers_unsupported",
+    ] {
+        assert!(
+            group_stdout.contains(expected),
+            "publishers help omitted {expected:?}: {group_stdout}"
+        );
+    }
+
+    let list_output = bl_command()
+        .args(["apps", "publishers", "list", "--help"])
+        .output()
+        .expect("run bl apps publishers list help");
+    let (list_stdout, list_stderr) = output_text(&list_output);
+    assert!(list_output.status.success(), "stderr was: {list_stderr}");
+    for expected in [
+        "<APP_ID>",
+        "--environment <ENVIRONMENT>",
+        "--base-url <URL>",
+    ] {
+        assert!(
+            list_stdout.contains(expected),
+            "publishers list help omitted {expected:?}: {list_stdout}"
+        );
+    }
+
+    for action in ["add", "remove"] {
+        let output = bl_command()
+            .args(["apps", "publishers", action, "--help"])
+            .output()
+            .expect("run bl apps publishers mutation help");
+        let (stdout, stderr) = output_text(&output);
+        assert!(output.status.success(), "stderr was: {stderr}");
+        for expected in [
+            "<APP_ID>",
+            "--publisher <IDENTITY>",
+            "case-sensitive",
+            "bl apps list --json",
+            "--environment <ENVIRONMENT>",
+            "--base-url <URL>",
+        ] {
+            assert!(
+                stdout.contains(expected),
+                "publishers {action} help omitted {expected:?}: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
 fn bl_apps_access_set_requires_explicit_restricted_viewer_clearing_before_auth_or_network() {
     let output = bl_command()
         .args([
