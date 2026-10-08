@@ -361,6 +361,7 @@ pub fn command() -> Command {
                         .arg(Arg::new("app-id").required(true).value_name("APP_ID"))
                         .arg(Arg::new("email").long("email").required(true).value_name("EMAIL"))
                         .arg(Arg::new("role").long("role").required(true).value_parser(["viewer", "publisher"]))
+                        .arg(Arg::new("environment").long("environment").value_name("ENVIRONMENT"))
                 )),
         )
         .subcommand(
@@ -906,8 +907,12 @@ fn run_people(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         anyhow::bail!("an exact email address is required");
     }
     let role = resolve.get_one::<String>("role").context("expected role")?;
+    let environment = resolve
+        .get_one::<String>("environment")
+        .map(|value| vec![("environment", value.clone())])
+        .unwrap_or_default();
     let (client, credential) = control_plane_context(config, resolve)?;
-    print_json(&client.resolve_person(&credential, app_id, email, role)?)
+    print_json(&client.resolve_person(&credential, app_id, email, role, &environment)?)
 }
 
 fn run_access(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
@@ -1505,8 +1510,9 @@ impl ControlPlaneClient {
         app_id: &str,
         email: &str,
         role: &str,
+        query: &[(&str, String)],
     ) -> Result<Value> {
-        let mut url = self.app_url(app_id, &[])?;
+        let mut url = self.app_url(app_id, query)?;
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("invalid Apps Platform URL"))?
             .extend(["people", "resolve"]);
@@ -2574,6 +2580,8 @@ mod tests {
                 APPROVED_TEST_BASE_URL,
                 "--client-version",
                 "0.2.0",
+                "--environment",
+                "staging",
                 "--json",
             ],
             credential,
@@ -2595,7 +2603,7 @@ mod tests {
         assert_process_control_plane(
             &requests[0],
             "POST",
-            "/v1/agent/apps/lookup-app/people/resolve",
+            "/v1/agent/apps/lookup-app/people/resolve?environment=staging",
             credential,
         );
         assert_eq!(
