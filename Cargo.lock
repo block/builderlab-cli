@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "sq-kgoose"
-version = "0.7.12"
+version = "0.0.1-beta.1"
 dependencies = [
  "anyhow",
  "builderlab-auth",
