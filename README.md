@@ -64,6 +64,20 @@ verbose output.
 For inherited Apps Platform trace context and failure correlation, see
 [Apps operation correlation](docs/apps-operation-correlation.md).
 
+For deployments with people lookup enabled, an app owner can resolve an
+existing workspace member by email without granting access:
+
+```bash
+bl apps people resolve APP_ID --email alice@example.net --role viewer --json
+```
+
+Review the returned person and exact `subject_id`, then use it in the separate
+access or publisher grant. LDAP and directory search aren't supported. No match,
+ambiguity, missing verification and ineligibility return explicit statuses and
+`next_action`; only `resolved` contains a person. Old verification evidence
+requires the recipient to sign in again. Publisher lookup requires deployment
+support; this command doesn't enable individual sharing in the bb-public pilot.
+
 ## Local development
 
 Install the repository tools and git hooks once:

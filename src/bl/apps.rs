@@ -350,6 +350,20 @@ pub fn command() -> Command {
                 ),
         ))
         .subcommand(
+            Command::new("people")
+                .about("Resolve an existing app-workspace member by verified email")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .subcommand(control_plane_args(
+                    Command::new("resolve")
+                        .about("Look up an exact email without granting access")
+                        .long_about("Resolve a registered member of the app's workspace by exact email. Only the app owner may look up people. Review the returned person and stable subject before a separate access or publisher grant. Unknown or stale email verification requires the recipient to sign in again. Lookup must be enabled by the platform.")
+                        .arg(Arg::new("app-id").required(true).value_name("APP_ID"))
+                        .arg(Arg::new("email").long("email").required(true).value_name("EMAIL"))
+                        .arg(Arg::new("role").long("role").required(true).value_parser(["viewer", "publisher"]))
+                )),
+        )
+        .subcommand(
             Command::new("access")
                 .about("Read or update an app's viewer access policy")
                 .long_about(
@@ -504,6 +518,7 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("delete", delete_matches)) => run_delete(config, delete_matches),
         Some(("ready", ready_matches)) => run_ready(config, ready_matches),
         Some(("debug", debug_matches)) => run_debug(config, debug_matches),
+        Some(("people", people_matches)) => run_people(config, people_matches),
         Some(("access", access_matches)) => run_access(config, access_matches),
         Some(("share", share_matches)) => run_share(config, share_matches),
         _ => anyhow::bail!("expected an apps subcommand"),
@@ -872,6 +887,27 @@ fn run_debug(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let (client, credential) = control_plane_context(config, matches)?;
     let response = client.debug(&credential, app_id, environment, version_id, tail_lines)?;
     print_json(&response)
+}
+
+fn run_people(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let (_, resolve) = matches.subcommand().context("expected people resolve")?;
+    let app_id = resolve
+        .get_one::<String>("app-id")
+        .context("expected app id")?;
+    let email = resolve
+        .get_one::<String>("email")
+        .context("expected email")?
+        .trim();
+    if email.is_empty()
+        || email.len() > 320
+        || !email.contains('@')
+        || email.chars().any(char::is_whitespace)
+    {
+        anyhow::bail!("an exact email address is required");
+    }
+    let role = resolve.get_one::<String>("role").context("expected role")?;
+    let (client, credential) = control_plane_context(config, resolve)?;
+    print_json(&client.resolve_person(&credential, app_id, email, role)?)
 }
 
 fn run_access(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
@@ -1461,6 +1497,26 @@ impl ControlPlaneClient {
             .map(|environment| vec![("environment", environment.to_string())])
             .unwrap_or_default();
         self.get_app_resource(credential, app_id, "access", &query)
+    }
+
+    fn resolve_person(
+        &self,
+        credential: &ComposeSessionCredential,
+        app_id: &str,
+        email: &str,
+        role: &str,
+    ) -> Result<Value> {
+        let mut url = self.app_url(app_id, &[])?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid Apps Platform URL"))?
+            .extend(["people", "resolve"]);
+        let path = url.path().to_string();
+        self.authorized_json_request(credential, "POST", &path, |authorization| {
+            self.standard_request(self.client.post(url.clone()), authorization)
+                .json(&json!({"email": email, "role": role}))
+                .build()
+                .context("build app people lookup request")
+        })
     }
 
     fn set_access(
@@ -2445,6 +2501,106 @@ mod tests {
             "GET",
             "/v1/agent/apps/merchant%2Flookup%20app?environment=staging",
             credential,
+        );
+    }
+
+    #[test]
+    fn bl_apps_people_requires_email_and_rejects_ldap_or_scope_flags() {
+        assert!(command()
+            .try_get_matches_from([
+                "apps",
+                "people",
+                "resolve",
+                "lookup-app",
+                "--email",
+                "alice@example.net",
+                "--role",
+                "viewer",
+                "--base-url",
+                APPROVED_TEST_BASE_URL
+            ])
+            .is_ok());
+        for flag in ["--ldap", "--block-username", "--org", "--resolver"] {
+            assert!(command()
+                .try_get_matches_from([
+                    "apps",
+                    "people",
+                    "resolve",
+                    "lookup-app",
+                    "--email",
+                    "alice@example.net",
+                    "--role",
+                    "viewer",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    flag,
+                    "arbitrary"
+                ])
+                .is_err());
+        }
+        assert!(command()
+            .try_get_matches_from([
+                "apps",
+                "people",
+                "resolve",
+                "lookup-app",
+                "--role",
+                "viewer",
+                "--base-url",
+                APPROVED_TEST_BASE_URL
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn bl_apps_people_process_resolves_email_without_granting() {
+        let credential = "apps-e2e-only.people.session+credential";
+        let result = json!({"status":"resolved", "person":{"subject_id":"User-Exact", "email":"alice@example.net"}, "role":"viewer"});
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![ProcessResponse::json(result.clone())]);
+        let mut cmd = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "people",
+                "resolve",
+                "lookup-app",
+                "--email",
+                "alice@example.net",
+                "--role",
+                "viewer",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--client-version",
+                "0.2.0",
+                "--json",
+            ],
+            credential,
+        );
+        let output = cmd.output().expect("run people lookup");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&process_stdout(&output)).unwrap(),
+            result
+        );
+        let auth = auth_server.finish();
+        let requests = control_plane.finish();
+        assert_eq!(requests.len(), 1);
+        assert_process_auth(&auth[0], credential);
+        assert_process_control_plane(
+            &requests[0],
+            "POST",
+            "/v1/agent/apps/lookup-app/people/resolve",
+            credential,
+        );
+        assert_eq!(
+            requests[0].body,
+            json!({"email":"alice@example.net","role":"viewer"})
         );
     }
 
