@@ -33,6 +33,13 @@ target/release/bl --help
 
 ## Distribution status
 
+Apps Platform sends an independently maintained compatibility version in
+`X-Hotpod-Agent-Client-Version` (currently `0.2.0`). This is separate from the
+standalone package version shown by `bl --version` and the User-Agent. Review
+Apps protocol compatibility when changing that value; resetting the package
+version for a beta release must not lower the Apps compatibility version.
+`--client-version` / `BL_APPS_CLIENT_VERSION` explicitly override it.
+
 For now, build `bl` from source using the commands above. This repository does
 not yet provide a standalone installer or published binary release workflow.
 

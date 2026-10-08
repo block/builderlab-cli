@@ -40,6 +40,9 @@ use super::skills_config::SkillsConfig;
 
 const APPS_BASE_URL_ENV_VAR: &str = "BL_APPS_CONTROL_PLANE_URL";
 const APPS_CLIENT_VERSION_ENV_VAR: &str = "BL_APPS_CLIENT_VERSION";
+// Apps compatibility evolves independently of the standalone CLI release
+// numbering. Keep the beta package version in --version and User-Agent.
+const APPS_PROTOCOL_VERSION: &str = "0.2.0";
 #[cfg(test)]
 const APPS_E2E_CONTROL_PLANE_URL_ENV_VAR: &str = "BL_APPS_E2E_CONTROL_PLANE_URL";
 #[cfg(test)]
@@ -478,8 +481,8 @@ fn control_plane_args(command: Command) -> Command {
                 .long("client-version")
                 .value_name("VERSION")
                 .env(APPS_CLIENT_VERSION_ENV_VAR)
-                .default_value(env!("CARGO_PKG_VERSION"))
-                .help("Agent client version sent to the Compose control plane"),
+                .default_value(APPS_PROTOCOL_VERSION)
+                .help("Apps protocol compatibility version sent to the Compose control plane"),
         )
 }
 
@@ -2305,8 +2308,6 @@ mod tests {
                 "contract",
                 "--base-url",
                 APPROVED_TEST_BASE_URL,
-                "--client-version",
-                "0.2.0",
                 "--json",
             ],
             credential,
