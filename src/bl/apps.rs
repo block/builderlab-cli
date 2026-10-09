@@ -445,6 +445,86 @@ pub fn command() -> Command {
                 .subcommand(share_action_command("grant"))
                 .subcommand(share_action_command("revoke")),
         )
+        .subcommand(
+            Command::new("publishers")
+                .about("List, add, or remove an app's approved publishers")
+                .long_about(
+                    "List, add, or remove an Apps Platform app's approved publishers. Approved \
+                     publishers can deploy, roll back, and inspect the app. Only the original owner \
+                     may manage publishers, access, sharing, and deletion. In workspace-scoped \
+                     installations, a publisher can only publish while acting in the app's \
+                     workspace. Ask each intended publisher to copy the exact caller value from \
+                     `bl apps list --json`.",
+                )
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .disable_help_subcommand(true)
+                .subcommand(control_plane_args(
+                    Command::new("list")
+                        .about("List an app's owner and approved publishers")
+                        .arg(
+                            Arg::new("app-id")
+                                .value_name("APP_ID")
+                                .required(true)
+                                .help("App identifier returned by `bl apps list` or `bl apps create`"),
+                        )
+                        .arg(
+                            Arg::new("environment")
+                                .long("environment")
+                                .value_name("ENVIRONMENT")
+                                .help("Optional Compose environment override"),
+                        ),
+                ))
+                .subcommand(publisher_action_command("add"))
+                .subcommand(publisher_action_command("remove")),
+        )
+}
+
+fn publisher_action_command(action: &'static str) -> Command {
+    let (about, long_about) = if action == "add" {
+        (
+            "Approve a publisher to deploy, roll back, and inspect an app",
+            "Add one approved publisher. Publishers can deploy, roll back, and inspect the app; \
+             only the original owner may manage publishers, access, sharing, and deletion. In \
+             workspace-scoped installations, a publisher can only publish while acting in the \
+             app's workspace. Ask the intended publisher to copy the exact caller value from \
+             `bl apps list --json`.",
+        )
+    } else {
+        (
+            "Remove an approved publisher from an app",
+            "Remove one approved publisher. Only the original owner may manage publishers. Pass \
+             the exact subject listed in `approved_publishers` from `bl apps publishers list`.",
+        )
+    };
+    control_plane_args(
+        Command::new(action)
+            .about(about)
+            .long_about(long_about)
+            .arg(
+                Arg::new("app-id")
+                    .value_name("APP_ID")
+                    .required(true)
+                    .help("App identifier returned by `bl apps list` or `bl apps create`"),
+            )
+            .arg(
+                Arg::new("publisher")
+                    .long("publisher")
+                    .value_name("IDENTITY")
+                    .required(true)
+                    .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                    .help(
+                        "Exact case-sensitive Apps Platform user subject (for example, auth0|...); \
+                         ask the publisher to copy `caller` from `bl apps list --json`",
+                    ),
+            )
+            .arg(
+                Arg::new("environment")
+                    .long("environment")
+                    .value_name("ENVIRONMENT")
+                    .help("Optional Compose environment override"),
+            ),
+    )
 }
 
 fn share_action_command(action: &'static str) -> Command {
@@ -513,6 +593,7 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("debug", debug_matches)) => run_debug(config, debug_matches),
         Some(("access", access_matches)) => run_access(config, access_matches),
         Some(("share", share_matches)) => run_share(config, share_matches),
+        Some(("publishers", publishers_matches)) => run_publishers(config, publishers_matches),
         _ => anyhow::bail!("expected an apps subcommand"),
     }
 }
@@ -934,6 +1015,63 @@ fn run_share(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     print_json(&response)
 }
 
+fn run_publishers(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let (action, action_matches) = matches
+        .subcommand()
+        .context("expected publishers list, add, or remove")?;
+    let app_id = action_matches
+        .get_one::<String>("app-id")
+        .context("expected app id")?;
+    let environment = action_matches
+        .get_one::<String>("environment")
+        .map(String::as_str);
+    let response = match action {
+        "list" => {
+            let (client, credential) = control_plane_context(config, action_matches)?;
+            client.list_publishers(&credential, app_id, environment)
+        }
+        "add" | "remove" => {
+            let request = PublisherRequest {
+                publisher: action_matches
+                    .get_one::<String>("publisher")
+                    .context("expected publisher")?,
+                environment,
+            };
+            let (client, credential) = control_plane_context(config, action_matches)?;
+            client.update_publishers(&credential, app_id, action, &request)
+        }
+        _ => anyhow::bail!("expected publishers list, add, or remove"),
+    }
+    .map_err(publishers_unsupported_failure)?;
+    print_json(&response)
+}
+
+/// Compose answers publisher routes with an uncoded 404 when the installation
+/// does not enable publisher sharing; app-level failures always carry a code.
+fn publishers_unsupported_failure(error: anyhow::Error) -> anyhow::Error {
+    let unrouted = format!("failed with {}", StatusCode::NOT_FOUND);
+    let is_unrouted = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CliFailure>())
+        .is_some_and(|failure| {
+            failure.code == "control_plane_request_failed" && failure.message.ends_with(&unrouted)
+        });
+    if !is_unrouted {
+        return error;
+    }
+    let trace_id = failure_trace_id(&error).map(str::to_string);
+    with_failure_trace_id(
+        failure(
+            exit_codes::GENERAL,
+            "publishers_unsupported",
+            "this control plane does not support publisher management\n\
+             next_action: Run `bl apps contract` and check whether `supported_operations` lists \
+             `/v1/agent/apps/{app_id}/publishers`.",
+        ),
+        trace_id.as_deref(),
+    )
+}
+
 fn run_access_get(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let app_id = matches
         .get_one::<String>("app-id")
@@ -1019,6 +1157,13 @@ struct DeleteAppRequest<'a> {
 struct AccessRequest<'a> {
     visibility: &'a str,
     viewers: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct PublisherRequest<'a> {
+    publisher: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     environment: Option<&'a str>,
 }
@@ -1495,6 +1640,45 @@ impl ControlPlaneClient {
                 .json(request)
                 .build()
                 .context("build Apps Platform access update request")
+        })
+    }
+
+    fn list_publishers(
+        &self,
+        credential: &ComposeSessionCredential,
+        app_id: &str,
+        environment: Option<&str>,
+    ) -> Result<Value> {
+        let query = environment
+            .map(|environment| vec![("environment", environment.to_string())])
+            .unwrap_or_default();
+        self.get_app_resource(credential, app_id, "publishers", &query)
+    }
+
+    fn update_publishers(
+        &self,
+        credential: &ComposeSessionCredential,
+        app_id: &str,
+        action: &str,
+        request: &PublisherRequest<'_>,
+    ) -> Result<Value> {
+        let url = self.app_resource_url(app_id, "publishers", &[])?;
+        let path = request_path(&url);
+        let method = match action {
+            "add" => "POST",
+            "remove" => "DELETE",
+            _ => anyhow::bail!("unsupported publisher action"),
+        };
+        self.authorized_json_request(credential, method, &path, |authorization| {
+            let builder = if method == "POST" {
+                self.client.post(url.clone())
+            } else {
+                self.client.delete(url.clone())
+            };
+            self.standard_request(builder, authorization)
+                .json(request)
+                .build()
+                .context("build Apps Platform publisher update request")
         })
     }
 
@@ -2753,6 +2937,138 @@ mod tests {
             requests[0].body,
             json!({"visibility": "restricted", "viewers": []})
         );
+    }
+
+    #[test]
+    fn bl_apps_publishers_process_lists_adds_and_removes_exact_subjects() {
+        let credential = "apps-e2e-only.publishers.session+credential";
+        let listed = json!({
+            "ok": true,
+            "app_id": "merchant/lookup app",
+            "environment": "staging/west",
+            "owner": "auth0|owner",
+            "workspace_id": "team-workspace",
+            "approved_publishers": ["auth0|alice"]
+        });
+        let added = json!({
+            "ok": true,
+            "app_id": "merchant/lookup app",
+            "environment": "staging/west",
+            "owner": "auth0|owner",
+            "workspace_id": "team-workspace",
+            "publisher": "auth0|Bob",
+            "approved_publishers": ["auth0|alice", "auth0|Bob"]
+        });
+        let removed = json!({
+            "ok": true,
+            "app_id": "merchant/lookup app",
+            "environment": "production",
+            "owner": "auth0|owner",
+            "publisher": "auth0|alice",
+            "approved_publishers": []
+        });
+        let auth_server = ProcessServer::start(vec![
+            process_auth_response(),
+            process_auth_response(),
+            process_auth_response(),
+        ]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(listed.clone()),
+            ProcessResponse::json(added.clone()),
+            ProcessResponse::json(removed.clone()),
+        ]);
+
+        for (args, expected) in [
+            (
+                vec![
+                    "apps",
+                    "publishers",
+                    "list",
+                    "merchant/lookup app",
+                    "--environment",
+                    "staging/west",
+                ],
+                &listed,
+            ),
+            (
+                vec![
+                    "apps",
+                    "publishers",
+                    "add",
+                    "merchant/lookup app",
+                    "--publisher",
+                    "auth0|Bob",
+                    "--environment",
+                    "staging/west",
+                ],
+                &added,
+            ),
+            (
+                vec![
+                    "apps",
+                    "publishers",
+                    "remove",
+                    "merchant/lookup app",
+                    "--publisher",
+                    "auth0|alice",
+                ],
+                &removed,
+            ),
+        ] {
+            let mut args = args;
+            args.extend([
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--client-version",
+                "0.2.0",
+                "--json",
+            ]);
+            let output = process_command(&auth_server, &control_plane, &args, credential)
+                .output()
+                .expect("run Apps publishers process command");
+            assert!(
+                output.status.success(),
+                "stderr was: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                &serde_json::from_str::<Value>(&process_stdout(&output))
+                    .expect("parse publishers process output"),
+                expected
+            );
+        }
+
+        let auth_requests = auth_server.finish();
+        assert_eq!(auth_requests.len(), 3);
+        for request in &auth_requests {
+            assert_process_auth(request, credential);
+        }
+        let requests = control_plane.finish();
+        assert_eq!(requests.len(), 3);
+        assert_process_control_plane(
+            &requests[0],
+            "GET",
+            "/v1/agent/apps/merchant%2Flookup%20app/publishers?environment=staging%2Fwest",
+            credential,
+        );
+        assert_eq!(requests[0].body, Value::Null);
+        assert_process_control_plane(
+            &requests[1],
+            "POST",
+            "/v1/agent/apps/merchant%2Flookup%20app/publishers",
+            credential,
+        );
+        assert_eq!(
+            requests[1].body,
+            json!({"publisher": "auth0|Bob", "environment": "staging/west"})
+        );
+        assert_process_control_plane(
+            &requests[2],
+            "DELETE",
+            "/v1/agent/apps/merchant%2Flookup%20app/publishers",
+            credential,
+        );
+        assert_eq!(requests[2].body, json!({"publisher": "auth0|alice"}));
     }
 
     #[test]
@@ -4538,6 +4854,93 @@ mod tests {
     }
 
     #[test]
+    fn bl_apps_publishers_reports_unsupported_control_plane_on_unrouted_404() {
+        for args in [
+            vec!["apps", "publishers", "list", "app"],
+            vec![
+                "apps",
+                "publishers",
+                "add",
+                "app",
+                "--publisher",
+                "auth0|bob",
+            ],
+            vec![
+                "apps",
+                "publishers",
+                "remove",
+                "app",
+                "--publisher",
+                "auth0|bob",
+            ],
+        ] {
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane =
+                ProcessServer::start(vec![ProcessResponse::raw(404, "404 page not found\n")
+                    .with_trace_id(REQUEST_TRACE_ID)]);
+            let mut args = args;
+            args.extend([
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--client-version",
+                "0.2.0",
+                "--json",
+            ]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &args,
+                "apps-e2e-only.publishers-unsupported.session",
+            )
+            .output()
+            .expect("run publishers command against a control plane without publisher sharing");
+            let error = process_error(&output);
+            assert_eq!(error["error"]["code"], "publishers_unsupported");
+            let message = error["error"]["message"].as_str().expect("error message");
+            assert!(
+                message.contains("this control plane does not support publisher management"),
+                "message was: {message}"
+            );
+            assert!(message.contains("next_action:"), "message was: {message}");
+            assert_eq!(error["error"]["trace_id"], REQUEST_TRACE_ID);
+            auth_server.finish();
+            assert_eq!(control_plane.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn bl_apps_publishers_preserves_coded_control_plane_errors() {
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![ProcessResponse::json_status(
+            404,
+            json!({"error": {"code": "app_not_found", "message": "missing has no Hot Pod metadata"}}),
+        )]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "publishers",
+                "add",
+                "missing",
+                "--publisher",
+                "auth0|bob",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--client-version",
+                "0.2.0",
+                "--json",
+            ],
+            "apps-e2e-only.publishers-missing.session",
+        )
+        .output()
+        .expect("run publishers add for a missing app");
+        assert_eq!(process_error(&output)["error"]["code"], "app_not_found");
+        auth_server.finish();
+        control_plane.finish();
+    }
+
+    #[test]
     fn delete_retains_response_id_through_http_and_unknown_outcome_failures() {
         for (status, body, expected_code, expected_exit) in [
             (
@@ -5686,6 +6089,122 @@ mod tests {
             .expect("revoke workspace grant");
         assert_eq!(response["ok"], true);
         server_thread.join().expect("join control-plane server");
+    }
+
+    #[test]
+    fn publishers_support_each_environment_shape() {
+        let server = Server::http("127.0.0.1:0").expect("bind control-plane server");
+        let base_url = format!("http://{}", server.server_addr());
+        let server_thread = thread::spawn(move || {
+            for (index, (method, expected_path, expected_body)) in [
+                ("GET", "/v1/agent/apps/app/publishers", None),
+                (
+                    "GET",
+                    "/v1/agent/apps/app/publishers?environment=staging%2Fwest%3Fcell%3D1",
+                    None,
+                ),
+                (
+                    "POST",
+                    "/v1/agent/apps/app/publishers",
+                    Some(json!({"publisher": "auth0|alice"})),
+                ),
+                (
+                    "DELETE",
+                    "/v1/agent/apps/app/publishers",
+                    Some(json!({
+                        "publisher": "auth0|alice",
+                        "environment": "staging/west?cell=1"
+                    })),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut request = server.recv().expect("receive publishers request");
+                assert_eq!(request.method().as_str(), method);
+                assert_eq!(request.url(), expected_path);
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("read publishers request body");
+                match expected_body {
+                    Some(expected_body) => assert_eq!(
+                        serde_json::from_str::<Value>(&body)
+                            .expect("parse publishers request body"),
+                        expected_body
+                    ),
+                    None => assert!(body.is_empty(), "GET publishers body was: {body}"),
+                }
+                request
+                    .respond(
+                        Response::from_string(format!(r#"{{"request":{index}}}"#)).with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("build content type"),
+                        ),
+                    )
+                    .expect("respond to publishers request");
+            }
+        });
+        let client = test_control_plane_client(&base_url, Duration::from_secs(2));
+        let credential = test_credential("publishers_environment_session_credential_1234");
+
+        let add = PublisherRequest {
+            publisher: "auth0|alice",
+            environment: None,
+        };
+        let remove = PublisherRequest {
+            publisher: "auth0|alice",
+            environment: Some("staging/west?cell=1"),
+        };
+        let responses = [
+            client.list_publishers(&credential, "app", None),
+            client.list_publishers(&credential, "app", Some("staging/west?cell=1")),
+            client.update_publishers(&credential, "app", "add", &add),
+            client.update_publishers(&credential, "app", "remove", &remove),
+        ];
+        for (index, response) in responses.into_iter().enumerate() {
+            assert_eq!(
+                response.expect("request publishers response")["request"],
+                index
+            );
+        }
+
+        server_thread.join().expect("join control-plane server");
+    }
+
+    #[test]
+    fn publisher_mutations_require_a_nonempty_publisher_before_auth_or_network() {
+        for action in ["add", "remove"] {
+            let error = command()
+                .try_get_matches_from([
+                    "apps",
+                    "publishers",
+                    action,
+                    "app",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                ])
+                .expect_err("require --publisher");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+
+            let error = command()
+                .try_get_matches_from([
+                    "apps",
+                    "publishers",
+                    action,
+                    "app",
+                    "--publisher",
+                    "",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                ])
+                .expect_err("reject empty --publisher");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        }
     }
 
     #[test]
