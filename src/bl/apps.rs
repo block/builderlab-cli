@@ -474,7 +474,9 @@ fn control_plane_args(command: Command) -> Command {
                 .value_name("URL")
                 .env(APPS_BASE_URL_ENV_VAR)
                 .required(true)
-                .help("Approved BuilderLab Compose control-plane ingress URL"),
+                .help(
+                    "Approved BuilderLab Compose control-plane URL (set by the operator on Blox)",
+                ),
         )
         .arg(
             Arg::new("apps-client-version")
@@ -495,7 +497,9 @@ pub fn run(matches: &ArgMatches) -> Result<()> {
 }
 
 fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
-    runner::ensure_org_configured(config)?;
+    if !uses_proxy_auth(matches) {
+        runner::ensure_org_configured(config)?;
+    }
     match matches.subcommand() {
         Some(("contract", contract_matches)) => run_contract(config, contract_matches),
         Some(("list", list_matches)) => run_list(config, list_matches),
@@ -522,7 +526,7 @@ fn run_contract(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         .context("expected Apps Platform client version")?;
 
     let client = ControlPlaneClient::new(base_url, client_version, config.style)?;
-    let credential = ComposeSessionCredential::from_config(config)?;
+    let credential = ComposeSessionCredential::from_config(config, base_url)?;
     let contract = client.contract(&credential)?;
     print_json(&contract)
 }
@@ -979,7 +983,7 @@ fn control_plane_context(
         .get_one::<String>("apps-client-version")
         .context("expected Apps Platform client version")?;
     let client = ControlPlaneClient::new(base_url, client_version, config.style)?;
-    let credential = ComposeSessionCredential::from_config(config)?;
+    let credential = ComposeSessionCredential::from_config(config, base_url)?;
     Ok((client, credential))
 }
 
@@ -1068,13 +1072,19 @@ fn validate_artifact_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-struct ComposeSessionCredential {
-    authorization: HeaderValue,
-    secret: String,
+enum ComposeSessionCredential {
+    Session {
+        authorization: HeaderValue,
+        secret: String,
+    },
+    Proxy,
 }
 
 impl ComposeSessionCredential {
-    fn from_config(config: &SkillsConfig) -> Result<Self> {
+    fn from_config(config: &SkillsConfig, base_url: &str) -> Result<Self> {
+        if proxy_auth_for_url(base_url) {
+            return Ok(Self::Proxy);
+        }
         let storage = default_session_storage(config)?;
         let verified =
             verify_stored_session(config, storage.as_ref())?.ok_or_else(auth_required_error)?;
@@ -1092,18 +1102,24 @@ impl ComposeSessionCredential {
         // Authorization scheme is a backend contract, independent of CLI branding.
         let authorization = HeaderValue::from_str(&format!("BBIdentity {secret}"))
             .context("stored BuilderLab CLI auth session is invalid; run `bl auth login`")?;
-        Ok(Self {
+        Ok(Self::Session {
             authorization,
             secret,
         })
     }
 
-    fn authorization_header(&self) -> HeaderValue {
-        self.authorization.clone()
+    fn authorization_header(&self) -> Option<HeaderValue> {
+        match self {
+            Self::Session { authorization, .. } => Some(authorization.clone()),
+            Self::Proxy => None,
+        }
     }
 
     fn redact(&self, value: &str) -> String {
-        value.replace(&self.secret, "[REDACTED]")
+        match self {
+            Self::Session { secret, .. } => value.replace(secret, "[REDACTED]"),
+            Self::Proxy => value.to_string(),
+        }
     }
 }
 
@@ -1602,7 +1618,7 @@ impl ControlPlaneClient {
     fn standard_request(
         &self,
         request: RequestBuilder,
-        authorization: HeaderValue,
+        authorization: Option<HeaderValue>,
     ) -> RequestBuilder {
         let request = request
             .header(USER_AGENT, apps_user_agent())
@@ -1610,8 +1626,11 @@ impl ControlPlaneClient {
             .header(
                 HOTPOD_AGENT_CLIENT_VERSION_HEADER,
                 self.client_version.clone(),
-            )
-            .header(AUTHORIZATION, authorization);
+            );
+        let request = match authorization {
+            Some(authorization) => request.header(AUTHORIZATION, authorization),
+            None => request,
+        };
         match &self.traceparent {
             Some(traceparent) => request.header("traceparent", traceparent.clone()),
             None => request,
@@ -1626,7 +1645,7 @@ impl ControlPlaneClient {
         send: F,
     ) -> Result<Value>
     where
-        F: Fn(HeaderValue) -> Result<Request>,
+        F: Fn(Option<HeaderValue>) -> Result<Request>,
     {
         let authorization = credential.authorization_header();
         let (status, body, trace_id) =
@@ -1659,10 +1678,10 @@ impl ControlPlaneClient {
         method: &str,
         path: &str,
         send: &F,
-        authorization: HeaderValue,
+        authorization: Option<HeaderValue>,
     ) -> Result<(StatusCode, String, Option<String>)>
     where
-        F: Fn(HeaderValue) -> Result<Request>,
+        F: Fn(Option<HeaderValue>) -> Result<Request>,
     {
         self.style.verbose(&format!("{method} {path}"));
         let request = send(authorization)?;
@@ -1847,6 +1866,9 @@ fn deploy_form(artifact: &Path, options: &DeployOptions) -> Result<multipart::Fo
 }
 
 fn is_trusted_control_plane_url(url: &url::Url) -> bool {
+    if is_blox_control_plane_url(url) {
+        return true;
+    }
     if url.scheme() != "https"
         || url.port_or_known_default() != Some(443)
         || !url.username().is_empty()
@@ -1862,12 +1884,44 @@ fn is_trusted_control_plane_url(url: &url::Url) -> bool {
         .any(|trusted| host.eq_ignore_ascii_case(trusted))
 }
 
+fn on_blox() -> bool {
+    std::env::var("IS_BLOX").as_deref() == Ok("true")
+        && std::env::var("BLOX_WORKSTATION_ID").is_ok_and(|id| !id.is_empty())
+}
+
+// On Blox the operator sets BL_APPS_CONTROL_PLANE_URL and Roxy authenticates
+// requests to that origin, so the CLI trusts it and sends no credentials.
+fn is_blox_control_plane_url(url: &url::Url) -> bool {
+    on_blox()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && std::env::var(APPS_BASE_URL_ENV_VAR)
+            .ok()
+            .and_then(|configured| url::Url::parse(&configured).ok())
+            .is_some_and(|configured| configured.origin() == url.origin())
+}
+
+fn proxy_auth_for_url(base_url: &str) -> bool {
+    url::Url::parse(base_url).is_ok_and(|url| is_blox_control_plane_url(&url))
+}
+
+fn uses_proxy_auth(matches: &ArgMatches) -> bool {
+    matches
+        .try_get_one::<String>("apps-base-url")
+        .ok()
+        .flatten()
+        .is_some_and(|base_url| proxy_auth_for_url(base_url))
+        || matches
+            .subcommand()
+            .is_some_and(|(_, child)| uses_proxy_auth(child))
+}
+
 fn validate_control_plane_base_url(base_url: &str) -> Result<()> {
     let contract_url = auth_url(base_url, APPS_CONTRACT_PATH)
         .context("build Apps Platform control-plane contract URL")?;
     if !is_trusted_control_plane_url(&contract_url) {
         anyhow::bail!(
-            "Apps Platform control-plane URL must use HTTPS and target an approved BuilderLab ingress host"
+            "Apps Platform control-plane URL must target an approved BuilderLab ingress over HTTPS, or the Blox-configured {APPS_BASE_URL_ENV_VAR} endpoint"
         );
     }
     Ok(())
@@ -2167,6 +2221,12 @@ mod tests {
         std::env::set_var("KGOOSE_BASE_URL", auth_url.as_str());
         std::env::remove_var("BL_SKILLS_PROFILE");
         std::env::remove_var("KGOOSE_PLAYPEN");
+        if std::env::var("BL_APPS_E2E_PROXY").as_deref() == Ok("true") {
+            fs::remove_file(bl_home.join("config.yaml")).expect("remove local org");
+            fs::remove_file(&storage_path).expect("remove local credentials");
+            std::env::set_var("IS_BLOX", "true");
+            std::env::set_var("BLOX_WORKSTATION_ID", "test-workstation");
+        }
         println!("{PROCESS_STDOUT_BEGIN}");
         crate::run_bl_with_argv(args).expect("run bl Apps process command");
         println!("{PROCESS_STDOUT_END}");
@@ -2210,6 +2270,8 @@ mod tests {
             .env_remove("KGOOSE_BASE_URL")
             .env_remove("BL_SKILLS_PROFILE")
             .env_remove("KGOOSE_PLAYPEN");
+        command.env_remove("BL_APPS_E2E_PROXY");
+        command.env_remove(APPS_BASE_URL_ENV_VAR);
         command.env_remove("TRACEPARENT");
         command
     }
@@ -4649,7 +4711,7 @@ mod tests {
             assert_eq!(exit_code, exit_codes::GENERAL);
             assert_eq!(payload["error"]["trace_id"], REQUEST_TRACE_ID);
             assert!(format!("{error:#}").contains(expected_message));
-            assert!(!payload.to_string().contains(&credential.secret));
+            assert_eq!(credential.redact(&payload.to_string()), payload.to_string());
             server_thread.join().unwrap();
         }
     }
@@ -4729,6 +4791,7 @@ mod tests {
         assert_eq!(
             credential
                 .authorization_header()
+                .expect("session authorization")
                 .to_str()
                 .expect("authorization text"),
             format!("BBIdentity {secret}")
@@ -4738,6 +4801,65 @@ mod tests {
                 .err()
                 .expect("reject invalid session credential");
             assert!(!error.to_string().contains(invalid));
+        }
+    }
+
+    #[test]
+    fn bl_apps_blox_process_delegates_auth_for_configured_url_without_local_configuration() {
+        let auth_server = ProcessServer::start(vec![]);
+        let control_plane = ProcessServer::start(vec![ProcessResponse::json(json!({"apps": []}))]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &["apps", "list"],
+            "apps-e2e-only.unused",
+        )
+        .env("BL_APPS_E2E_PROXY", "true")
+        .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+        .output()
+        .expect("run Blox Apps process");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&process_stdout(&output)).unwrap(),
+            json!({"apps": []})
+        );
+        assert!(auth_server.finish().is_empty());
+        let requests = control_plane.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/v1/agent/apps");
+        for header in ["authorization", "cookie", "x-bb-session-credential"] {
+            assert!(!requests[0].headers.contains_key(header));
+        }
+    }
+
+    #[test]
+    fn bl_apps_blox_process_rejects_explicit_url_outside_configured_origin() {
+        for base_url in [
+            "http://other.mesh.example",
+            "http://compose.mesh.example:8080",
+            "https://compose.mesh.example",
+            "http://user@compose.mesh.example",
+        ] {
+            let auth_server = ProcessServer::start(vec![]);
+            let control_plane = ProcessServer::start(vec![]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &["apps", "list", "--base-url", base_url],
+                "apps-e2e-only.unused",
+            )
+            .env("BL_APPS_E2E_PROXY", "true")
+            .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+            .output()
+            .expect("run Blox Apps process");
+            assert!(!output.status.success(), "{base_url} should be rejected");
+            assert!(auth_server.finish().is_empty());
+            assert!(control_plane.finish().is_empty());
         }
     }
 
@@ -4753,6 +4875,7 @@ mod tests {
         assert_eq!(
             credential
                 .authorization_header()
+                .expect("session authorization")
                 .to_str()
                 .expect("authorization text"),
             format!("BBIdentity {secret}")

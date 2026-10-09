@@ -64,6 +64,13 @@ verbose output.
 For inherited Apps Platform trace context and failure correlation, see
 [Apps operation correlation](docs/apps-operation-correlation.md).
 
+On a BuilderLab Blox workstation, the operator sets `BL_APPS_CONTROL_PLANE_URL`.
+For that origin, the CLI delegates authentication to Roxy and needs no local
+login or organization configuration. Roxy obtains a short-lived Compose JWT
+from KGoose for the workstation owner and injects it on the wire. Any other
+URL, including an explicit `--base-url` outside that origin, must be an
+approved HTTPS ingress and requires `bl auth login`.
+
 ## Local development
 
 Install the repository tools and git hooks once:
