@@ -361,9 +361,6 @@ fn apply_builderlab_mode_if_needed(config: &mut KgooseConfig, builderlab_mode: b
     if tools_proxy_auth_for_url(&config.base_url) {
         config.proxy_auth = true;
         config.session_credential = None;
-        if config.service_path == DEFAULT_KGOOSE_SERVICE_PATH {
-            config.service_path = normalize_kgoose_service_path("api")?;
-        }
         return Ok(());
     }
     let bl_home = read_optional_env(BL_HOME_ENV_VAR)?

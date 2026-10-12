@@ -17,7 +17,8 @@ use zip::write::SimpleFileOptions;
 use common::{
     bl_command, calculate_tool_schema, list_tools_response, output_text, temp_test_dir,
     write_bl_org_config, write_extensions_catalog, MockResponse, MockServer,
-    BL_TOOLS_CALL_TOOL_PATH, BL_TOOLS_LIST_TOOLS_PATH,
+    BL_TOOLS_CALL_TOOL_PATH, BL_TOOLS_LIST_TOOLS_PATH, CALL_TOOL_PATH, LIST_EXTENSIONS_PATH,
+    LIST_TOOLS_PATH,
 };
 
 // ---------------------------------------------------------------------------
@@ -4183,8 +4184,8 @@ fn bl_tools_blox_discovers_and_calls_tools_without_local_configuration_or_creden
     assert!(stdout.contains("sum"), "stdout was: {stdout}");
     assert!(!temp.join("config.yaml").exists());
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].path, BL_TOOLS_LIST_TOOLS_PATH);
-    assert_eq!(requests[1].path, BL_TOOLS_CALL_TOOL_PATH);
+    assert_eq!(requests[0].path, LIST_TOOLS_PATH);
+    assert_eq!(requests[1].path, CALL_TOOL_PATH);
     for request in &requests {
         for header in [
             "authorization",
@@ -4214,7 +4215,7 @@ fn bl_tools_blox_lists_extensions_without_local_configuration() {
 
     assert!(output.status.success(), "stderr was: {stderr}");
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].path, "/api/v3/list-extensions");
+    assert_eq!(requests[0].path, LIST_EXTENSIONS_PATH);
     assert!(fs::read_to_string(temp.join("extensions.yaml"))
         .unwrap()
         .contains("utils"));
