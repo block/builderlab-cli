@@ -4139,6 +4139,261 @@ fn bl_apps_pipeline_without_a_session_never_starts_browser_login() {
 // ---------------------------------------------------------------------------
 // bl tools passthrough
 
+fn blox_tools_command(bl_home: &Path, base_url: &str) -> std::process::Command {
+    let mut command = bl_command();
+    command
+        .env("BL_HOME", bl_home)
+        .env("IS_BLOX", "true")
+        .env("BLOX_WORKSTATION_ID", "tools-test-workstation")
+        .env("BL_TOOLS_BASE_URL", base_url)
+        .env("BL_AUTH_STORAGE", "file")
+        .env("BL_AUTH_STORAGE_FILE", bl_home.join("sessions.json"));
+    command
+}
+
+#[test]
+fn bl_tools_blox_discovers_and_calls_tools_without_local_configuration_or_credentials() {
+    let server = MockServer::start(vec![
+        list_tools_response("utils", calculate_tool_schema(false)),
+        MockResponse::json(json!({
+            "content": [{"text": {"text": "{\"sum\":5}"}}],
+            "is_error": false
+        })),
+    ]);
+    let temp = temp_test_dir("bl-tools-blox-proxy");
+    fs::write(temp.join("sessions.json"), "not json").expect("write unreadable session storage");
+    let output = blox_tools_command(&temp, &server.base_url)
+        .env("STS_ACCESS_TOKEN", "ambient-sts-token")
+        .args([
+            "tools",
+            "utils",
+            "calculate",
+            "--numbers",
+            "2",
+            "3",
+            "--operation",
+            "add",
+        ])
+        .output()
+        .expect("run proxy-authenticated tool");
+    let (stdout, stderr) = output_text(&output);
+    let requests = server.finish();
+
+    assert!(output.status.success(), "stderr was: {stderr}");
+    assert!(stdout.contains("sum"), "stdout was: {stdout}");
+    assert!(!temp.join("config.yaml").exists());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, BL_TOOLS_LIST_TOOLS_PATH);
+    assert_eq!(requests[1].path, BL_TOOLS_CALL_TOOL_PATH);
+    for request in &requests {
+        for header in [
+            "authorization",
+            "cookie",
+            "x-bb-session-credential",
+            "x-forwarded-identity-token",
+        ] {
+            assert!(!request.headers.contains_key(header), "unexpected {header}");
+        }
+    }
+    fs::remove_dir_all(temp).expect("remove temp dir");
+}
+
+#[test]
+fn bl_tools_blox_lists_extensions_without_local_configuration() {
+    let server = MockServer::start(vec![MockResponse::json(json!({
+        "extensions": [{"name": "utils", "description": "Utility helpers"}]
+    }))]);
+    let temp = temp_test_dir("bl-tools-blox-extensions");
+    let output = blox_tools_command(&temp, &server.base_url)
+        .args(["tools", "--write-extensions"])
+        .arg(temp.join("extensions.yaml"))
+        .output()
+        .expect("discover proxy-authenticated extensions");
+    let (_, stderr) = output_text(&output);
+    let requests = server.finish();
+
+    assert!(output.status.success(), "stderr was: {stderr}");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/api/v3/list-extensions");
+    assert!(fs::read_to_string(temp.join("extensions.yaml"))
+        .unwrap()
+        .contains("utils"));
+    fs::remove_dir_all(temp).expect("remove temp dir");
+}
+
+#[test]
+fn bl_tools_blox_preserves_same_origin_url_and_explicit_service_path() {
+    let server = MockServer::start(vec![list_tools_response(
+        "utils",
+        calculate_tool_schema(false),
+    )]);
+    let temp = temp_test_dir("bl-tools-blox-service-path");
+    let output = blox_tools_command(&temp, &server.base_url)
+        .args([
+            "tools",
+            "--base-url",
+            &format!("{}/proxy", server.base_url),
+            "--kgoose-service-path",
+            "/custom/api",
+            "utils",
+            "--help",
+        ])
+        .output()
+        .expect("discover tools through explicit proxy path");
+    let (_, stderr) = output_text(&output);
+    let requests = server.finish();
+
+    assert!(output.status.success(), "stderr was: {stderr}");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/proxy/custom/api/v3/list-tools");
+    fs::remove_dir_all(temp).expect("remove temp dir");
+}
+
+#[test]
+fn bl_tools_blox_proxy_auth_requires_both_workstation_markers() {
+    let temp = temp_test_dir("bl-tools-blox-markers");
+    for (is_blox, workstation_id) in [("false", Some("id")), ("true", None), ("true", Some(""))] {
+        let server = MockServer::start(vec![]);
+        let mut command = blox_tools_command(&temp, &server.base_url);
+        command.env("IS_BLOX", is_blox);
+        if let Some(id) = workstation_id {
+            command.env("BLOX_WORKSTATION_ID", id);
+        } else {
+            command.env_remove("BLOX_WORKSTATION_ID");
+        }
+        let output = command
+            .args(["tools", "--base-url", &server.base_url, "utils", "--help"])
+            .output()
+            .expect("run without valid workstation markers");
+        let (_, stderr) = output_text(&output);
+        assert_eq!(output.status.code(), Some(3), "stderr was: {stderr}");
+        assert!(stderr.contains("org is not configured"));
+        assert!(server.finish().is_empty());
+    }
+    fs::remove_dir_all(temp).expect("remove temp dir");
+}
+
+#[test]
+fn bl_tools_blox_proxy_auth_does_not_apply_outside_configured_origin() {
+    let temp = temp_test_dir("bl-tools-blox-origin");
+    let server = MockServer::start(vec![]);
+    for base_url in [
+        "http://other.example.test".to_string(),
+        server.base_url.replacen("http:", "https:", 1),
+        "http://127.0.0.1:1".to_string(),
+        server.base_url.replacen("http://", "http://user@", 1),
+    ] {
+        let output = blox_tools_command(&temp, &server.base_url)
+            .args(["tools", "--base-url", &base_url, "utils", "--help"])
+            .output()
+            .expect("run explicit endpoint override");
+        let (_, stderr) = output_text(&output);
+        assert_eq!(output.status.code(), Some(3), "stderr was: {stderr}");
+        assert!(stderr.contains("org is not configured"));
+    }
+    let output = blox_tools_command(&temp, &server.base_url)
+        .env("KGOOSE_BASE_URL", "http://other.example.test")
+        .args(["tools", "utils", "--help"])
+        .output()
+        .expect("run environment endpoint override");
+    assert_eq!(output.status.code(), Some(3));
+    assert!(server.finish().is_empty());
+    fs::remove_dir_all(temp).expect("remove temp dir");
+}
+
+#[test]
+fn bl_tools_blox_proxy_auth_requires_a_valid_configured_endpoint() {
+    let temp = temp_test_dir("bl-tools-blox-endpoint");
+    let server = MockServer::start(vec![]);
+    let userinfo_url = server.base_url.replacen("http://", "http://user@", 1);
+    for configured in [
+        None,
+        Some("not a URL"),
+        Some("file:///tmp/tools"),
+        Some(userinfo_url.as_str()),
+    ] {
+        let mut command = blox_tools_command(&temp, &server.base_url);
+        if let Some(base_url) = configured {
+            command.env("BL_TOOLS_BASE_URL", base_url);
+        } else {
+            command.env_remove("BL_TOOLS_BASE_URL");
+        }
+        let output = command
+            .args(["tools", "--base-url", &server.base_url, "utils", "--help"])
+            .output()
+            .expect("run without a trusted endpoint");
+        let (_, stderr) = output_text(&output);
+        assert_eq!(output.status.code(), Some(3), "stderr was: {stderr}");
+        assert!(stderr.contains("org is not configured"));
+    }
+    assert!(server.finish().is_empty());
+    fs::remove_dir_all(temp).expect("remove temp dir");
+}
+
+#[test]
+fn bl_tools_blox_proxy_auth_does_not_follow_redirects() {
+    let target = MockServer::start(vec![]);
+    let server = MockServer::start(vec![MockResponse::bytes(
+        302,
+        vec![],
+        &[("Location", target.base_url.clone())],
+    )]);
+    let temp = temp_test_dir("bl-tools-blox-redirect");
+    let output = blox_tools_command(&temp, &server.base_url)
+        .args(["tools", "linear", "--help"])
+        .output()
+        .expect("run redirected tools request");
+    let (_, stderr) = output_text(&output);
+    assert!(!output.status.success());
+    assert!(stderr.contains("302"), "stderr was: {stderr}");
+    assert_eq!(server.finish().len(), 1);
+    assert!(target.finish().is_empty());
+    fs::remove_dir_all(temp).expect("remove temp dir");
+}
+
+#[test]
+fn bl_tools_blox_other_origins_keep_local_session_authentication() {
+    assert_bl_tools_session_credential(
+        "bl-tools-blox-local-session",
+        "default",
+        "stored-local-session",
+        |_, command| {
+            command
+                .env("IS_BLOX", "true")
+                .env("BLOX_WORKSTATION_ID", "tools-test-workstation")
+                .env("BL_TOOLS_BASE_URL", "http://other.example.test");
+        },
+    );
+}
+
+#[test]
+fn agent_tools_keeps_internal_identity_authentication_on_blox() {
+    let server = MockServer::start(vec![list_tools_response(
+        "utils",
+        calculate_tool_schema(false),
+    )]);
+    let output = server
+        .command()
+        .env("IS_BLOX", "true")
+        .env("BLOX_WORKSTATION_ID", "tools-test-workstation")
+        .env("BL_TOOLS_BASE_URL", &server.base_url)
+        .env("STS_ACCESS_TOKEN", "internal-sts-token")
+        .args(["utils", "--help"])
+        .output()
+        .expect("run internal agent-tools");
+    let (_, stderr) = output_text(&output);
+    assert!(output.status.success(), "stderr was: {stderr}");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("x-forwarded-identity-token")
+            .map(String::as_str),
+        Some("internal-sts-token")
+    );
+}
+
 #[test]
 fn bl_tools_help_surfaces_schema_derived_flags() {
     let server = MockServer::start(vec![list_tools_response(

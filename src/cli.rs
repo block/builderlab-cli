@@ -108,6 +108,17 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
+    bootstrap_args_with_default_base_url(args, None)
+}
+
+pub fn bootstrap_args_with_default_base_url<I, S>(
+    args: I,
+    default_base_url: Option<&str>,
+) -> Result<BootstrapArgs>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let env_base_url = read_optional_env("KGOOSE_BASE_URL")?;
     let mut values = BootstrapValueState::from_env()?;
 
@@ -146,7 +157,7 @@ where
     Ok(BootstrapArgs {
         base_url: resolve_base_url(
             env_base_url.as_deref(),
-            values.cli_base_url.as_deref(),
+            values.cli_base_url.as_deref().or(default_base_url),
             read_optional_env(IS_BLOX_ENV_VAR)?.as_deref(),
             read_optional_env(BLOX_ENVIRONMENT_ENV_VAR)?.as_deref(),
         ),

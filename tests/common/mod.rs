@@ -141,6 +141,7 @@ impl MockServer {
             .env_remove("KGOOSE_SERVICE_PATH")
             .env_remove("KGOOSE_TIMEOUT")
             .env_remove("STS_ACCESS_TOKEN")
+            .env_remove("BL_TOOLS_BASE_URL")
             .env_remove("BL_HOME")
             .env_remove("BL_SKILLS_PROFILE")
             .env_remove("BL_AUTH_STORAGE")
@@ -160,6 +161,7 @@ impl MockServer {
             .env_remove("KGOOSE_SERVICE_PATH")
             .env_remove("KGOOSE_TIMEOUT")
             .env_remove("STS_ACCESS_TOKEN")
+            .env_remove("BL_TOOLS_BASE_URL")
             .env("BL_HOME", bl_home)
             .env_remove("BL_SKILLS_CONFIG")
             .env_remove("BL_SKILLS_PROFILE")
@@ -202,7 +204,8 @@ pub fn bl_command() -> Command {
         .env_remove("KGOOSE_PLAYPEN")
         .env_remove("KGOOSE_SERVICE_PATH")
         .env_remove("KGOOSE_TIMEOUT")
-        .env_remove("STS_ACCESS_TOKEN");
+        .env_remove("STS_ACCESS_TOKEN")
+        .env_remove("BL_TOOLS_BASE_URL");
     command
 }
 

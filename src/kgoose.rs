@@ -29,6 +29,8 @@ pub struct KgooseConfig {
     pub goosemcp_playpen: Option<String>,
     pub timeout_secs: f64,
     pub session_credential: Option<String>,
+    /// Roxy authenticates the configured Blox tools origin.
+    pub proxy_auth: bool,
 }
 
 impl KgooseConfig {
@@ -163,7 +165,11 @@ fn build_http_client(config: &KgooseConfig) -> Result<Client> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    if let Some(session_credential) = config.session_credential.as_deref() {
+    if let Some(session_credential) = config
+        .session_credential
+        .as_deref()
+        .filter(|_| !config.proxy_auth)
+    {
         headers.insert(
             SESSION_CREDENTIAL_HEADER,
             HeaderValue::from_str(session_credential)
@@ -190,16 +196,18 @@ fn build_http_client(config: &KgooseConfig) -> Result<Client> {
         );
     }
 
-    match env::var(STS_ACCESS_TOKEN_ENV_VAR) {
-        Ok(access_token) => {
-            headers.insert(
-                HeaderName::from_static("x-forwarded-identity-token"),
-                HeaderValue::from_str(&access_token)
-                    .context("build x-forwarded-identity-token header")?,
-            );
+    if !config.proxy_auth {
+        match env::var(STS_ACCESS_TOKEN_ENV_VAR) {
+            Ok(access_token) => {
+                headers.insert(
+                    HeaderName::from_static("x-forwarded-identity-token"),
+                    HeaderValue::from_str(&access_token)
+                        .context("build x-forwarded-identity-token header")?,
+                );
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(err) => anyhow::bail!("failed to read {STS_ACCESS_TOKEN_ENV_VAR}: {err}"),
         }
-        Err(env::VarError::NotPresent) => {}
-        Err(err) => anyhow::bail!("failed to read {STS_ACCESS_TOKEN_ENV_VAR}: {err}"),
     }
 
     debug_log(format!(
@@ -212,6 +220,11 @@ fn build_http_client(config: &KgooseConfig) -> Result<Client> {
     ));
 
     ClientBuilder::new()
+        .redirect(if config.proxy_auth {
+            reqwest::redirect::Policy::none()
+        } else {
+            reqwest::redirect::Policy::default()
+        })
         .default_headers(headers)
         .timeout(config.timeout())
         .build()
