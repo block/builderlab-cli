@@ -15,10 +15,11 @@ use anyhow::{Context, Result};
 use clap::error::ErrorKind;
 use clap::{ArgMatches, Command};
 use cli::{
-    bool_false_id, bool_true_id, bootstrap_args, build_tools_command, parameter_id,
-    ToolCommandConfig, APPKIT_COMMAND_ABOUT, APPKIT_COMMAND_NAME, BL_TOOLS_BIN_NAME,
-    EXTENSION_DESCRIBE_COMMAND_ABOUT, EXTENSION_DESCRIBE_COMMAND_NAME, ROOT_BIN_NAME,
-    ROOT_COMMAND_NAME, ROOT_SUMMARY, TOOLS_COMMAND_NAME,
+    bool_false_id, bool_true_id, bootstrap_args, bootstrap_args_with_default_base_url,
+    build_tools_command, parameter_id, ToolCommandConfig, APPKIT_COMMAND_ABOUT,
+    APPKIT_COMMAND_NAME, BL_TOOLS_BIN_NAME, EXTENSION_DESCRIBE_COMMAND_ABOUT,
+    EXTENSION_DESCRIBE_COMMAND_NAME, ROOT_BIN_NAME, ROOT_COMMAND_NAME, ROOT_SUMMARY,
+    TOOLS_COMMAND_NAME,
 };
 use runtime::{
     load_extension, load_extensions, LoadedExtension, ParameterKind, RuntimeTool, ScalarKind,
@@ -40,6 +41,7 @@ use crate::proto::squareup::cash::kgoose::api::v3::user_content;
 
 const BL_COMMAND_NAME: &str = "bl";
 const BL_SUMMARY: &str = "BuilderLab command line tools";
+const BL_TOOLS_BASE_URL_ENV_VAR: &str = "BL_TOOLS_BASE_URL";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ToolsCliConfig {
@@ -203,7 +205,16 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
         return appkit::run(raw_args);
     }
 
-    let bootstrap = bootstrap_args(raw_args.iter().cloned())?;
+    let proxy_base_url = if config.builderlab_mode {
+        blox_tools_base_url()?
+    } else {
+        None
+    };
+    let bootstrap = if let Some(base_url) = proxy_base_url.as_deref() {
+        bootstrap_args_with_default_base_url(raw_args.iter().cloned(), Some(base_url))?
+    } else {
+        bootstrap_args(raw_args.iter().cloned())?
+    };
 
     let mut kgoose_config = KgooseConfig {
         base_url: bootstrap.base_url.clone(),
@@ -212,6 +223,7 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
         goosemcp_playpen: bootstrap.goosemcp_playpen.clone(),
         timeout_secs: bootstrap.timeout_secs,
         session_credential: None,
+        proxy_auth: false,
     };
 
     let client = HttpKgooseClient;
@@ -346,6 +358,11 @@ fn apply_builderlab_mode_if_needed(config: &mut KgooseConfig, builderlab_mode: b
     if !builderlab_mode {
         return Ok(());
     }
+    if tools_proxy_auth_for_url(&config.base_url) {
+        config.proxy_auth = true;
+        config.session_credential = None;
+        return Ok(());
+    }
     let bl_home = read_optional_env(BL_HOME_ENV_VAR)?
         .map(std::path::PathBuf::from)
         .unwrap_or_else(default_bl_home);
@@ -362,6 +379,30 @@ fn apply_builderlab_mode_if_needed(config: &mut KgooseConfig, builderlab_mode: b
         config.service_path = normalize_kgoose_service_path("api")?;
     }
     Ok(())
+}
+
+fn blox_tools_base_url() -> Result<Option<String>> {
+    if std::env::var("IS_BLOX").as_deref() != Ok("true")
+        || !std::env::var("BLOX_WORKSTATION_ID").is_ok_and(|id| !id.is_empty())
+    {
+        return Ok(None);
+    }
+    read_optional_env(BL_TOOLS_BASE_URL_ENV_VAR)
+}
+
+fn tools_proxy_auth_for_url(base_url: &str) -> bool {
+    let Some(configured) = blox_tools_base_url().ok().flatten() else {
+        return false;
+    };
+    let (Ok(configured), Ok(requested)) = (url::Url::parse(&configured), url::Url::parse(base_url))
+    else {
+        return false;
+    };
+    [&configured, &requested].iter().all(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+    }) && configured.origin() == requested.origin()
 }
 
 fn bl_org_required_error() -> anyhow::Error {
@@ -971,6 +1012,7 @@ mod tests {
             goosemcp_playpen: None,
             timeout_secs: 600.0,
             session_credential: None,
+            proxy_auth: false,
         }
     }
 

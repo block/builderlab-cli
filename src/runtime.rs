@@ -647,6 +647,7 @@ mod tests {
             goosemcp_playpen: None,
             timeout_secs: 600.0,
             session_credential: None,
+            proxy_auth: false,
         }
     }
 
