@@ -62,6 +62,8 @@ selected KGoose backend. Extensions whose credentials are missing for the caller
 appear with `[not connected]` beside their description. The same live list is
 used by `bl tools --describe-commands`. Listing requires backend access and
 authentication, just like inspecting or calling an extension's tools.
+When inspecting an extension fails, `bl tools` also uses the live extension list
+to distinguish an unknown name from a configured extension that is not connected.
 
 The separately packaged `sq agent-tools` command uses the embedded
 `extensions.yaml` catalog for its top-level help and command discovery.

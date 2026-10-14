@@ -292,8 +292,12 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
         selected_extension_name.as_deref()
     {
         apply_builderlab_mode_if_needed(&mut kgoose_config, config.builderlab_mode)?;
-        let known_extensions = load_extensions_catalog()?;
-        let loaded = load_extension(&client, &kgoose_config, extension_name, &known_extensions)?;
+        let loaded = load_tools_extension(
+            &client,
+            &kgoose_config,
+            extension_name,
+            config.builderlab_mode,
+        )?;
         let extensions = vec![runtime::ExtensionSummary {
             name: loaded.name.clone(),
             about: loaded.about.clone(),
@@ -469,13 +473,27 @@ fn load_command_description(
                 tools_cli.nested_appkit_help
             )
         }
-        [extension_name] => load_extension_command_description(client, config, extension_name),
+        [extension_name] => load_extension_command_description(
+            client,
+            config,
+            extension_name,
+            tools_cli.builderlab_mode,
+        ),
         [extension_name, EXTENSION_DESCRIBE_COMMAND_NAME] => {
-            load_extension_describe_command_description(client, config, extension_name)
+            load_extension_describe_command_description(
+                client,
+                config,
+                extension_name,
+                tools_cli.builderlab_mode,
+            )
         }
-        [extension_name, tool_name] => {
-            load_tool_command_description(client, config, extension_name, tool_name)
-        }
+        [extension_name, tool_name] => load_tool_command_description(
+            client,
+            config,
+            extension_name,
+            tool_name,
+            tools_cli.builderlab_mode,
+        ),
         _ => anyhow::bail!(
             "`--describe-commands` only supports the root command, an extension, or a tool path"
         ),
@@ -506,23 +524,32 @@ fn load_tools_extensions(
     }
 }
 
-/// Loads an extension by name, using the static catalog to produce helpful error
-/// messages for extensions that exist but the user hasn't connected yet.
-fn load_extension_with_catalog(
+/// Uses live discovery for BuilderLab errors and the static catalog for sq.
+fn load_tools_extension(
     client: &impl KgooseClient,
     config: &KgooseConfig,
     extension_name: &str,
+    builderlab_mode: bool,
 ) -> Result<LoadedExtension> {
-    let known_extensions = load_extensions_catalog()?;
-    load_extension(client, config, extension_name, &known_extensions)
+    if builderlab_mode {
+        load_extension(client, config, extension_name, || {
+            load_extensions(client, config).map(Some)
+        })
+    } else {
+        let known_extensions = load_extensions_catalog()?;
+        load_extension(client, config, extension_name, || {
+            Ok((!known_extensions.is_empty()).then_some(known_extensions))
+        })
+    }
 }
 
 fn load_extension_command_description(
     client: &impl KgooseClient,
     config: &KgooseConfig,
     extension_name: &str,
+    builderlab_mode: bool,
 ) -> Result<CommandDescription> {
-    let loaded = load_extension_with_catalog(client, config, extension_name)?;
+    let loaded = load_tools_extension(client, config, extension_name, builderlab_mode)?;
     Ok(extension_command_description(&loaded))
 }
 
@@ -531,8 +558,9 @@ fn load_tool_command_description(
     config: &KgooseConfig,
     extension_name: &str,
     tool_name: &str,
+    builderlab_mode: bool,
 ) -> Result<CommandDescription> {
-    let loaded = load_extension_with_catalog(client, config, extension_name)?;
+    let loaded = load_tools_extension(client, config, extension_name, builderlab_mode)?;
     let tool = loaded
         .tools
         .iter()
@@ -546,8 +574,9 @@ fn load_extension_describe_command_description(
     client: &impl KgooseClient,
     config: &KgooseConfig,
     extension_name: &str,
+    builderlab_mode: bool,
 ) -> Result<CommandDescription> {
-    load_extension_with_catalog(client, config, extension_name)?;
+    load_tools_extension(client, config, extension_name, builderlab_mode)?;
     Ok(extension_describe_command_description())
 }
 

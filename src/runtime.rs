@@ -123,25 +123,36 @@ pub fn load_extension(
     client: &impl KgooseClient,
     config: &KgooseConfig,
     extension_name: &str,
-    known_extensions: &[ExtensionSummary],
+    load_known_extensions: impl FnOnce() -> Result<Option<Vec<ExtensionSummary>>>,
 ) -> Result<LoadedExtension> {
     let response = match client.list_tools(config, extension_name) {
         Ok(response) => response,
         Err(err) => {
-            // The static catalog covers all known extensions (both live API and late-init
-            // OAuth extensions like `asana` or `notion`). Using it here lets us distinguish
-            // "unknown extension" (typo) from "known but not yet connected" and surface a
-            // helpful G2 Connections hint for the latter.
-            let is_known = known_extensions
-                .iter()
-                .any(|extension| extension.name == extension_name);
-
-            if is_known || known_extensions.is_empty() {
+            // Discovery is only needed to distinguish unknown extensions from configured
+            // but inaccessible ones. Keep successful ListTools calls independent of it.
+            let Some(known_extensions) = load_known_extensions()
+                .with_context(|| format!("ListTools for `{extension_name}` failed: {err:#}"))?
+            else {
                 return Err(humanize_list_tools_error(
                     extension_name,
                     config.playpen.as_deref(),
                     &err,
                 ));
+            };
+            let is_known = known_extensions
+                .iter()
+                .any(|extension| extension.name == extension_name);
+
+            if is_known {
+                return Err(humanize_list_tools_error(
+                    extension_name,
+                    config.playpen.as_deref(),
+                    &err,
+                ));
+            }
+
+            if known_extensions.is_empty() {
+                anyhow::bail!("unknown extension `{extension_name}` (no extensions configured in this backend)");
             }
 
             anyhow::bail!(
@@ -689,8 +700,10 @@ mod tests {
 
     #[test]
     fn load_extension_discovers_tools_and_schema_parameters() {
-        let extension =
-            load_extension(&TestKgooseClient, &kgoose_config(), "utils", &[]).expect("extension");
+        let extension = load_extension(&TestKgooseClient, &kgoose_config(), "utils", || {
+            panic!("successful ListTools must not load extension discovery")
+        })
+        .expect("extension");
         assert_eq!(extension.name, "utils");
         assert_eq!(extension.about, "Utility helpers");
         assert_eq!(extension.description, "Utility helpers");
@@ -721,7 +734,7 @@ mod tests {
             &UnauthorizedKgooseClient,
             &kgoose_config(),
             "airtable",
-            &known,
+            || Ok(Some(known)),
         )
         .expect_err("expected inaccessible extension");
 
@@ -742,7 +755,7 @@ mod tests {
             &ConnectFailureKgooseClient,
             &kgoose_config(),
             "sourcegraph",
-            &known,
+            || Ok(Some(known)),
         )
         .expect_err("expected connect failure");
 
@@ -759,15 +772,12 @@ mod tests {
 
     #[test]
     fn load_extension_rewrites_catalog_known_inaccessible_errors_for_humans() {
-        let error = load_extension(
-            &UnauthorizedKgooseClient,
-            &kgoose_config(),
-            "asana",
-            &[ExtensionSummary {
+        let error = load_extension(&UnauthorizedKgooseClient, &kgoose_config(), "asana", || {
+            Ok(Some(vec![ExtensionSummary {
                 name: "asana".to_string(),
                 about: "Asana tools".to_string(),
-            }],
-        )
+            }]))
+        })
         .expect_err("expected inaccessible extension");
 
         let message = error.to_string();

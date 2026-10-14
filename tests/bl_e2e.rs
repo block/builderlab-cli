@@ -4655,6 +4655,150 @@ fn bl_tools_root_metadata_commands_do_not_read_auth_storage() {
 }
 
 #[test]
+fn bl_tools_unconnected_extensions_use_live_discovery_for_help_and_metadata_errors() {
+    let temp = temp_test_dir("bl-tools-live-unconnected");
+    for args in [
+        vec!["playpen-only", "--help"],
+        vec!["playpen-only", "calculate", "--help"],
+        vec!["playpen-only", "describe"],
+        vec!["playpen-only", "--describe-commands"],
+        vec!["playpen-only", "calculate", "--describe-commands"],
+        vec!["playpen-only", "describe", "--describe-commands"],
+        vec!["playpen-only", "--summary"],
+    ] {
+        let server = MockServer::start(vec![
+            MockResponse::text(404, "Extension 'playpen-only' not found or not authorized"),
+            MockResponse::json(json!({
+                "extensions": [{
+                    "name": "playpen-only",
+                    "description": "Configured in this backend",
+                    "authSatisfiedForCaller": false,
+                    "tool_count": 0
+                }]
+            })),
+        ]);
+        let output = server
+            .bl_tools_command()
+            .env(
+                "KGOOSE_EXTENSIONS_CATALOG",
+                temp.join("missing-catalog.yaml"),
+            )
+            .args(args)
+            .output()
+            .expect("inspect unconnected extension");
+        let (_, stderr) = output_text(&output);
+        let requests = server.finish();
+
+        assert!(!output.status.success());
+        assert!(
+            stderr.contains("not connected in your account"),
+            "stderr was: {stderr}"
+        );
+        assert!(
+            !stderr.contains("unknown extension"),
+            "stderr was: {stderr}"
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, BL_TOOLS_LIST_TOOLS_PATH);
+        assert_eq!(requests[1].path, "/api/v3/list-extensions");
+    }
+    fs::remove_dir_all(temp).expect("remove temp dir");
+}
+
+#[test]
+fn bl_tools_unknown_extensions_are_classified_against_the_live_backend() {
+    for (extensions, expected) in [
+        (
+            json!([{"name": "backend-only", "authSatisfiedForCaller": true}]),
+            "available: backend-only",
+        ),
+        (json!([]), "no extensions configured in this backend"),
+    ] {
+        let server = MockServer::start(vec![
+            MockResponse::text(404, "Extension 'slack' not found or not authorized"),
+            MockResponse::json(json!({"extensions": extensions})),
+        ]);
+        let output = server
+            .bl_tools_command()
+            .args(["slack", "--help"])
+            .output()
+            .expect("inspect extension absent from backend");
+        let (_, stderr) = output_text(&output);
+        let requests = server.finish();
+
+        assert!(!output.status.success());
+        assert!(
+            stderr.contains("unknown extension `slack`"),
+            "stderr was: {stderr}"
+        );
+        assert!(stderr.contains(expected), "stderr was: {stderr}");
+        assert!(!stderr.contains("not connected in your account"));
+        assert_eq!(requests.len(), 2);
+    }
+}
+
+#[test]
+fn bl_tools_successful_extension_inspection_does_not_load_a_catalog() {
+    let temp = temp_test_dir("bl-tools-no-catalog-inspection");
+    for args in [
+        vec!["playpen-only", "--help"],
+        vec!["playpen-only", "calculate", "--help"],
+        vec!["playpen-only", "describe"],
+        vec!["playpen-only", "--describe-commands"],
+        vec!["playpen-only", "calculate", "--describe-commands"],
+        vec!["playpen-only", "describe", "--describe-commands"],
+        vec!["playpen-only", "--summary"],
+    ] {
+        let server = MockServer::start(vec![list_tools_response(
+            "playpen-only",
+            calculate_tool_schema(false),
+        )]);
+        let output = server
+            .bl_tools_command()
+            .env(
+                "KGOOSE_EXTENSIONS_CATALOG",
+                temp.join("missing-catalog.yaml"),
+            )
+            .args(args)
+            .output()
+            .expect("inspect configured extension");
+        let (_, stderr) = output_text(&output);
+        let requests = server.finish();
+
+        assert!(output.status.success(), "stderr was: {stderr}");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, BL_TOOLS_LIST_TOOLS_PATH);
+    }
+    fs::remove_dir_all(temp).expect("remove temp dir");
+}
+
+#[test]
+fn bl_tools_failed_discovery_preserves_the_original_tool_lookup_error() {
+    let server = MockServer::start(vec![
+        MockResponse::text(404, "tool lookup failed"),
+        MockResponse::text(503, "extension discovery unavailable"),
+    ]);
+    let output = server
+        .bl_tools_command()
+        .args(["playpen-only", "--help"])
+        .output()
+        .expect("inspect extension while discovery is unavailable");
+    let (_, stderr) = output_text(&output);
+    let requests = server.finish();
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("tool lookup failed"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("extension discovery unavailable"),
+        "stderr was: {stderr}"
+    );
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
 fn bl_tools_describe_commands_uses_configured_extensions_and_connection_status() {
     let server = MockServer::start(vec![MockResponse::json(json!({
         "extensions": [
