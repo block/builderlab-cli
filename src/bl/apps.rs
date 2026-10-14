@@ -63,6 +63,8 @@ const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
     "compose-ctrl.block.builderlab.xyz",
     "compose-ctrl.apps.builderlab.xyz",
     "compose-ctrl.apps.builderlabstaging.xyz",
+    "compose-ctrl.public.builderlab.xyz",
+    "compose-ctrl.public.builderlabstaging.xyz",
 ];
 
 pub fn command() -> Command {
@@ -4894,6 +4896,10 @@ mod tests {
             "https://compose-ctrl.apps.builderlab.xyz:443",
             "https://compose-ctrl.apps.builderlabstaging.xyz",
             "https://compose-ctrl.apps.builderlabstaging.xyz:443",
+            "https://compose-ctrl.public.builderlab.xyz",
+            "https://compose-ctrl.public.builderlab.xyz:443",
+            "https://compose-ctrl.public.builderlabstaging.xyz",
+            "https://compose-ctrl.public.builderlabstaging.xyz:443",
             "https://compose-ctrl.test.blockstaging.build:443",
         ] {
             assert!(
@@ -4923,6 +4929,14 @@ mod tests {
             "https://compose-ctrl.apps.builderlabstaging.xyz.attacker.example",
             "https://compose-ctrl.apps.builderlabstaging.xyz:444",
             "https://user@compose-ctrl.apps.builderlabstaging.xyz",
+            "http://compose-ctrl.public.builderlab.xyz",
+            "https://user@compose-ctrl.public.builderlab.xyz",
+            "https://compose-ctrl.public.builderlab.xyz.attacker.example",
+            "https://compose-ctrl.public.builderlab.xyz:444",
+            "http://compose-ctrl.public.builderlabstaging.xyz",
+            "https://user@compose-ctrl.public.builderlabstaging.xyz",
+            "https://compose-ctrl.public.builderlabstaging.xyz.attacker.example",
+            "https://compose-ctrl.public.builderlabstaging.xyz:444",
             "https://app.builderlabstaging.xyz",
             "https://user@compose-ctrl.test.blockstaging.build",
             "http://localhost:8080",
