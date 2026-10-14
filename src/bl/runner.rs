@@ -42,6 +42,7 @@ fn run_resolved(
 ) -> Result<()> {
     match dispatch(config, matches) {
         Ok(()) => Ok(()),
+        Err(error) if error.downcast_ref::<SilentJsonExit>().is_some() => Err(error),
         Err(error) if config.json => {
             let (exit_code, payload) = failure_info(&error);
             eprintln!("{payload}");

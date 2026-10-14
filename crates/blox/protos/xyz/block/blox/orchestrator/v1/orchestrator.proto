@@ -1,0 +1,1640 @@
+syntax = "proto3";
+
+package xyz.block.blox.orchestrator.v1;
+
+option go_package = "github.com/block/blox/protos/xyz/block/blox/orchestrator/v1;orchestratorpb";
+
+// Main orchestrator service
+service OrchestratorService {
+  rpc Ping(PingRequest) returns (PingResponse);
+  // Ping a specific workstation's bloxlet to measure end-to-end latency.
+  rpc PingWorkstation(PingWorkstationRequest) returns (PingWorkstationResponse);
+
+  // Workstation presetup (creates namespace in staging, no-op locally)
+  rpc PresetupWorkstation(PresetupWorkstationRequest) returns (PresetupWorkstationResponse);
+
+  // Workstation lifecycle
+  rpc StartWorkstation(StartWorkstationRequest) returns (StartWorkstationResponse);
+  rpc DeleteWorkstation(DeleteWorkstationRequest) returns (DeleteWorkstationResponse);
+  rpc ListWorkstations(ListWorkstationsRequest) returns (ListWorkstationsResponse);
+  rpc GetWorkstation(GetWorkstationRequest) returns (GetWorkstationResponse);
+  rpc GetLatestDeletedWorkstation(GetLatestDeletedWorkstationRequest) returns (GetLatestDeletedWorkstationResponse);
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  rpc GetWorkstationStatus(GetWorkstationStatusRequest) returns (GetWorkstationStatusResponse); // buf:lint:ignore
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc WatchWorkstationStatus(WatchWorkstationStatusRequest) returns (stream GetWorkstationStatusResponse); // buf:lint:ignore
+  rpc ShutdownWorkstation(ShutdownWorkstationRequest) returns (ShutdownWorkstationResponse);
+  rpc SuspendWorkstation(SuspendWorkstationRequest) returns (SuspendWorkstationResponse);
+  rpc ResumeWorkstation(ResumeWorkstationRequest) returns (ResumeWorkstationResponse);
+  rpc ApproveWorkstation(ApproveWorkstationRequest) returns (ApproveWorkstationResponse);
+  rpc UpdateWorkstationIdleTimeout(UpdateWorkstationIdleTimeoutRequest) returns (UpdateWorkstationIdleTimeoutResponse);
+  rpc ResizeWorkstationResources(ResizeWorkstationResourcesRequest) returns (ResizeWorkstationResourcesResponse);
+  rpc GetWorkstationResourceResize(GetWorkstationResourceResizeRequest) returns (GetWorkstationResourceResizeResponse);
+  rpc UpdateWorkstationDisplayName(UpdateWorkstationDisplayNameRequest) returns (UpdateWorkstationDisplayNameResponse);
+  // Pin or unpin a workstation at the top of its owner's sidebar.
+  rpc SetWorkstationPinned(SetWorkstationPinnedRequest) returns (SetWorkstationPinnedResponse);
+  // Switch the GitHub token identity of a service-account workstation. Only the
+  // GitHub credentials the workstation receives are affected; ownership and UI
+  // visibility are unchanged. Gated behind per-service-account config. The
+  // override does not survive a workstation restart.
+  rpc SwitchWorkstationIdentity(SwitchWorkstationIdentityRequest) returns (SwitchWorkstationIdentityResponse);
+
+  // Process execution
+  rpc ExecuteProcess(ExecuteProcessRequest) returns (ExecuteProcessResponse);
+  rpc StreamCommandOutput(StreamCommandOutputRequest) returns (stream StreamCommandOutputResponse);
+  // ACP-aware replay of a recorded agent process. The orchestrator parses the
+  // recorded JSON-RPC stream and replays the frames that carry protocol state
+  // followed by the most recent prompt turns, instead of the whole recording.
+  // Replay only: follow live output via StreamCommandOutput from the final
+  // resume_id.
+  rpc StreamACPOutput(StreamACPOutputRequest) returns (stream StreamACPOutputResponse);
+  rpc SendProcessInput(SendProcessInputRequest) returns (SendProcessInputResponse);
+  rpc GetCommandOutput(GetCommandOutputRequest) returns (GetCommandOutputResponse);
+  rpc StopProcess(StopProcessRequest) returns (StopProcessResponse);
+  rpc ExecuteTransientProcess(ExecuteTransientProcessRequest) returns (ExecuteTransientProcessResponse);
+
+  rpc GetWorkstationCommands(GetWorkstationCommandsRequest) returns (GetWorkstationCommandsResponse);
+
+  // Update tags on an existing command. Sets or deletes arbitrary key:value pairs.
+  rpc UpdateCommandTags(UpdateCommandTagsRequest) returns (UpdateCommandTagsResponse);
+
+  // File operations
+  rpc GetFileContents(GetFileContentsRequest) returns (GetFileContentsResponse);
+  rpc StreamFileContents(StreamFileContentsRequest) returns (stream StreamFileContentsResponse);
+  rpc PutFileContents(PutFileContentsRequest) returns (PutFileContentsResponse);
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+
+  // Git operations
+  rpc GetGitDiff(GetGitDiffRequest) returns (GetGitDiffResponse);
+  rpc GetGitFileContents(GetGitFileContentsRequest) returns (GetGitFileContentsResponse);
+  rpc GetWorkstationRepoState(GetWorkstationRepoStateRequest) returns (GetWorkstationRepoStateResponse);
+
+  // Run targets declared in each checked-out repo's .blox/workstation.yaml,
+  // read live from the working tree so mid-session edits are picked up.
+  rpc GetWorkstationRunTargets(GetWorkstationRunTargetsRequest) returns (GetWorkstationRunTargetsResponse);
+
+  // Artifact operations
+  rpc GetCommandArtifacts(GetCommandArtifactsRequest) returns (GetCommandArtifactsResponse);
+  rpc GetWorkstationArtifacts(GetWorkstationArtifactsRequest) returns (GetWorkstationArtifactsResponse);
+  rpc DeleteArtifact(DeleteArtifactRequest) returns (DeleteArtifactResponse);
+  // Upload a file to attach to a prompt (stored in S3, materialized on the
+  // workstation before the prompt command runs — see
+  // ExecuteProcessRequest.attachment_artifact_ids).
+  rpc UploadPromptAttachment(UploadPromptAttachmentRequest) returns (UploadPromptAttachmentResponse);
+
+  // Workspace name generation (deprecated: use AnalyzePrompt instead)
+  rpc GenerateWorkspaceName(GenerateWorkspaceNameRequest) returns (GenerateWorkspaceNameResponse);
+
+  // Current authenticated user profile for UI display.
+  rpc GetCurrentUser(GetCurrentUserRequest) returns (GetCurrentUserResponse);
+
+  // Preview whether creating a workstation now would be queued (over quota)
+  rpc GetWorkstationQuota(GetWorkstationQuotaRequest) returns (GetWorkstationQuotaResponse);
+
+  // Analyze prompt to recommend agent and optionally generate workspace name
+  rpc AnalyzePrompt(AnalyzePromptRequest) returns (AnalyzePromptResponse);
+
+  // List git repository suggestions for the current user based on their recent workstations
+  rpc ListRepoSuggestions(ListRepoSuggestionsRequest) returns (ListRepoSuggestionsResponse);
+
+  // List the compute providers users may select when starting a workstation.
+  rpc ListComputeProviders(ListComputeProvidersRequest) returns (ListComputeProvidersResponse);
+
+  // Terminal operations
+  rpc StartTerminal(StartTerminalRequest) returns (StartTerminalResponse);
+  rpc ListTerminals(ListTerminalsRequest) returns (ListTerminalsResponse);
+  // Unary RPCs for terminal I/O
+  rpc SendTerminalInput(SendTerminalInputRequest) returns (SendTerminalInputResponse);
+  rpc ResizeTerminal(ResizeTerminalRequest) returns (ResizeTerminalResponse);
+  rpc GetTerminalOutput(GetTerminalOutputRequest) returns (GetTerminalOutputResponse);
+  // Server-streaming RPC for real-time terminal output (lower latency than polling)
+  rpc StreamTerminalOutput(StreamTerminalOutputRequest) returns (stream StreamTerminalOutputResponse);
+  rpc CloseTerminal(CloseTerminalRequest) returns (CloseTerminalResponse);
+  rpc RenameTerminal(RenameTerminalRequest) returns (RenameTerminalResponse);
+}
+
+// Internal pod-to-pod service for operations that should not be exposed on the
+// public API surface. Registered only on the internal gRPC port.
+service InternalOrchestratorService {
+  // RegisterPostStartClone records a git clone performed outside the bootstrap
+  // flow and triggers contract providers. Forwarded here by the originating pod
+  // when the bloxlet stream lives on a different orchestrator pod.
+  rpc RegisterPostStartClone(RegisterPostStartCloneRequest) returns (RegisterPostStartCloneResponse);
+
+  // DeliverPendingBootstrap delivers a workstation's pending bootstrap commands
+  // over its bloxlet stream. Forwarded here by the pod handling a warm-pool
+  // claim when the bloxlet stream lives on a different orchestrator pod.
+  rpc DeliverPendingBootstrap(DeliverPendingBootstrapRequest) returns (DeliverPendingBootstrapResponse);
+
+  // SnapshotWorkstation captures a workstation snapshot over the bloxlet
+  // stream and only returns once it has completed. Forwarded here by the pod
+  // handling a suspend when the bloxlet stream lives on a different
+  // orchestrator pod.
+  rpc SnapshotWorkstation(SnapshotWorkstationRequest) returns (SnapshotWorkstationResponse);
+}
+
+// ============================================================================
+// Presetup Messages
+// ============================================================================
+
+message PresetupWorkstationRequest {}
+
+message PresetupWorkstationResponse {
+  string namespace = 1;
+  bool namespace_created = 2;
+}
+
+// ============================================================================
+// Workstation Lifecycle Messages
+// ============================================================================
+
+message StartWorkstationRequest {
+  // Name of the workstation
+  optional string name = 1;
+  // The repositories to clone, either specified directly or via service name
+  repeated Project projects = 2;
+
+  reserved 3;
+  reserved "resources";
+  // Reserved: previously "prompt" (tag 5), which was added unintentionally and has been removed.
+  reserved 5;
+  reserved "prompt";
+
+  // Tags for webhook routing - events for this workstation will be sent to webhooks configured for these tags
+  repeated string tags = 6;
+
+  // Optional idle timeout in minutes. If not set, defaults to the system-wide idle timeout (24 hours).
+  // The workstation will be automatically deleted after being idle for this duration.
+  optional int32 idle_timeout_minutes = 7;
+
+  // Optional compute provider name (matching one returned by ListComputeProviders).
+  // If unset, the user's configured default compute provider is used.
+  optional string compute_provider = 8;
+
+  // Optional CPU architecture for Kubernetes workstations ("amd64" or "arm64").
+  // If unset, .blox/workstation.yaml may specify architecture; otherwise the
+  // compute provider's default architecture is used.
+  optional string architecture = 9;
+
+  // Provider-specific workstation parameters. Valid keys, types, descriptions,
+  // and allowed values are returned by ListComputeProviders for the selected
+  // compute provider. Values are sent as strings and validated by the
+  // orchestrator against the provider's parameter metadata.
+  map<string, string> workstation_parameters = 10;
+
+  // Optional number of CPU cores to request. Overrides .blox/workstation.yaml
+  // cpu value. Clamped to the user's per-user max or the global maximum (92).
+  // When set, this value is used as the Kubernetes CPU limit. The built-in
+  // Kubernetes template requests half the limit; custom templates may differ.
+  optional int32 cpu = 11;
+
+  // Optional memory in GiB to request. Overrides .blox/workstation.yaml
+  // memory value. Requests below the minimum supported (4) or above the
+  // global maximum (360) are rejected; values within range are clamped to
+  // the user's per-user max. When set, this value is used as both the
+  // Kubernetes memory request and limit, ensuring Karpenter provisions a
+  // node large enough to deliver the requested memory.
+  optional int32 memory_gb = 12;
+
+  // Client that initiated creation. Used only for product analytics; it does
+  // not affect authorization or workstation behavior.
+  // Values are lowercase identifiers containing letters, digits, underscores,
+  // periods, or hyphens. Empty and invalid values are reported as "unknown".
+  string creation_client = 13;
+
+  // Disable creation and restoration of workstation snapshots. This is useful
+  // for ephemeral workstations that must not persist state between boots.
+  // Requests are rejected when persistent home volumes are enabled.
+  bool disable_snapshots = 14;
+
+  // Selects an entry from the deployment's compute SKU catalog. Required when
+  // the catalog has entries.
+  // The request must omit cpu and memory_gb. If compute_provider or architecture
+  // is present, its value must match the selected catalog entry.
+  ComputeSkuSelection compute_sku = 15;
+}
+
+message ComputeSkuSelection {
+  // Must exactly match one case-sensitive code in the deployment's catalog.
+  string code = 1;
+
+  // Unitless count of the entry's base resources. Valid values are 1 through
+  // the entry's configured max_multiple, inclusive.
+  int32 multiple = 2;
+}
+
+message Project {
+  oneof project {
+    Repository repository = 1;
+  }
+  reserved 2;
+  reserved "service";
+}
+
+message Repository {
+  // Source URL. Examples:
+  //   github.com/org/repo
+  //   github.com/org/repo?ref=main
+  //   github.com/org/repo//subdir?ref=v1.0.0&depth=1
+  //   git+https://github.com/org/repo.git?ref=feature-branch&depth=100
+  // Query parameters:
+  //   ref=<branch|tag|commit> - git reference to checkout
+  //   depth=<N> - shallow clone depth (0 or omitted for full clone)
+  // Subdir suffix:
+  //   //path/to/subdir - subdirectory within the repo
+  string source = 1;
+  // If true, clone to a temporary directory and sync contents to the user's
+  // home directory, excluding paths like ".git".
+  bool sync_to_home = 2;
+  // Absolute checkout directory on the workstation, once the project has been
+  // cloned. Authoritative over any path derived from the source (the two can
+  // differ for subdir sources and post-start clones). Empty until checkout.
+  string resolved_dir = 3;
+}
+
+message StartWorkstationResponse {
+  string workstation_id = 1;
+  WorkstationStatus status = 2;
+  string message = 3;
+}
+
+message DeleteWorkstationRequest {
+  string workstation_id = 1;
+}
+
+message DeleteWorkstationResponse {
+  string workstation_id = 1;
+  bool success = 2;
+  string message = 3;
+}
+
+message GetWorkstationStatusRequest {
+  string workstation_id = 1;
+  // Request the running instance's image identity from the compute provider.
+  // An unavailable identity fails the request instead of returning stale data.
+  bool include_image_identity = 2;
+}
+
+message WatchWorkstationStatusRequest {
+  string workstation_id = 1;
+}
+
+message GetWorkstationStatusResponse {
+  string workstation_id = 1;
+  WorkstationStatus status = 2;
+  WorkstationInfo info = 3;
+  string message = 4;
+}
+
+enum WorkstationStatus {
+  WORKSTATION_STATUS_UNSPECIFIED = 0;
+  WORKSTATION_STATUS_CREATING = 1;
+  WORKSTATION_STATUS_STARTING = 2;
+  WORKSTATION_STATUS_RUNNING = 3;
+  WORKSTATION_STATUS_ERROR = 4;
+  WORKSTATION_STATUS_SHUTTING_DOWN = 5;
+  WORKSTATION_STATUS_SUSPENDED = 6;
+  WORKSTATION_STATUS_DELETED = 7;
+  WORKSTATION_STATUS_DEGRADED = 8;
+  WORKSTATION_STATUS_PENDING = 9;
+  WORKSTATION_STATUS_QUEUED = 10;
+  // Transient teardown states: provider resources (and the shutdown snapshot)
+  // are still draining. Resume is blocked until they settle to the terminal
+  // SUSPENDED / DELETED state. These replace the former shutting_down boolean.
+  WORKSTATION_STATUS_SUSPENDING = 11;
+  WORKSTATION_STATUS_DELETING = 12;
+}
+
+message WorkstationInfo {
+  string created_at = 1;
+  string ready_at = 2;
+  repeated ProcessInfo running_processes = 4;
+  // The running workspace container's image ID and pod UID, when requested.
+  string image_id = 5;
+  string instance_id = 6;
+}
+
+message ShutdownWorkstationRequest {
+  string workstation_id = 1;
+}
+
+message ShutdownWorkstationResponse {
+  string workstation_id = 1;
+  bool success = 2;
+  string message = 3;
+}
+
+message ResumeWorkstationRequest {
+  string workstation_id = 1;
+}
+
+message ResumeWorkstationResponse {
+  string workstation_id = 1;
+  WorkstationStatus status = 2;
+  string message = 3;
+}
+
+message SuspendWorkstationRequest {
+  string workstation_id = 1;
+}
+
+message SuspendWorkstationResponse {
+  string workstation_id = 1;
+  WorkstationStatus status = 2;
+  string message = 3;
+}
+
+message ApproveWorkstationRequest {
+  string workstation_id = 1;
+}
+
+message ApproveWorkstationResponse {
+  string workstation_id = 1;
+  WorkstationStatus status = 2;
+  string message = 3;
+}
+
+message UpdateWorkstationIdleTimeoutRequest {
+  string workstation_id = 1;
+  // Idle timeout in minutes. Set to 0 to revert to the system default.
+  int32 idle_timeout_minutes = 2;
+}
+
+message UpdateWorkstationIdleTimeoutResponse {
+  string workstation_id = 1;
+  // The idle timeout that was set, in minutes. 0 means system default.
+  int32 idle_timeout_minutes = 2;
+}
+
+message ResizeWorkstationResourcesRequest {
+  string workstation_id = 1;
+  // CPU cores for the workspace container. Omit to leave CPU unchanged.
+  optional int32 cpu = 2;
+  // Memory in whole GiB for the workspace container. Omit to leave memory unchanged.
+  optional int32 memory_gb = 3;
+}
+
+message GetWorkstationResourceResizeRequest {
+  string workstation_id = 1;
+}
+
+enum WorkstationResourceResizeStatus {
+  WORKSTATION_RESOURCE_RESIZE_STATUS_UNSPECIFIED = 0;
+  WORKSTATION_RESOURCE_RESIZE_STATUS_APPLIED = 1;
+  WORKSTATION_RESOURCE_RESIZE_STATUS_PENDING = 2;
+  WORKSTATION_RESOURCE_RESIZE_STATUS_NEEDS_REPROVISION = 3;
+  WORKSTATION_RESOURCE_RESIZE_STATUS_FAILED = 4;
+}
+
+message ResizeWorkstationResourcesResponse {
+  string workstation_id = 1;
+  int32 desired_cpu = 2;
+  int32 desired_memory_gb = 3;
+  WorkstationResourceResizeStatus status = 4;
+  string message = 5;
+  int32 applied_cpu = 6;
+  int32 applied_memory_gb = 7;
+}
+
+message GetWorkstationResourceResizeResponse {
+  string workstation_id = 1;
+  int32 desired_cpu = 2;
+  int32 desired_memory_gb = 3;
+  WorkstationResourceResizeStatus status = 4;
+  string message = 5;
+  int32 applied_cpu = 6;
+  int32 applied_memory_gb = 7;
+}
+
+message UpdateWorkstationDisplayNameRequest {
+  string workstation_id = 1;
+  // Human-readable display label. Unset or empty clears the override.
+  optional string display_name = 2;
+}
+
+message UpdateWorkstationDisplayNameResponse {
+  string workstation_id = 1;
+  optional string display_name = 2;
+}
+
+message SetWorkstationPinnedRequest {
+  string workstation_id = 1;
+  bool pinned = 2;
+}
+
+message SetWorkstationPinnedResponse {
+  string workstation_id = 1;
+  // RFC3339; empty when unpinned.
+  string pinned_at = 2;
+}
+
+message UpdateCommandTagsRequest {
+  string workstation_id = 1;
+  string command_id = 2;
+  // Tags to set. An empty value deletes the tag.
+  map<string, string> tags = 3;
+}
+
+message UpdateCommandTagsResponse {
+  string command_id = 1;
+  // The full set of tags on the command after the update.
+  map<string, string> tags = 2;
+}
+
+message SwitchWorkstationIdentityRequest {
+  string workstation_id = 1;
+  // Username whose GitHub credentials the workstation should use for pushes.
+  // Unset or empty resets the workstation to its owner's own identity.
+  optional string identity = 2;
+}
+
+message SwitchWorkstationIdentityResponse {
+  string workstation_id = 1;
+  // The effective GitHub identity after the switch (the owner when reset).
+  string effective_identity = 2;
+  string message = 3;
+}
+
+message ListWorkstationsRequest {
+  // Include deleted workstations in the response
+  optional bool include_deleted = 1;
+  // Maximum number of workstations to return. 0 means no limit.
+  int32 page_limit = 2;
+  // Number of workstations to skip for pagination.
+  int32 page_offset = 3;
+  // Omit connection URIs and SSH configuration. This avoids resolving
+  // provider access details when callers only need workstation metadata.
+  bool skip_access_details = 4;
+}
+
+message ListWorkstationsResponse {
+  repeated WorkstationSummary workstations = 1;
+  // Total number of workstations matching the query (for pagination).
+  int64 total_count = 2;
+  // Number of recently deleted workstations (last 14 days). Always populated
+  // so the UI can show "Show N archived" without a separate query.
+  int64 recently_deleted_count = 3;
+}
+
+message GetWorkstationRequest {
+  // Workstation name or ID
+  string workstation = 1;
+}
+
+message GetWorkstationResponse {
+  WorkstationSummary workstation = 1;
+}
+
+message GetLatestDeletedWorkstationRequest {
+  string name = 1;
+}
+
+message GetLatestDeletedWorkstationResponse {
+  WorkstationSummary workstation = 1;
+}
+
+message WorkstationURI {
+  // Type of URI (e.g., "code-server", "jupyter", "rstudio")
+  string type = 1;
+  // The actual URI
+  string uri = 2;
+}
+
+message WorkstationSSHConfigOption {
+  // OpenSSH config option key, e.g. "StrictHostKeyChecking".
+  string key = 1;
+  // OpenSSH config option value, e.g. "no".
+  string value = 2;
+}
+
+message WorkstationSSHConfig {
+  // Host alias to pass to ssh and write in the generated Host block.
+  string host = 1;
+  // SSH username for the workstation.
+  string user = 2;
+  // Direct SSH target hostname or IP. Empty when access is purely via ProxyCommand.
+  string hostname = 3;
+  // Direct SSH target port. Zero means omit the Port directive.
+  int32 port = 4;
+  // ProxyCommand argv. The CLI shell-quotes these when writing OpenSSH config.
+  repeated string proxy_command = 5;
+  // Additional OpenSSH config options.
+  repeated WorkstationSSHConfigOption options = 6;
+  // The workstation is reachable only through the orchestrator's SSH relay.
+  // When set (and proxy_command is empty), the CLI supplies its own
+  // `ws ssh-proxy --tunnel` invocation as the ProxyCommand.
+  bool tunnel = 7;
+}
+
+message PullRequest {
+  // Pull request number
+  int32 number = 1;
+  // Pull request title
+  string title = 2;
+  // Pull request URL
+  string url = 3;
+  // Pull request state (e.g., "open", "closed", "merged")
+  string state = 4;
+  // Repository name (e.g., "owner/repo")
+  string repository = 5;
+}
+
+message WorkstationSummary {
+  string workstation_id = 1;
+  string name = 2;
+  WorkstationStatus status = 3;
+  string created_at = 4;
+  string message = 5;
+  int64 running_commands_count = 6;
+  repeated WorkstationURI uris = 7;
+  string last_used_at = 8;
+  repeated Project projects = 9;
+  repeated PullRequest pull_requests = 10;
+  // Compute provider type (e.g., "kube")
+  string provider = 11;
+  // Effective idle timeout in minutes — either the per-workstation override or the system default.
+  // Absent only when the orchestrator has no configured default.
+  optional int32 idle_timeout_minutes = 12;
+  // Whether a snapshot artifact exists for this workstation
+  bool has_snapshot = 13;
+  // Registered preview link ports
+  repeated PreviewLink preview_links = 14;
+  // Human-readable display label. Absent means clients should show name.
+  optional string display_name = 15;
+  // Agent activity derived from commands tagged blox:role=acp or blox:role=prompt.
+  AgentActivityStatus agent_activity_status = 16;
+  // SSH access configuration for the workstation, if SSH is available.
+  WorkstationSSHConfig ssh_config = 17;
+  // Number of EXECUTE_PROCESS commands that are neither bootstrap commands nor
+  // agent chat runs (blox:role=acp/prompt) — i.e. process runs started via the
+  // orchestrator API or CLI outside a chat session.
+  int32 api_run_count = 18;
+  // RFC3339 timestamp of the most recent command creation or status change on
+  // this workstation; empty when it has no commands. A cheap change marker:
+  // clients that already poll the summary can invalidate cached command
+  // history when it moves instead of polling the command list themselves.
+  string last_command_change = 19;
+  // True when the workstation runs in a per-workstation VM that must boot
+  // before bloxlet can execute commands (EC2 Tart placements).
+  bool vm_placement = 20;
+  // Latest estimated agent usage reported by the workstation, when available.
+  AgentCostUsageSummary agent_cost_usage = 21;
+  // Tags set at creation (StartWorkstationRequest.tags), sorted. Lets API
+  // clients find the workstations they created, e.g. by a session identifier.
+  repeated string tags = 22;
+  string user_name = 23;
+  string updated_at = 24;
+  string provider_id = 25;
+  string memory = 26;
+  int32 cpu = 27;
+  optional bool kvm = 28;
+  string image = 29;
+  string sidecar_memory = 30;
+  string first_started_at = 31;
+  string provisioning_started_at = 32;
+  string connected_orchestrator_address = 33;
+  // RFC3339; empty when not pinned to the top of the owner's sidebar.
+  string pinned_at = 34;
+  // Saved selection and resolved shape at creation, independent of today's catalog.
+  SavedComputeSku compute_sku = 35;
+  // Uploaded command_result artifacts; excludes snapshots and prompt attachments.
+  int32 artifact_count = 36;
+  // RFC3339 time of the newest change to those artifacts; empty when none.
+  string last_artifact_change = 37;
+  // Host-side VM base image the workstation's VM was cloned from (EC2 VM
+  // placements); empty when not recorded. Unrelated to `image`, the requested
+  // workspace image alias.
+  string base_image = 38;
+  // True when no online host still serves base_image, so the next VM for this
+  // workstation (e.g. after suspend and resume) boots a newer image.
+  bool base_image_outdated = 39;
+}
+
+message SavedComputeSku {
+  string code = 1;
+  int32 multiple = 2;
+  int32 cpu = 3;
+  int32 memory_gb = 4;
+  string architecture = 5;
+  string compute_provider = 6;
+}
+
+// Latest cumulative agent usage for display in the workstation UI. The cost is
+// an estimate based on the pricing snapshot, not invoiced spend.
+message AgentCostUsageSummary {
+  double total_cost_usd = 1;
+  int64 input_tokens = 2;
+  int64 output_tokens = 3;
+  int64 cache_creation_tokens = 4;
+  int64 cache_read_tokens = 5;
+  string updated_at = 6;
+  // False while one or more reported models are waiting for pricing.
+  bool pricing_complete = 7;
+}
+
+enum AgentActivityStatus {
+  AGENT_ACTIVITY_STATUS_UNSPECIFIED = 0;
+  AGENT_ACTIVITY_STATUS_IDLE = 1;
+  AGENT_ACTIVITY_STATUS_WORKING = 2;
+}
+
+message PreviewLink {
+  // Port number for the preview service
+  int32 port = 1;
+  // Full preview URI for this port
+  string uri = 2;
+}
+
+// ============================================================================
+// Process Execution Messages
+// ============================================================================
+
+message ExecuteProcessRequest {
+  string workstation_id = 1;
+
+  // Command to execute
+  string command = 2;
+  repeated string args = 3;
+
+  // Working directory
+  string working_dir = 4;
+
+  // Environment variables
+  map<string, string> env_vars = 5;
+
+  // If true, bloxlet will buffer output and only emit complete JSON objects as chunks
+  // (one object per chunk, like JSONL lines or JSON-RPC invocations)
+  // If the output is malformed, it will be sent as-is
+  bool json_output = 6;
+
+  // If this is true then we can stream stdin into the process
+  bool stream_stdin = 7;
+
+  // Command IDs that must complete before this command starts
+  repeated string dependencies = 8;
+
+  // If true, command.output webhook events will be sent for this command.
+  // Only one command.output event will be queued at a time per command.
+  bool notify_hooks_on_output = 9;
+
+  // Result files to collect after process completes
+  repeated ResultSpec results = 10;
+
+  // Arbitrary key:value tags to associate with the command (e.g. "blox:role=prompt")
+  map<string, string> tags = 11;
+
+  // When true, the workstation owner receives a Slack DM when this command finishes.
+  bool notification_required = 12;
+
+  // Artifact IDs of previously uploaded prompt attachments (see
+  // UploadPromptAttachment). The bloxlet downloads them onto the workstation
+  // before the process starts; the process fails if any download fails.
+  repeated string attachment_artifact_ids = 13;
+
+  // When set on an ACP agent process (stream_stdin + json_output), the bloxlet
+  // bootstraps the session itself: it performs the ACP handshake and sends the
+  // initial prompt, so the prompt is delivered even if the launching client
+  // disconnects before the process starts.
+  ACPBootstrap acp_bootstrap = 14;
+  // Optional precondition from a prior image identity read. Both values are
+  // required together; the command fails if the running instance changed.
+  string expected_image_id = 15;
+  string expected_instance_id = 16;
+}
+
+// Server-side ACP session bootstrap (see ExecuteProcessRequest.acp_bootstrap).
+message ACPBootstrap {
+  // Initial user prompt, sent as the first session/prompt turn.
+  string initial_prompt = 1;
+  // Session mode id granting unrestricted permissions, applied via
+  // session/set_mode after the session is created (e.g. "bypassPermissions").
+  string unrestricted_mode_id = 2;
+  // For agents that expose permission bypass as a session config option
+  // instead of a mode: applied via session/set_config_option.
+  string unrestricted_config_id = 3;
+  string unrestricted_config_value = 4;
+  // Requested model, applied best-effort through the session's model config
+  // option (covers agents whose model can't be pinned via launch env vars).
+  string model = 5;
+}
+
+message UploadPromptAttachmentRequest {
+  string workstation_id = 1;
+  // Base filename of the attachment (no directory components).
+  string filename = 2;
+  // MIME type of the content, e.g. "image/png".
+  string mime_type = 3;
+  // Raw file content.
+  bytes content = 4;
+}
+
+message UploadPromptAttachmentResponse {
+  // Artifact ID to pass in ExecuteProcessRequest.attachment_artifact_ids.
+  string artifact_id = 1;
+  // Home-relative path the attachment will have on the workstation
+  // (e.g. ".blox/attachments/42-screenshot.png").
+  string workstation_path = 2;
+}
+
+message ExecuteTransientProcessRequest {
+  string workstation_id = 1;
+
+  // Command to execute
+  string command = 2;
+  repeated string args = 3;
+
+  // Working directory
+  string working_dir = 4;
+
+  // Environment variables
+  map<string, string> env_vars = 5;
+
+  bytes stdin = 6;
+
+  // Optional identity precondition for a process that must run on this image and pod.
+  // Set both fields together after reading GetWorkstationStatus with include_image_identity.
+  string expected_image_id = 7;
+  string expected_instance_id = 8;
+}
+
+message ExecuteTransientProcessResponse {
+  int32 exit_code = 1;
+  string stdout = 2;
+  string stderr = 3;
+}
+message ExecuteProcessResponse {
+  string command_id = 1;
+}
+
+message ProcessInfo {
+  string process_id = 1;
+  string command = 2;
+  optional int32 exit_code = 3;
+  string started_at = 4;
+}
+
+message StreamCommandOutputRequest {
+  string workstation_id = 1;
+  string command_id = 2;
+
+  // start from a specific offset
+  optional uint64 resume_id = 3;
+
+  // follow mode (like tail -f)
+  bool follow = 4;
+
+  reserved 5;
+  reserved "include_timestamps";
+
+  // When true, stdin data is included in the stream alongside stdout/stderr.
+  // Used by ACP clients to replay the user side of conversations.
+  bool include_input = 6;
+
+  // When true, output entries are returned without timestamp-based merging,
+  // preserving accurate per-line timestamps. Used by the command output view.
+  bool preserve_timestamp = 7;
+
+  // When true, the stream reports the current end of the recorded output
+  // instead of replaying it: the orchestrator walks the history in-cluster and
+  // returns a single empty response carrying the tail resume_id. A client
+  // reattaching to a long-lived process (`blox acp`) needs only that cursor, so
+  // this keeps reattach cost independent of how much output the process has
+  // already produced. Only honored when follow is false.
+  bool start_at_tail = 8;
+}
+
+message StreamCommandOutputResponse {
+  enum StreamType {
+    // Used when there is just an exit code with no output. Sent as the final
+    // message of a stream whose command produced no output of its own (e.g. a
+    // process that failed before it spawned): data is empty and exit_code
+    // carries how the command ended.
+    STREAM_TYPE_UNSPECIFIED = 0;
+    STREAM_TYPE_STDOUT = 1;
+    STREAM_TYPE_STDERR = 2;
+    STREAM_TYPE_STDIN = 3;
+  }
+
+  StreamType stream = 1;
+  bytes data = 2;
+  // The exit code, only set when the process has exited
+  optional int32 exit_code = 3;
+  // The id of this output chunk. Used for resuming streams
+  uint64 resume_id = 4;
+  // True when this stream is done
+  bool eof = 5;
+  // Timestamp of this chunk in nanoseconds since Unix epoch
+  int64 timestamp = 6;
+}
+
+message StreamACPOutputRequest {
+  string workstation_id = 1;
+  string command_id = 2;
+  // Continuation cursor from an interrupted stream. When set, recorded output
+  // after it is replayed verbatim, with no state digest or turn windowing.
+  optional uint64 resume_id = 3;
+  // Most-recent prompt turns to replay. 0 replays the full transcript.
+  uint32 tail_turns = 4;
+}
+
+// A response with no data and no resume_id is a keep-alive sent while the
+// server analyzes the recording; clients should ignore it.
+message StreamACPOutputResponse {
+  enum StreamType {
+    STREAM_TYPE_UNSPECIFIED = 0;
+    STREAM_TYPE_STDOUT = 1;
+    STREAM_TYPE_STDERR = 2;
+    STREAM_TYPE_STDIN = 3;
+  }
+  StreamType stream = 1;
+  // State-digest messages each carry one whole ACP frame (newline-terminated);
+  // transcript messages carry raw recorded output.
+  bytes data = 2;
+  // The exit code, only set when the process has exited
+  optional int32 exit_code = 3;
+  // Cursor for resuming. Absent on state-digest messages, which are re-derived
+  // on a fresh call rather than resumed.
+  optional uint64 resume_id = 4;
+  // True when this stream is done
+  bool eof = 5;
+  // Timestamp of this chunk in nanoseconds since Unix epoch
+  int64 timestamp = 6;
+  // True on the first transcript message when older turns were omitted. The
+  // state-digest messages before it carry the omitted range's protocol state.
+  bool history_truncated = 7;
+}
+
+message SendProcessInputRequest {
+  string workstation_id = 1;
+  string command_id = 2;
+  optional bytes data = 3;
+  bool eof = 4;
+}
+
+message SendProcessInputResponse {}
+
+message GetCommandOutputRequest {
+  string workstation_id = 1;
+  string command_id = 2;
+  reserved 3;
+  reserved "include_timestamps";
+}
+
+enum OutputStreamType {
+  OUTPUT_STREAM_TYPE_UNSPECIFIED = 0;
+  OUTPUT_STREAM_TYPE_STDOUT = 1;
+  OUTPUT_STREAM_TYPE_STDERR = 2;
+  OUTPUT_STREAM_TYPE_STDIN = 3;
+}
+
+message OutputFragment {
+  OutputStreamType stream_type = 1;
+  string content = 2;
+  uint64 sequence = 3;
+  // Timestamp in nanoseconds since epoch (UTC)
+  int64 timestamp = 4;
+}
+
+message GetCommandOutputResponse {
+  // Output fragments in order
+  repeated OutputFragment fragments = 1;
+  // Exit code if command completed
+  optional int32 exit_code = 2;
+  // Command status: "running" while the command is not finished, then
+  // "completed" or "failed". The terminal statuses mirror the command record
+  // returned by GetWorkstationCommands, so a poller can rely on this field
+  // alone even for commands that never produced output (e.g. a process that
+  // failed before it spawned).
+  string status = 3;
+  // Status message from the command record, set when the command failed
+  // without producing output (e.g. "working directory does not exist: /foo").
+  optional string message = 4;
+}
+
+message StopProcessRequest {
+  string workstation_id = 1;
+  string command_id = 2;
+  bool force = 3;
+}
+
+message StopProcessResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetWorkstationCommandsRequest {
+  string workstation_id = 1;
+  // Optional: limit the number of commands returned (default: 50)
+  optional int32 limit = 2;
+  // Optional: only return commands with specific status. The special value
+  // "active" returns running and idle commands that are not stopping.
+  optional string status = 3;
+}
+
+enum CommandStatus {
+  COMMAND_STATUS_UNSPECIFIED = 0;
+  COMMAND_STATUS_PENDING = 1;
+  COMMAND_STATUS_RUNNING = 2;
+  COMMAND_STATUS_SUCCEEDED = 3;
+  COMMAND_STATUS_FAILED = 4;
+  COMMAND_STATUS_IDLE = 5;
+}
+
+enum CommandType {
+  COMMAND_TYPE_UNSPECIFIED = 0;
+  COMMAND_TYPE_CHECKOUT = 1;
+  COMMAND_TYPE_EXECUTE_PROCESS = 2;
+  COMMAND_TYPE_PROJECT_BOOTSTRAP = 3;
+  COMMAND_TYPE_PROVISION_WORKSPACE = 4;
+  COMMAND_TYPE_RESTORE_SNAPSHOT = 5;
+  COMMAND_TYPE_EXECUTE_BOOTSTRAP = 6;
+}
+
+message CommandSummary {
+  string command_id = 1;
+  CommandType command_type = 2;
+  CommandStatus status = 3;
+  string message = 4;
+  bool is_bootstrap = 5;
+  string created_at = 6;
+  string updated_at = 7;
+  // For execute_process commands, this contains the command name
+  optional string process_command = 8;
+  // For execute_process commands, this contains the command args
+  repeated string process_args = 9;
+  // Command IDs that must complete before this command starts
+  repeated string dependencies = 10;
+  // When the command actually started running (as opposed to created_at which is when it entered the system)
+  optional string started_at = 11;
+  // Tags associated with the command (e.g. "blox:role" = "prompt")
+  map<string, string> tags = 12;
+  // Server-provided operation label for provisioning commands.
+  optional string display_name = 13;
+}
+
+message GetWorkstationCommandsResponse {
+  repeated CommandSummary commands = 1;
+}
+
+// ============================================================================
+// File Operations Messages
+// ============================================================================
+message GetFileContentsRequest {
+  string workstation_id = 1;
+  string file_path = 2;
+}
+
+message GetFileContentsResponse {
+  bytes content = 1;
+}
+
+message StreamFileContentsRequest {
+  string workstation_id = 1;
+  string file_path = 2;
+}
+
+message StreamFileContentsResponse {
+  bytes chunk = 1;
+}
+
+message PutFileContentsRequest {
+  string workstation_id = 1;
+  string file_path = 2;
+  bytes content = 3;
+}
+
+message PutFileContentsResponse {}
+
+message ListFilesRequest {
+  string workstation_id = 1;
+  // Directory path to list (defaults to home directory if empty)
+  string path = 2;
+  // If true, list files recursively
+  bool recursive = 3;
+  // If true, include git modification status for each file
+  bool include_git_status = 4;
+  // Maximum depth to recurse. 0 means unlimited depth.
+  int32 depth = 5;
+}
+
+message ListFilesResponse {
+  repeated FileInfo files = 1;
+}
+
+message FileInfo {
+  // File or directory name
+  string name = 1;
+  // Full path
+  string path = 2;
+  // File size in bytes
+  int64 size = 3;
+  // True if this is a directory
+  bool is_dir = 4;
+  // Modification time as Unix timestamp
+  int64 mod_time = 5;
+  // Git index (staging area) status
+  GitStatusCode git_index_status = 6;
+  // Git working tree status
+  GitStatusCode git_worktree_status = 7;
+}
+
+// Git file status codes from git status --porcelain
+enum GitStatusCode {
+  GIT_STATUS_CODE_UNSPECIFIED = 0;
+  GIT_STATUS_CODE_UNMODIFIED = 1;
+  GIT_STATUS_CODE_MODIFIED = 2;
+  GIT_STATUS_CODE_TYPE_CHANGED = 3;
+  GIT_STATUS_CODE_ADDED = 4;
+  GIT_STATUS_CODE_DELETED = 5;
+  GIT_STATUS_CODE_RENAMED = 6;
+  GIT_STATUS_CODE_COPIED = 7;
+  GIT_STATUS_CODE_UNMERGED = 8;
+  GIT_STATUS_CODE_UNTRACKED = 9;
+  GIT_STATUS_CODE_IGNORED = 10;
+}
+
+// ============================================================================
+// Git Operations Messages
+// ============================================================================
+
+// Reads one diff side, resolving Git LFS pointers. Limited to 10 MiB.
+message GetGitFileContentsRequest {
+  string workstation_id = 1;
+  string project_source = 2;
+  // Repository-relative path, including the original path for a renamed base file.
+  string file_path = 3;
+  // Commit to read. Empty reads the working tree, including uncommitted changes.
+  string revision = 4;
+}
+
+message GetGitFileContentsResponse {
+  bytes content = 1;
+}
+
+message GetGitDiffRequest {
+  string workstation_id = 1;
+
+  // Diff from launch time (default) or specific commit
+  string base_commit = 2;
+
+  // Optional: specific paths to diff
+  repeated string paths = 3;
+
+  // Optional: source of the project to diff (e.g. "github.com/org/repo?ref=main"),
+  // matching a Project.repository.source on the workstation. When empty, the
+  // primary (first non-sync-to-home) project is diffed.
+  string project_source = 4;
+}
+
+message GetGitDiffResponse {
+  string diff = 1;
+  string base_commit = 2;
+  string current_commit = 3;
+  repeated string changed_files = 4;
+  bool truncated = 5;
+  repeated GitDiffHunkContext hunk_contexts = 6;
+
+  // Absolute checkout directory of the diffed project on the workstation.
+  // Diff paths are relative to this directory.
+  string project_dir = 7;
+}
+
+message GitDiffHunkContext {
+  string file_path = 1;
+  int32 old_start = 2;
+  int32 old_lines = 3;
+  int32 new_start = 4;
+  int32 new_lines = 5;
+  string header_context = 6;
+  repeated string enclosing_elements = 7;
+}
+
+message GetWorkstationRepoStateRequest {
+  string workstation_id = 1;
+}
+
+message GetWorkstationRepoStateResponse {
+  repeated WorkstationRepoState repos = 1;
+}
+
+message WorkstationRepoState {
+  string path = 1;
+  string repository = 2;
+  string remote_url = 3;
+  string branch = 4;
+  string head_sha = 5;
+  bool detached = 6;
+  int32 additions = 7;
+  int32 deletions = 8;
+  bool has_uncommitted_changes = 9;
+  string configured_source = 10;
+  string configured_ref = 11;
+  bool registered_project = 12;
+  string error = 13;
+  int32 untracked_files = 14;
+}
+
+message GetWorkstationRunTargetsRequest {
+  string workstation_id = 1;
+}
+
+message GetWorkstationRunTargetsResponse {
+  repeated RunTarget targets = 1;
+  // Human-readable notes about declarations that were skipped (invalid entry,
+  // duplicate name, unparseable config), for surfacing config mistakes.
+  repeated string warnings = 2;
+}
+
+// A named command declared under `run:` in a repo's .blox/workstation.yaml.
+message RunTarget {
+  string name = 1;
+  // Shell command line, executed with bash -lc.
+  string command = 2;
+  // Port the target serves on; 0 when the target has no preview.
+  int32 port = 3;
+  // Absolute working directory the command runs in.
+  string dir = 4;
+}
+
+// ============================================================================
+// Workspace Name Generation Messages (Deprecated)
+// ============================================================================
+
+message GenerateWorkspaceNameRequest {
+  // The prompt/task description from the user
+  string prompt = 1;
+  // Optional: repo name for context
+  optional string repo_name = 2;
+}
+
+message GenerateWorkspaceNameResponse {
+  // Generated workspace name (kebab-case, concise)
+  string name = 1;
+}
+
+// ============================================================================
+// Prompt Analysis Messages
+// ============================================================================
+
+message AnalyzePromptRequest {
+  // The prompt/task description from the user
+  string prompt = 1;
+  // Optional: repo name for workspace name context
+  optional string repo_name = 2;
+  // Whether to generate a workspace name (default: true)
+  optional bool generate_workspace_name = 3;
+}
+
+message AnalyzePromptResponse {
+  // Recommended agent: "opus", "sonnet", "haiku", or "codex"
+  string agent = 1;
+  // Brief explanation of why this agent was recommended
+  string agent_reason = 2;
+  // Generated workspace name (only if generate_workspace_name was true)
+  optional string workspace_name = 3;
+}
+
+// ============================================================================
+// Git Repository Suggestions Messages
+// ============================================================================
+
+message ListRepoSuggestionsRequest {
+  // Unused — kept for proto wire compatibility. The backend returns the
+  // authenticated user's recently used repos regardless of this field.
+  optional string repo_prefix = 1;
+}
+
+message ListRepoSuggestionsResponse {
+  // Repository sources the authenticated user has used recently, ordered by usage
+  // count descending. Capped at 10 entries drawn from workstations created in the
+  // last month.
+  repeated string repos = 1;
+}
+
+// ============================================================================
+// Compute Provider Messages
+// ============================================================================
+
+message ListComputeProvidersRequest {}
+
+message ListComputeProvidersResponse {
+  // The compute providers users may select when starting a workstation.
+  repeated ComputeProvider providers = 1;
+  // The default compute provider name used when no provider is selected.
+  string default_provider = 2;
+  // True when all new starts require compute_sku, even if this user has no eligible SKUs.
+  bool compute_sku_required = 3;
+  repeated ComputeSku compute_skus = 4;
+}
+
+message ComputeSku {
+  string code = 1;
+  string display_name = 2;
+  int32 cpu = 3;
+  int32 memory_gb = 4;
+  string architecture = 5;
+  string compute_provider = 6;
+  // Maximum multiple allowed for this user by both catalog and resource caps.
+  int32 max_multiple = 7;
+}
+
+message ComputeProvider {
+  // The provider name (e.g. "kube"). Pass this in StartWorkstationRequest.compute_provider.
+  string name = 1;
+  // Human-readable label suitable for display in UIs.
+  string label = 2;
+  // Operating system of workstations created by this provider. Lets clients
+  // pick the right paths/conventions without string-matching on name. Names
+  // are operator-configurable (e.g. a kube provider may be named "kitt"), so
+  // clients should rely on this field rather than the name.
+  ComputeProviderOS os = 3;
+  // CPU architectures this provider can run when StartWorkstationRequest.architecture
+  // or .blox/workstation.yaml requests one.
+  repeated string supported_architectures = 4;
+  // Provider-specific workstation parameters users may set when starting a
+  // workstation on this provider.
+  repeated WorkstationParameter parameters = 5;
+}
+
+enum ComputeProviderOS {
+  COMPUTE_PROVIDER_OS_UNSPECIFIED = 0;
+  COMPUTE_PROVIDER_OS_LINUX = 1;
+  COMPUTE_PROVIDER_OS_MACOS = 2;
+}
+
+message WorkstationParameter {
+  // Stable parameter key. Pass this as a key in StartWorkstationRequest.workstation_parameters.
+  string name = 1;
+  // Parameter value type. Values are encoded as strings in StartWorkstationRequest.
+  WorkstationParameterType type = 2;
+  // Human-readable description suitable for display in UIs and CLI help.
+  string description = 3;
+  // Allowed string values. When empty, any value of the declared type is accepted.
+  repeated string allowed_values = 4;
+}
+
+enum WorkstationParameterType {
+  WORKSTATION_PARAMETER_TYPE_UNSPECIFIED = 0;
+  WORKSTATION_PARAMETER_TYPE_STRING = 1;
+  WORKSTATION_PARAMETER_TYPE_INT = 2;
+  WORKSTATION_PARAMETER_TYPE_BOOL = 3;
+}
+
+message PingRequest {}
+message PingResponse {
+  // If present, the service is not ready to accept requests and this is the
+  // reason.
+  optional string not_ready = 1;
+}
+
+message PingWorkstationRequest {
+  string workstation_id = 1;
+}
+
+message PingWorkstationResponse {
+  // Round-trip time from orchestrator to workstation bloxlet, in milliseconds.
+  int64 rtt_ms = 1;
+}
+
+// ============================================================================
+// User Onboarding Status Messages
+// ============================================================================
+
+message GetCurrentUserRequest {}
+
+message GetCurrentUserResponse {
+  reserved 3;
+
+  // The authenticated Blox username from the trusted identity.
+  string user_name = 1;
+  // Human-readable display name when available; otherwise the username.
+  string display_name = 2;
+  // Whether this request has admin privileges.
+  bool is_admin = 4;
+}
+
+// ============================================================================
+// Workstation Quota Messages
+// ============================================================================
+
+message GetWorkstationQuotaRequest {
+  // The provider the workstation would run on. Empty uses the user's default.
+  string compute_provider = 1;
+}
+
+message GetWorkstationQuotaResponse {
+  // Whether creating a workstation now would be queued rather than started immediately.
+  bool would_queue = 1;
+  // Global per-user limit and current runnable usage (across all providers).
+  int32 limit = 2;
+  int32 used = 3;
+  // Whether the resolved provider is in the ec2 family; the ec2_* fields apply only then.
+  bool ec2 = 4;
+  // ec2-family sub-limit and current ec2-family runnable usage for the resolved provider.
+  int32 ec2_limit = 5;
+  int32 ec2_used = 6;
+  // Human-readable label of the resolved provider (e.g. "macOS"), for messaging.
+  string provider_label = 7;
+  // Per-user cap on queued workstations and the user's current queued count.
+  // StartWorkstation rejects with ResourceExhausted once queued_used reaches queued_limit.
+  int32 queued_limit = 8;
+  int32 queued_used = 9;
+  // True when a start now would be rejected (not queued) because the user is at
+  // their queued cap. The create UI uses this to warn before submit.
+  bool would_reject_queued_limit = 10;
+}
+
+// ============================================================================
+// Terminal Messages
+// ============================================================================
+
+message StartTerminalRequest {
+  string workstation_id = 1;
+  // Shell to use (e.g., "/bin/bash", "/bin/zsh"). Defaults to user's default shell.
+  string shell = 2;
+  // Initial terminal dimensions
+  uint32 cols = 3;
+  uint32 rows = 4;
+  // Environment variables to set
+  map<string, string> env_vars = 5;
+  // Working directory (optional, defaults to project directory or home)
+  string working_dir = 6;
+  // The session id of the resulting terminal
+  string session_id = 7;
+}
+
+message StartTerminalResponse {
+  // Unique identifier for this terminal
+  string terminal_id = 1;
+}
+
+message ListTerminalsRequest {
+  string workstation_id = 1;
+}
+
+message ListTerminalsResponse {
+  repeated TerminalInfo terminals = 1;
+}
+
+message TerminalInfo {
+  // Unique identifier for this terminal session
+  string terminal_id = 1;
+  // Shell being used
+  string shell = 2;
+  // When the session was created (Unix timestamp)
+  int64 created_at = 3;
+  // When the session was last active (Unix timestamp)
+  int64 last_activity = 4;
+  // User-assigned name for this terminal session
+  string name = 5;
+}
+
+message RenameTerminalRequest {
+  string workstation_id = 1;
+  string terminal_id = 2;
+  string name = 3;
+}
+
+message RenameTerminalResponse {}
+
+// Bidirectional streaming for terminal I/O
+message StreamTerminalRequest {
+  string workstation_id = 1;
+  string terminal_id = 2;
+  oneof message {
+    // Keyboard input to send to the terminal
+    bytes input = 3;
+    // Resize the terminal
+    StreamTerminalResize resize = 4;
+  }
+}
+
+message StreamTerminalResize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+message StreamTerminalResponse {
+  string terminal_id = 1;
+  oneof message {
+    // Output from the terminal (includes ANSI codes)
+    bytes output = 2;
+    // Terminal session has closed
+    StreamTerminalClosed closed = 3;
+  }
+}
+
+message StreamTerminalClosed {
+  // Exit code of the shell process
+  optional int32 exit_code = 1;
+}
+
+message CloseTerminalRequest {
+  string workstation_id = 1;
+  string terminal_id = 2;
+}
+
+message CloseTerminalResponse {
+  bool success = 1;
+}
+
+// Unary RPC messages for terminal I/O (non-streaming)
+message SendTerminalInputRequest {
+  string workstation_id = 1;
+  string terminal_id = 2;
+  bytes input = 3;
+}
+
+message SendTerminalInputResponse {}
+
+message ResizeTerminalRequest {
+  string workstation_id = 1;
+  string terminal_id = 2;
+  uint32 cols = 3;
+  uint32 rows = 4;
+}
+
+message ResizeTerminalResponse {}
+
+message GetTerminalOutputRequest {
+  string workstation_id = 1;
+  string terminal_id = 2;
+  // If true, block until new output is available (long polling)
+  bool wait_for_output = 4;
+  // Terminal session ID for tracking
+  string session_id = 5;
+}
+
+message GetTerminalOutputResponse {
+  // Output chunks since last fetch
+  repeated bytes output = 1;
+  // Terminal status
+  bool is_closed = 3;
+  // Exit code if terminal closed
+  optional int32 exit_code = 4;
+}
+
+// Server-streaming terminal output (lower latency than polling)
+message StreamTerminalOutputRequest {
+  string workstation_id = 1;
+  string terminal_id = 2;
+  // Terminal session ID
+  string session_id = 4;
+}
+
+message StreamTerminalOutputResponse {
+  // Output data from the terminal
+  bytes output = 1;
+  // True when terminal has closed
+  bool is_closed = 3;
+  // Exit code if terminal closed
+  optional int32 exit_code = 4;
+}
+
+// ============================================================================
+// Artifact Messages
+// ============================================================================
+
+message ResultSpec {
+  // Human-readable name for this result
+  string name = 1;
+  // Path on the workstation to collect (file or directory)
+  string path = 2;
+  // If true, path is a directory and will be archived as .tar.gz
+  bool is_directory = 3;
+}
+
+message GetCommandArtifactsRequest {
+  string workstation_id = 1;
+  string command_id = 2;
+}
+
+message GetCommandArtifactsResponse {
+  repeated Artifact artifacts = 1;
+}
+
+message Artifact {
+  string artifact_id = 1;
+  string name = 2;
+  // Pre-signed S3 GET URL. Empty if the result was not generated/uploaded.
+  optional string download_url = 3;
+  bool is_archive = 4;
+  bool uploaded = 5;
+  // Original filename on the workstation
+  optional string filename = 6;
+  // Size of the uploaded file in bytes
+  optional int64 size_bytes = 7;
+  // The type of artifact (e.g. "command_result", "workstation_snapshot")
+  string artifact_type = 8;
+  // ID of the command that produced this artifact, if any.
+  optional string command_id = 9;
+  // RFC3339 timestamp of when the artifact was created.
+  string created_at = 10;
+  // Compute provider the source workstation ran on (e.g. "kube", "ec2-macos").
+  // Set for snapshots; empty for artifacts created before this was recorded.
+  optional string source_provider_name = 11;
+}
+
+message GetWorkstationArtifactsRequest {
+  string workstation_id = 1;
+}
+
+message GetWorkstationArtifactsResponse {
+  repeated Artifact artifacts = 1;
+}
+
+message DeleteArtifactRequest {
+  string workstation_id = 1;
+  string artifact_id = 2;
+}
+
+message DeleteArtifactResponse {}
+
+// ErrorReason qualifies a Connect error with a domain-level reason, beyond
+// the generic Connect code. It lets clients distinguish backend-issued errors
+// from HTTP errors produced by upstream proxies (Cloudflare Access, WARP,
+// etc.) which connect-es maps to the same Connect code.
+enum ErrorReason {
+  ERROR_REASON_UNSPECIFIED = 0;
+
+  // The caller is authenticated but the workstation they requested is owned
+  // by a different user. Paired with Connect code PermissionDenied.
+  ERROR_REASON_WORKSTATION_OWNERSHIP_DENIED = 1;
+
+  // The caller is authenticated but lacks admin privileges required for the
+  // requested operation. Paired with Connect code PermissionDenied.
+  ERROR_REASON_ADMIN_ACCESS_DENIED = 2;
+
+  // The caller's GitHub OAuth connection is missing, expired, or revoked and
+  // must be re-established via onboarding/settings. Paired with Connect code
+  // FailedPrecondition.
+  ERROR_REASON_GITHUB_AUTH_REQUIRED = 3;
+
+  // The caller's STS delegation is missing or expired and must be re-approved
+  // via settings. Paired with Connect code FailedPrecondition.
+  ERROR_REASON_STS_AUTH_REQUIRED = 4;
+
+  // The caller has not completed Blox onboarding (user record or initial
+  // GitHub authentication missing) and must run the onboarding flow. Paired
+  // with Connect code FailedPrecondition.
+  ERROR_REASON_ONBOARDING_REQUIRED = 5;
+
+  // Snapshot policy disables snapshots for this workstation. Paired with
+  // Connect code FailedPrecondition; shutdown snapshots may safely skip.
+  ERROR_REASON_SNAPSHOTS_DISABLED = 6;
+}
+
+// BloxErrorInfo is attached as a Connect error detail to carry a typed reason
+// alongside the generic Connect code. See ErrorReason.
+message BloxErrorInfo {
+  ErrorReason reason = 1;
+}
+
+// ============================================================================
+// Post-Start Clone Registration (pod-to-pod routing target)
+// ============================================================================
+
+message RegisterPostStartCloneRequest {
+  int64 workstation_id = 1;
+  string working_dir = 2;
+  string source = 3;
+  string git_commit = 4;
+  bool cachew_used = 5;
+  optional int32 requested_cpu = 6;
+  optional int32 requested_memory_gb = 7;
+}
+
+enum PostStartCloneResizeStatus {
+  POST_START_CLONE_RESIZE_STATUS_UNSPECIFIED = 0;
+  POST_START_CLONE_RESIZE_STATUS_NOT_REQUESTED = 1;
+  POST_START_CLONE_RESIZE_STATUS_APPLIED = 2;
+  POST_START_CLONE_RESIZE_STATUS_PENDING = 3;
+  POST_START_CLONE_RESIZE_STATUS_NEEDS_REPROVISION = 4;
+  POST_START_CLONE_RESIZE_STATUS_FAILED = 5;
+}
+
+message RegisterPostStartCloneResponse {
+  PostStartCloneResizeStatus resize_status = 1;
+  string resize_message = 2;
+  int32 desired_cpu = 3;
+  int32 desired_memory_gb = 4;
+  int32 applied_cpu = 5;
+  int32 applied_memory_gb = 6;
+}
+
+message DeliverPendingBootstrapRequest {
+  int64 workstation_id = 1;
+}
+
+message DeliverPendingBootstrapResponse {}
+
+message SnapshotWorkstationRequest {
+  int64 workstation_id = 1;
+  // Human-readable reason for the snapshot, used only for logging.
+  string reason = 2;
+  // Preserved when forwarding so timeout and callback reports share an alert group.
+  string attempt_id = 3;
+}
+
+message SnapshotWorkstationResponse {}

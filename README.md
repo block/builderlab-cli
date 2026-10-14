@@ -1,8 +1,8 @@
 # BuilderLab CLI
 
 `bl` is the command-line interface for BuilderLab. It provides authenticated
-access to BuilderLab skills, agents, workspaces, and apps, along with the
-`bl tools` command for discovering configured tool extensions.
+access to BuilderLab skills, agents, workspaces, apps, and Blox workstations,
+along with the `bl tools` command for discovering configured tool extensions.
 
 The CLI is written in Rust and is built from this repository. Run `bl --help`
 to see the current command surface:
@@ -11,6 +11,7 @@ to see the current command surface:
 auth         Manage BuilderLab marketplace authentication
 workspace    Manage BuilderLab workspaces
 apps         Manage apps through Apps Platform
+blox         Manage Blox workstations
 config       Get and set bl preferences
 skills       Manage BuilderLab skills
 agents       Manage BuilderLab marketplace agents
@@ -82,6 +83,89 @@ from KGoose for the workstation owner and injects it on the wire. Any other
 URL, including an explicit `--base-url` outside that origin, must be an
 approved HTTPS ingress and requires `bl auth login`.
 
+## Blox workstations
+
+Use your existing `bl auth login` session to create and inspect Blox workstations:
+
+```bash
+bl blox skus
+bl blox create my-workstation --multiple 2
+bl blox list
+bl blox get <name-or-full-id>
+bl blox list --include-deleted --limit 20 --offset 20 --json
+bl blox exec my-workstation -- uname -a
+bl blox suspend my-workstation
+bl blox resume my-workstation
+bl blox delete my-workstation
+```
+
+The Blox endpoint defaults to the deployment associated with your BuilderLab
+login: Block staging, public staging, or public production. Block production
+does not currently deploy Blox. Override the endpoint with
+`bl blox --base-url <url> list` or `BL_BLOX_CONTROL_PLANE_URL`. The CLI accepts
+only the approved HTTPS ingress origins `blox.test.blockstaging.build`,
+`blox.public.builderlabstaging.xyz`, and `blox.public.builderlab.xyz`.
+
+The CLI verifies the same stored session used by the other BuilderLab commands
+and sends it as `Authorization: BBIdentity` to Blox ingress. No additional
+login or token configuration is required. Redirects are disabled.
+
+`list` returns your workstations, omits connection details, and defaults to 100
+results. Use `--limit 0` for all results; a nonzero `--offset` requires a
+nonzero limit. `get` forwards your selector to the orchestrator, which resolves
+an active canonical name before a numeric ID. Display labels are not selectors;
+use the full ID for archived workstations. JSON output retains the generated
+protobuf response shape, including string-encoded 64-bit counts. Help and shell
+completions work offline.
+
+`create [NAME]` always requests a new workstation. Its default SKU is
+`DEFAULT_AMD64`, the SKU available in public BuilderLab staging; `--multiple`
+defaults to 1 and must be positive. Use `bl blox skus` to see the codes and
+maximum multiples available to your account, and override with `--sku CODE`
+when needed. The deployment validates SKU availability and multiples. The CLI
+accepts no CPU, memory, repository, or prompt options. It requests no project
+repositories; the deployment may still bootstrap your configured home repository.
+
+Creation returns the initial workstation ID and status without waiting for
+readiness. Inspect it with `bl blox get <id>`. If the response is lost or cannot
+be read, the CLI reports an unknown result and does not retry automatically.
+Inspect `bl blox list` or `bl blox get <name>` before trying again to avoid
+creating a second workstation. Preserve any `--base-url` override for these checks.
+
+`suspend`, `resume`, and `delete` accept a canonical workstation name or full ID.
+The CLI resolves the target once and sends one transition request. It reports
+the server's response without waiting for the final state; use `bl blox get <id>`
+to inspect progress. Suspension can take several minutes while capturing a
+snapshot, then resource teardown may continue after the response. A resume
+response does not establish readiness, and deletion may continue asynchronously.
+
+Deletion archives the workstation. Resume after deletion depends on whether the
+deployment retained a usable snapshot; use its full ID because archived names
+are not resolved. If a transition result is uncertain, inspect that exact ID
+using the same Blox endpoint before trying again. Lifecycle requests are never
+retried automatically.
+
+`exec <WORKSTATION> -- <COMMAND> [ARG...]` runs an executable with literal
+arguments, streams its stdout and stderr, and exits with the remote process's
+exit status. Use `--workdir PATH` before `--` to choose a remote directory;
+otherwise Blox selects the workstation's configured directory. Shell expansion
+and pipelines require an explicit shell, for example:
+
+```bash
+bl blox exec my-workstation -- sh -c 'printf hello; uname -a'
+```
+
+Execution is noninteractive: stdin and PTY allocation are unsupported. Commands
+can run longer than 30 seconds. Interrupting the CLI or losing its connection
+may leave the durable command running. The CLI never retries execution; if a
+result is uncertain, inspect the command in Blox before starting another copy.
+
+With `--json`, execution prints JSONL events with `workstation_id`, `command_id`,
+and `output` containing the generated protobuf stream response (its `data` bytes
+are base64). A final event contains the process's `exit_code`. Local or service
+failures retain the normal JSON error envelope on stderr; a remote nonzero exit
+does not add an error envelope.
+
 ## Local development
 
 Install the repository tools and git hooks once:
@@ -124,6 +208,7 @@ The most useful configuration options are:
 | `BL_SKILLS_PROFILE` | Select a skills configuration profile. |
 | `BL_AUTH_STORAGE` | Select authentication storage, including `file` for local testing. |
 | `BL_AUTH_STORAGE_FILE` | Path used when file-backed auth storage is selected. |
+| `BL_BLOX_CONTROL_PLANE_URL` | Override the approved Blox control-plane ingress. |
 | `KGOOSE_BASE_URL` | Override the backend base URL for local development. |
 | `BL_KGOOSE_PLAYPEN` | Route backend requests through a named development playpen. |
 
@@ -143,6 +228,7 @@ development without modifying keyring state.
 - `src/bl/` contains the `bl` command implementations.
 - `crates/builderlab-auth/` contains browser login, session storage, workspace,
   and organization-routing support.
+- `crates/blox/` contains generated orchestrator protocol types and its Connect client.
 - `src/lib.rs` wires the CLI runtime and test harness together.
 - `tests/bl_e2e.rs` contains the offline and mock-service end-to-end coverage.
 - `docker/acceptance/` contains the isolated skills acceptance harness.
