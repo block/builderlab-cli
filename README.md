@@ -2,7 +2,7 @@
 
 `bl` is the command-line interface for BuilderLab. It provides authenticated
 access to BuilderLab skills, agents, workspaces, and apps, along with the
-`bl tools` command for discovering connected tool extensions.
+`bl tools` command for discovering configured tool extensions.
 
 The CLI is written in Rust and is built from this repository. Run `bl --help`
 to see the current command surface:
@@ -56,6 +56,17 @@ The CLI can also configure the organization used for service routing:
 ./target/debug/bl config set org <org>
 ./target/debug/bl config get org
 ```
+
+`bl tools` (or `bl tools --help`) fetches the configured extensions from the
+selected KGoose backend. Extensions whose credentials are missing for the caller
+appear with `[not connected]` beside their description. The same live list is
+used by `bl tools --describe-commands`. Listing requires backend access and
+authentication, just like inspecting or calling an extension's tools.
+When inspecting an extension fails, `bl tools` also uses the live extension list
+to distinguish an unknown name from a configured extension that is not connected.
+
+The separately packaged `sq agent-tools` command uses the embedded
+`extensions.yaml` catalog for its top-level help and command discovery.
 
 Use `--json` for machine-readable output and `--verbose` for request
 diagnostics. Do not include credentials or other sensitive data when sharing
