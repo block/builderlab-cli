@@ -99,6 +99,38 @@ Unknown backend messages and raw bodies remain hidden; malformed or unavailable
 responses retain the generic HTTP failure. Existing server recovery strings are
 credential-redacted and terminal-safe. This does not retry failed mutations.
 
+## Apps quota and recovery
+
+`bl apps list --scope owned --json` preserves the server's optional `quota`
+metadata. `quota.current_count` is authoritative owner usage, including held
+deploy reservations. The list's `count` describes visible apps and can differ.
+Check `accounting_enabled`, `enforcement_enabled` and `tier_status` before using
+the current allowance. Missing quota metadata does not mean zero or unlimited
+usage; an unavailable tier has no reliable tier-derived limit.
+
+Apps JSON errors retain the public object fields from `error.details`, alongside
+the CLI's `http_status` and reviewed validation diagnostics. Top-level
+`next_action` preserves string or structured recovery guidance. Credentials and
+terminal controls are sanitized only in these error recovery fields. Unsafe
+object keys omit the affected field. Successful JSON data, including multiline
+debug logs and deletion metadata, retains its original shape and contents after
+credential redaction. Authentication failures keep local auth guidance and do
+not expose server details.
+
+For `owner_site_limit_reached`, inspect owned apps on the same control plane,
+delete only an app you no longer need, then refresh authoritative usage before
+retrying. Existing counted apps remain manageable at the cap. Initialization
+does not consume quota; a validated deployment claims a slot, and failure after
+admission can retain that reservation until retry or owner deletion.
+
+Deletion requires the exact app and environment confirmations. A retired route
+does not prove capacity was released: `quota_cleanup_pending: true` means the
+slot remains held. Inspect the same app/environment and refresh
+`bl apps list --scope owned --include-deleted --json`; explicitly retry cleanup
+until the server confirms release. Owner reconciliation and unavailable quota
+or tier services require recovery before another mutation. The CLI does not
+automatically delete apps or retry failed mutations.
+
 ## Local development
 
 Install the repository tools and git hooks once:
