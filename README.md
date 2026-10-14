@@ -82,6 +82,23 @@ from KGoose for the workstation owner and injects it on the wire. Any other
 URL, including an explicit `--base-url` outside that origin, must be an
 approved HTTPS ingress and requires `bl auth login`.
 
+## Apps validation errors
+
+Apps HTTP failures include `error.details.http_status` in JSON output and retain
+the server error code and available trace ID. For HTTP 400
+`artifact_manifest_invalid`, human output and `error.details.validation` give
+repair guidance. Missing `hotpod.manifest.json` and missing fetch-js `ASSETS` or
+`HOTPOD` bindings get specific diagnostics; other manifest failures point to
+the selected control plane's advertised schemas and runtime requirements.
+Rebuild the artifact after fixing it, then explicitly deploy again.
+Use the same control plane for contract discovery, carrying forward any
+`--base-url` override used for the rejected request.
+
+The CLI generates validation details from fixed public validator messages.
+Unknown backend messages and raw bodies remain hidden; malformed or unavailable
+responses retain the generic HTTP failure. Existing server recovery strings are
+credential-redacted and terminal-safe. This does not retry failed mutations.
+
 ## Local development
 
 Install the repository tools and git hooks once:
