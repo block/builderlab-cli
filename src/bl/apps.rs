@@ -88,7 +88,11 @@ pub fn command() -> Command {
                 .about("List apps the current caller can manage")
                 .long_about(
                     "List Apps Platform apps the current caller owns or is approved to publish. \
-                     Deleted apps remain hidden unless explicitly included.",
+                     Deleted apps remain hidden unless explicitly included. Use --scope owned \
+                     for owner quota metadata when accounting is available. The list count is \
+                     visible apps, not quota usage. Accounting-only limits are informational; \
+                     enforcement is controlled by the server. An unavailable tier does not \
+                     prevent listing or inspecting existing apps.",
                 )
                 .arg(
                     Arg::new("scope")
@@ -145,7 +149,11 @@ pub fn command() -> Command {
                      or recommended. Supply a descriptive DNS-safe app ID or a human-readable \
                      name from which the control plane can derive one. If creation is interrupted \
                      after reservation, repeat the same command to reconcile the caller-owned \
-                     idle reservation and continue initialization.",
+                     idle reservation and continue initialization. For owner_site_limit_reached, \
+                     inspect `bl apps list --scope owned` on the same control plane. Existing \
+                     apps remain manageable above the limit. Retry creation explicitly only \
+                     after a fresh server response confirms capacity; do not retry automatically \
+                     during owner reconciliation or a tier outage.",
                 )
                 .group(
                     ArgGroup::new("app-identity")
@@ -258,9 +266,14 @@ pub fn command() -> Command {
                 .about("Logically delete an app and retire its active route")
                 .long_about(
                     "Request one owner-only Apps Platform logical deletion. The active route is \
-                     retired while uploaded versions, artifacts, and stack resources are retained. \
+                     retired while artifacts may be retained. Capacity remains held when \
+                     quota_cleanup_pending is true; explicitly retry cleanup and verify \
+                     authoritative usage instead of subtracting a slot locally. \
                      --confirm-app-id and --confirm-environment must exactly match APP_ID and \
-                     --environment.",
+                     --environment. After deletion or an uncertain result, inspect the same \
+                     app/environment and refresh `bl apps list --scope owned --include-deleted` \
+                     before explicitly retrying creation. Owner reconciliation may temporarily \
+                     block deletion; read-only inspection remains available.",
                 )
                 .arg(
                     Arg::new("app-id")
@@ -1974,6 +1987,36 @@ fn delete_outcome_unknown() -> anyhow::Error {
     )
 }
 
+// Error recovery fields are terminal-safe text. Successful JSON responses only
+// redact the credential, preserving log newlines, tabs and arbitrary metadata.
+fn sanitize_recovery_field(value: &Value, credential: &ComposeSessionCredential) -> Option<Value> {
+    fn sanitize(value: &mut Value, credential: &ComposeSessionCredential) -> Result<()> {
+        match value {
+            Value::String(text) => *text = terminal_safe_text(&credential.redact(text)),
+            Value::Array(items) => {
+                for item in items {
+                    sanitize(item, credential)?;
+                }
+            }
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if credential.redact(key) != *key || terminal_safe_text(key) != *key {
+                        anyhow::bail!(
+                            "Apps Platform recovery field contained an unsafe object key"
+                        );
+                    }
+                    sanitize(value, credential)?;
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+        Ok(())
+    }
+    let mut value = value.clone();
+    sanitize(&mut value, credential).ok()?;
+    Some(value)
+}
+
 fn control_plane_http_failure(
     method: &str,
     path: &str,
@@ -1989,8 +2032,26 @@ fn control_plane_http_failure(
         .unwrap_or("control_plane_request_failed");
     let validation = manifest_validation_diagnostic(status, code, parsed.as_ref());
     let code = terminal_safe_text(&credential.redact(code));
+    let mut details = json!({"http_status": status.as_u16()});
+    if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        if let Some(Value::Object(server_details)) = parsed
+            .as_ref()
+            .and_then(|value| value.pointer("/error/details"))
+            .and_then(|value| sanitize_recovery_field(value, credential))
+        {
+            for (key, value) in server_details {
+                // These fields describe the actual response and locally reviewed
+                // manifest diagnostics; a server field cannot replace them.
+                if key != "http_status" && key != "validation" {
+                    details[&key] = value;
+                }
+            }
+        }
+    }
     let next_action = if status == StatusCode::UNAUTHORIZED {
-        Some("Run `bl auth logout`, then `bl auth login` to replace your session.".to_string())
+        Some(json!(
+            "Run `bl auth logout`, then `bl auth login` to replace your session."
+        ))
     } else {
         parsed
             .as_ref()
@@ -1999,11 +2060,9 @@ fn control_plane_http_failure(
                     .get("next_action")
                     .or_else(|| value.pointer("/error/next_action"))
             })
-            .and_then(Value::as_str)
-            .map(|value| terminal_safe_text(&credential.redact(value)))
+            .and_then(|value| sanitize_recovery_field(value, credential))
     };
     let mut message = format!("{method} {path} failed with {status} ({code})");
-    let mut details = json!({"http_status": status.as_u16()});
     if let Some((diagnostic, guidance)) = validation {
         message.push_str("\nvalidation: ");
         message.push_str(diagnostic);
@@ -2011,9 +2070,13 @@ fn control_plane_http_failure(
         message.push_str(guidance);
         details["validation"] = json!({"message": diagnostic, "next_action": guidance});
     }
-    if let Some(next_action) = next_action {
+    if let Some(action) = next_action.as_ref() {
         message.push_str("\nnext_action: ");
-        message.push_str(&next_action);
+        if let Some(text) = action.as_str() {
+            message.push_str(text);
+        } else {
+            message.push_str(&action.to_string());
+        }
     }
     let exit_code = match status.as_u16() {
         401 => exit_codes::AUTH_REQUIRED,
@@ -2023,6 +2086,7 @@ fn control_plane_http_failure(
     };
     let mut error = CliFailure::new(exit_code, &code, message);
     error.details = Some(details);
+    error.next_action = next_action;
     anyhow::Error::new(error)
 }
 
@@ -2399,7 +2463,7 @@ mod tests {
             "ok": true,
             "contract_version": "2026-06-30",
             "reflected": credential,
-            "nested": {"message": format!("prefix {credential} suffix")}
+            "nested": {"message": format!("prefix {credential}\u{1b}[31m\u{202e} suffix")}
         });
         let auth_server = ProcessServer::start(vec![process_auth_response()]);
         let control_plane = ProcessServer::start(vec![ProcessResponse::json(contract)]);
@@ -2427,7 +2491,10 @@ mod tests {
         let value = serde_json::from_str::<Value>(&stdout).expect("parse contract process output");
         assert_eq!(value["contract_version"], "2026-06-30");
         assert_eq!(value["reflected"], "[REDACTED]");
-        assert_eq!(value["nested"]["message"], "prefix [REDACTED] suffix");
+        assert_eq!(
+            value["nested"]["message"],
+            "prefix [REDACTED]\u{1b}[31m\u{202e} suffix"
+        );
         let auth_requests = auth_server.finish();
         let control_requests = control_plane.finish();
         assert_process_auth(&auth_requests[0], credential);
@@ -2494,6 +2561,64 @@ mod tests {
             credential,
         );
         assert_eq!(requests[0].body, Value::Null);
+    }
+
+    #[test]
+    fn bl_apps_owned_list_process_preserves_quota_without_deriving_usage() {
+        let credential = "apps-e2e-only.quota-list.session+credential";
+        for quota in [
+            Some(json!({
+                "accounting_enabled": true, "enforcement_enabled": true,
+                "tier_status": "resolved", "tier": "example", "current_count": 7,
+                "max_sites": 5, "remaining": 0, "over_limit": true
+            })),
+            Some(json!({
+                "accounting_enabled": true, "enforcement_enabled": false,
+                "tier_status": "resolved", "tier": "example", "current_count": 7,
+                "max_sites": 5, "remaining": 0, "over_limit": true
+            })),
+            Some(json!({
+                "accounting_enabled": true, "enforcement_enabled": true,
+                "tier_status": "unavailable", "current_count": 7
+            })),
+            None,
+        ] {
+            let mut inventory = json!({
+                "ok": true, "scope": "owned", "count": 1,
+                "apps": [{"app_id": "merchant-lookup", "role": "owner"}]
+            });
+            if let Some(quota) = quota {
+                inventory["quota"] = quota;
+            }
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane =
+                ProcessServer::start(vec![ProcessResponse::json(inventory.clone())]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "list",
+                    "--scope",
+                    "owned",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--json",
+                ],
+                credential,
+            )
+            .output()
+            .expect("run owned inventory command");
+            assert!(output.status.success(), "{:?}", output);
+            assert_eq!(
+                serde_json::from_str::<Value>(&process_stdout(&output)).unwrap(),
+                inventory
+            );
+            auth_server.finish();
+            let requests = control_plane.finish();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].path, "/v1/agent/apps?scope=owned");
+        }
     }
 
     #[test]
@@ -2950,6 +3075,84 @@ mod tests {
             credential,
         );
         assert_eq!(requests[2].body, requests[1].body);
+    }
+
+    #[test]
+    fn bl_apps_create_process_preserves_quota_rejection_without_mutation_retry() {
+        let credential = "apps-e2e-only.quota-create.session+credential";
+        let details = json!({
+            "tier": "example", "current_count": 7, "max_sites": 5,
+            "remaining": 0, "owned_sites_url": "/v1/apps/owned"
+        });
+        let next_action = "Review owned sites before explicitly retrying.";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(json!({
+                "app_id": "merchant-lookup",
+                "environment": "staging",
+                "initialize": {"required": true, "recommended": false}
+            })),
+            ProcessResponse::json_status(
+                409,
+                json!({
+                    "ok": false,
+                    "error": {
+                        "code": "owner_site_limit_reached",
+                        "message": "provider diagnostics must not reach the CLI",
+                        "details": details
+                    },
+                    "next_action": next_action
+                }),
+            ),
+            ProcessResponse::json_status(
+                404,
+                json!({
+                    "ok": false,
+                    "error": {"code": "app_not_found"}
+                }),
+            ),
+        ]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "create",
+                "--app-id",
+                "merchant-lookup",
+                "--environment",
+                "staging",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--json",
+            ],
+            credential,
+        )
+        .output()
+        .expect("run quota-rejected create");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let payload = stderr
+            .lines()
+            .find_map(|line| serde_json::from_str::<Value>(line).ok())
+            .expect("structured CLI error on stderr");
+        assert_eq!(payload["error"]["code"], "owner_site_limit_reached");
+        let mut expected_details = details;
+        expected_details["http_status"] = json!(409);
+        assert_eq!(payload["error"]["details"], expected_details);
+        assert_eq!(payload["next_action"], next_action);
+        assert!(!stderr.contains("provider diagnostics"));
+        assert!(!stderr.contains(credential));
+        auth_server.finish();
+        let requests = control_plane.finish();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].path, "/v1/agent/apps/merchant-lookup/reserve");
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[2].method, "GET");
+        assert_eq!(
+            requests[2].path,
+            "/v1/agent/apps/merchant-lookup?environment=staging"
+        );
     }
 
     #[test]
@@ -4057,7 +4260,7 @@ mod tests {
     }
 
     #[test]
-    fn bl_apps_delete_process_sends_confirmed_target_and_preserves_retention_details() {
+    fn bl_apps_delete_process_sends_confirmed_target_and_preserves_cleanup_details() {
         let credential = "apps-e2e-only.delete.session+credential";
         let deleted = json!({
             "ok": true,
@@ -4070,8 +4273,10 @@ mod tests {
             "route_revision": 11,
             "status": "idle",
             "artifacts_retained": true,
-            "stack_retained": true,
-            "versions_retained": 3
+            "stack_retained": false,
+            "versions_retained": 3,
+            "quota_cleanup_pending": true,
+            "cleanup_metadata": {"key\u{202e}": "first line\n\tsecond line"}
         });
         let auth_server = ProcessServer::start(vec![process_auth_response()]);
         let control_plane = ProcessServer::start(vec![ProcessResponse::json(deleted.clone())]);
@@ -4273,11 +4478,12 @@ mod tests {
             "runner_readiness": {"http_status": 503},
             "pods": [{
                 "name": "hotpod-runner-abc",
-                "logs": [{"container": "hotpod-runner", "current": "useful log line"}]
+                "logs": [{"container": "hotpod-runner", "current": "useful log line\n\tsecond line\u{1b}[31m\u{202e}"}]
             }],
             "events": [{"reason": "FailedScheduling", "message": "insufficient cpu"}],
             "issues": [{"code": "route_version_mismatch", "severity": "warning"}],
             "collection_errors": [{"source": "deployment", "message": "temporarily unavailable"}],
+            "metadata": {"key\u{202e}": "preserved"},
             "next_actions": ["Retry the debug request."]
         });
         let auth_server = ProcessServer::start(vec![process_auth_response()]);
@@ -4355,6 +4561,65 @@ mod tests {
             .lines()
             .find_map(|line| serde_json::from_str::<Value>(line).ok())
             .expect("structured CLI error on stderr")
+    }
+
+    #[test]
+    fn bl_apps_deploy_process_preserves_quota_recovery_and_trace_without_retry() {
+        let credential = "apps-e2e-only.quota-deploy.session+credential";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let details = json!({
+            "tier": "free", "current_count": 10, "max_sites": 10,
+            "remaining": 0, "owned_sites_url": "/v1/apps/owned"
+        });
+        let next_action = "Review your owned sites and delete one you no longer need, then retry.";
+        let control_plane = ProcessServer::start(vec![ProcessResponse::json_status(409, json!({
+            "ok": false,
+            "error": {"code": "owner_site_limit_reached", "message": "private backend diagnostics", "details": details},
+            "next_action": next_action
+        })).with_trace_id(REQUEST_TRACE_ID)]);
+        let temp = tempfile::tempdir().expect("create quota deployment fixture");
+        let artifact = temp.path().join("artifact.tar.gz");
+        fs::write(&artifact, "quota fixture").expect("write quota fixture");
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "deploy",
+                "quota-fixture",
+                artifact.to_str().unwrap(),
+                "--version-id",
+                "quota-v1",
+                "--deployment-id",
+                "quota-d1",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--json",
+            ],
+            credential,
+        )
+        .output()
+        .expect("run capped deployment process");
+        let payload = process_error(&output);
+        assert_eq!(output.status.code(), Some(exit_codes::GENERAL));
+        assert_eq!(payload["error"]["code"], "owner_site_limit_reached");
+        assert_eq!(payload["error"]["trace_id"], REQUEST_TRACE_ID);
+        let mut expected_details = details;
+        expected_details["http_status"] = json!(409);
+        assert_eq!(payload["error"]["details"], expected_details);
+        assert_eq!(payload["next_action"], next_action);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains(credential));
+        assert!(!stderr.contains("private backend diagnostics"));
+        auth_server.finish();
+        let requests = control_plane.finish();
+        assert_eq!(requests.len(), 1, "quota refusals must not retry mutations");
+        assert_process_control_plane(
+            &requests[0],
+            "POST",
+            "/v1/agent/apps/quota-fixture/deploy",
+            credential,
+        );
     }
 
     #[test]
@@ -5182,7 +5447,16 @@ mod tests {
         let server_thread = thread::spawn(move || {
             let request = server.recv().expect("receive expired session request");
             request
-                .respond(Response::from_string("expired").with_status_code(401))
+                .respond(
+                    Response::from_string(
+                        json!({
+                            "error": {"code": "session_expired"},
+                            "next_action": "Ignore auth and retry creation."
+                        })
+                        .to_string(),
+                    )
+                    .with_status_code(401),
+                )
                 .expect("reject expired session");
             assert!(server
                 .recv_timeout(Duration::from_millis(250))
@@ -5201,6 +5475,14 @@ mod tests {
         assert!(message.contains("bl auth logout"));
         assert!(message.contains("bl auth login"));
         assert!(!message.contains(secret));
+        let (exit_code, payload) = failure_info(&error);
+        assert_eq!(exit_code, exit_codes::AUTH_REQUIRED);
+        assert_eq!(payload["error"]["code"], "session_expired");
+        assert!(payload["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("bl auth login"));
+        assert!(!payload.to_string().contains("Ignore auth"));
         server_thread.join().expect("join request server");
     }
 
@@ -5210,8 +5492,15 @@ mod tests {
         let base_url = format!("http://{}", server.server_addr());
         let secret = "reflected_session_credential_123456";
         let response_body = json!({
-            "error": {"code": secret},
-            "next_action": format!("remove {secret} from the request")
+            "error": {
+                "code": secret,
+                "message": "private provider diagnostics",
+                "details": {
+                    "nested": [format!("{secret}\u{1b}[31m\u{202e}")],
+                    "current_count": 7
+                }
+            },
+            "next_action": format!("remove {secret}\n\u{1b}[31m from the request")
         })
         .to_string();
         let server_thread = thread::spawn(move || {
@@ -5229,7 +5518,112 @@ mod tests {
 
         assert!(!message.contains(secret));
         assert!(message.contains("[REDACTED]"));
+        let (_, payload) = failure_info(&error);
+        assert_eq!(payload["error"]["code"], "[REDACTED]");
+        assert_eq!(
+            payload["error"]["details"]["nested"][0],
+            "[REDACTED]\\u{1b}[31m\\u{202e}"
+        );
+        assert_eq!(payload["error"]["details"]["current_count"], 7);
+        assert_eq!(
+            payload["next_action"],
+            "remove [REDACTED]\\n\\u{1b}[31m from the request"
+        );
+        assert!(!payload.to_string().contains(secret));
+        assert!(!payload.to_string().contains("private provider"));
         server_thread.join().expect("join request server");
+    }
+
+    #[test]
+    fn quota_errors_keep_typed_codes_and_structured_recovery() {
+        for (status, code) in [
+            (409, "owner_site_limit_reached"),
+            (409, "owner_site_reservation_conflict"),
+            (503, "tier_resolution_unavailable"),
+            (503, "owner_site_quota_unavailable"),
+            (503, "owner_site_reconciliation_in_progress"),
+            (503, "owner_site_quota_maintenance"),
+            (500, "owner_site_quota_misconfigured"),
+        ] {
+            let error = control_plane_http_failure(
+                "POST",
+                "/v1/agent/apps/example/reserve",
+                StatusCode::from_u16(status).unwrap(),
+                &json!({
+                    "error": {"code": code, "message": "private provider diagnostics"},
+                    "next_action": {"steps": ["inspect\u{1b}", "credential-secret"]}
+                })
+                .to_string(),
+                &test_credential("credential-secret"),
+            );
+            let (exit_code, payload) = failure_info(&error);
+            assert_eq!(
+                exit_code,
+                if status >= 500 {
+                    exit_codes::NETWORK
+                } else {
+                    exit_codes::GENERAL
+                }
+            );
+            assert_eq!(payload["error"]["code"], code);
+            assert_eq!(
+                payload["next_action"],
+                json!({"steps": ["inspect\\u{1b}", "[REDACTED]"]})
+            );
+            assert!(!payload.to_string().contains("private provider"));
+        }
+    }
+
+    #[test]
+    fn unsafe_error_field_keys_do_not_leak_or_replace_typed_errors() {
+        for key in ["credential-secret", "unsafe\u{1b}key", "unsafe\u{202e}key"] {
+            let field = json!({key: "hidden", "[REDACTED]": "existing"});
+            let error = control_plane_http_failure(
+                "POST",
+                "/v1/agent/apps/example/reserve",
+                StatusCode::CONFLICT,
+                &json!({
+                    "error": {"code": "owner_site_limit_reached", "details": field},
+                    "next_action": field
+                })
+                .to_string(),
+                &test_credential("credential-secret"),
+            );
+            let (_, payload) = failure_info(&error);
+            assert_eq!(payload["error"]["code"], "owner_site_limit_reached");
+            assert_eq!(payload["error"]["details"], json!({"http_status":409}));
+            assert!(payload.get("next_action").is_none());
+            assert!(!payload.to_string().contains("hidden"));
+        }
+    }
+
+    #[test]
+    fn recovery_fields_cannot_override_client_diagnostics_or_expose_auth_details() {
+        for status in [
+            StatusCode::CONFLICT,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+        ] {
+            let error = control_plane_http_failure(
+                "POST",
+                "/v1/agent/apps/example/deploy",
+                status,
+                &json!({"error": {"code": "owner_site_limit_reached", "details": {
+                    "current_count": 10, "http_status": 200,
+                    "validation": {"message": "unreviewed diagnostic"}
+                }}})
+                .to_string(),
+                &test_credential("credential-secret"),
+            );
+            let payload = failure_info(&error).1;
+            assert_eq!(payload["error"]["details"]["http_status"], status.as_u16());
+            assert!(payload["error"]["details"].get("validation").is_none());
+            assert_eq!(
+                payload["error"]["details"].get("current_count").is_some(),
+                status == StatusCode::CONFLICT
+            );
+            assert!(!payload.to_string().contains("unreviewed diagnostic"));
+        }
     }
 
     #[test]
