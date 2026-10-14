@@ -22,8 +22,8 @@ use cli::{
     TOOLS_COMMAND_NAME,
 };
 use runtime::{
-    load_extension, load_extensions, LoadedExtension, ParameterKind, RuntimeTool, ScalarKind,
-    ToolParameter,
+    load_extension, load_extensions, load_extensions_with_auth_status, LoadedExtension,
+    ParameterKind, RuntimeTool, ScalarKind, ToolParameter,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -244,7 +244,7 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
     }
 
     if bootstrap.describe_commands {
-        if !bootstrap.command_tokens.is_empty() {
+        if config.builderlab_mode || !bootstrap.command_tokens.is_empty() {
             apply_builderlab_mode_if_needed(&mut kgoose_config, config.builderlab_mode)?;
         }
         let description =
@@ -300,7 +300,8 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
         }];
         (extensions, Some(loaded))
     } else {
-        let extensions = load_extensions_catalog()?;
+        apply_builderlab_mode_if_needed(&mut kgoose_config, config.builderlab_mode)?;
+        let extensions = load_tools_extensions(&client, &kgoose_config, config.builderlab_mode)?;
         (extensions, None)
     };
 
@@ -460,7 +461,7 @@ fn load_command_description(
         .collect::<Vec<_>>();
 
     match command_path.as_slice() {
-        [] => load_root_command_description(client, config, tools_cli.describe_root_name),
+        [] => load_root_command_description(client, config, tools_cli),
         [APPKIT_COMMAND_NAME] => Ok(appkit_command_description()),
         [APPKIT_COMMAND_NAME, ..] => {
             anyhow::bail!(
@@ -482,12 +483,27 @@ fn load_command_description(
 }
 
 fn load_root_command_description(
-    _client: &impl KgooseClient,
-    _config: &KgooseConfig,
-    root_name: &str,
+    client: &impl KgooseClient,
+    config: &KgooseConfig,
+    tools_cli: ToolsCliConfig,
 ) -> Result<CommandDescription> {
-    let extensions = load_extensions_catalog()?;
-    Ok(root_command_description(&extensions, root_name))
+    let extensions = load_tools_extensions(client, config, tools_cli.builderlab_mode)?;
+    Ok(root_command_description(
+        &extensions,
+        tools_cli.describe_root_name,
+    ))
+}
+
+fn load_tools_extensions(
+    client: &impl KgooseClient,
+    config: &KgooseConfig,
+    builderlab_mode: bool,
+) -> Result<Vec<runtime::ExtensionSummary>> {
+    if builderlab_mode {
+        load_extensions_with_auth_status(client, config)
+    } else {
+        load_extensions_catalog()
+    }
 }
 
 /// Loads an extension by name, using the static catalog to produce helpful error

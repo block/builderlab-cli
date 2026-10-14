@@ -83,21 +83,40 @@ pub fn load_extensions(
     config: &KgooseConfig,
 ) -> Result<Vec<ExtensionSummary>> {
     let response = client.list_extensions(config)?;
-    Ok(sort_extensions(response)
+    Ok(extension_summaries(response, false))
+}
+
+pub fn load_extensions_with_auth_status(
+    client: &impl KgooseClient,
+    config: &KgooseConfig,
+) -> Result<Vec<ExtensionSummary>> {
+    let response = client.list_extensions(config)?;
+    Ok(extension_summaries(response, true))
+}
+
+fn extension_summaries(
+    response: ListExtensionsResponse,
+    show_auth_status: bool,
+) -> Vec<ExtensionSummary> {
+    sort_extensions(response)
         .into_iter()
         .filter_map(|extension| {
-            let name = extension.name?;
+            let about = compact_text(
+                extension
+                    .description
+                    .as_deref()
+                    .unwrap_or(&format!("{} tools", extension.tool_count.unwrap_or(0))),
+            );
             Some(ExtensionSummary {
-                about: compact_text(
-                    extension
-                        .description
-                        .as_deref()
-                        .unwrap_or(&format!("{} tools", extension.tool_count.unwrap_or(0))),
-                ),
-                name,
+                about: if show_auth_status && extension.auth_satisfied_for_caller == Some(false) {
+                    format!("[not connected] {about}")
+                } else {
+                    about
+                },
+                name: extension.name?,
             })
         })
-        .collect())
+        .collect()
 }
 
 pub fn load_extension(

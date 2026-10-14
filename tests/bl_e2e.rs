@@ -1259,7 +1259,7 @@ fn bl_root_description_lists_apps_not_appkit() {
 }
 
 #[test]
-fn bl_tools_root_help_does_not_require_org() {
+fn bl_tools_root_help_requires_org_without_blox_proxy_auth() {
     let temp = temp_test_dir("bl-tools-help-no-org");
     let bl_home = temp.join("bl-home");
     fs::create_dir_all(&bl_home).expect("create bl home");
@@ -1269,11 +1269,13 @@ fn bl_tools_root_help_does_not_require_org() {
         .args(["tools", "--help"])
         .output()
         .expect("run bl tools help");
-    let (stdout, stderr) = output_text(&output);
+    let (_, stderr) = output_text(&output);
 
-    assert!(output.status.success(), "stderr was: {stderr}");
-    assert!(stdout.contains("Discover auth-backed tool extensions"));
-    assert!(!stderr.contains("org_required"), "stderr was: {stderr}");
+    assert_eq!(output.status.code(), Some(3), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("org is not configured"),
+        "stderr was: {stderr}"
+    );
     fs::remove_dir_all(temp).expect("remove temp dir");
 }
 
@@ -4223,6 +4225,81 @@ fn bl_tools_blox_lists_extensions_without_local_configuration() {
 }
 
 #[test]
+fn bl_tools_root_help_lists_only_configured_extensions_and_marks_missing_credentials() {
+    for args in [vec!["tools"], vec!["tools", "--help"]] {
+        let server = MockServer::start(vec![MockResponse::json(json!({
+            "extensions": [
+                {
+                    "name": "slack",
+                    "description": "Slack tools",
+                    "authSatisfiedForCaller": true
+                },
+                {
+                    "name": "notion",
+                    "description": "Notion tools",
+                    "tool_count": 0,
+                    "auth_satisfied_for_caller": false
+                }
+            ]
+        }))]);
+        let temp = temp_test_dir("bl-tools-live-help");
+        fs::write(temp.join("sessions.json"), "not json")
+            .expect("write unreadable session storage");
+        let output = blox_tools_command(&temp, &server.base_url)
+            .env(
+                "KGOOSE_EXTENSIONS_CATALOG",
+                temp.join("missing-catalog.yaml"),
+            )
+            .env("STS_ACCESS_TOKEN", "ambient-sts-token")
+            .args(args)
+            .output()
+            .expect("list configured extensions");
+        let (stdout, stderr) = output_text(&output);
+        let requests = server.finish();
+
+        assert!(output.status.success(), "stderr was: {stderr}");
+        // clap prints implicit help for a missing subcommand to stderr.
+        let help = format!("{stdout}{stderr}");
+        assert!(
+            help.contains("[not connected] Notion tools"),
+            "help was: {help}"
+        );
+        assert!(help.contains("Slack tools"), "help was: {help}");
+        assert!(!help.contains("[not connected] Slack tools"));
+        assert!(!help.contains("linear"), "help was: {help}");
+        assert!(help.find("notion").unwrap() < help.find("slack").unwrap());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, LIST_EXTENSIONS_PATH);
+        assert!(!requests[0].headers.contains_key("x-bb-session-credential"));
+        assert!(!requests[0]
+            .headers
+            .contains_key("x-forwarded-identity-token"));
+        fs::remove_dir_all(temp).expect("remove temp dir");
+    }
+}
+
+#[test]
+fn bl_tools_root_help_reports_discovery_errors_without_catalog_fallback() {
+    let server = MockServer::start(vec![MockResponse::text(503, "discovery unavailable")]);
+    let output = server
+        .bl_tools_command()
+        .arg("--help")
+        .output()
+        .expect("run bl tools help");
+    let requests = server.finish();
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(!output.status.success());
+    assert!(stdout.is_empty(), "stdout was: {stdout}");
+    assert!(
+        stderr.contains("discovery unavailable"),
+        "stderr was: {stderr}"
+    );
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/api/v3/list-extensions");
+}
+
+#[test]
 fn bl_tools_blox_preserves_same_origin_url_and_explicit_service_path() {
     let server = MockServer::start(vec![list_tools_response(
         "utils",
@@ -4558,11 +4635,7 @@ fn bl_tools_root_metadata_commands_do_not_read_auth_storage() {
     let malformed_storage = temp.join("auth-sessions.json");
     fs::write(&malformed_storage, "not json").expect("write malformed auth storage");
 
-    for args in [
-        vec!["--version"],
-        vec!["--summary"],
-        vec!["--describe-commands"],
-    ] {
+    for args in [vec!["--version"], vec!["--summary"]] {
         let server = MockServer::start(vec![]);
         let output = server
             .bl_tools_command()
@@ -4582,27 +4655,42 @@ fn bl_tools_root_metadata_commands_do_not_read_auth_storage() {
 }
 
 #[test]
-fn bl_tools_describe_commands_uses_static_catalog_without_network() {
-    let server = MockServer::start(vec![]);
+fn bl_tools_describe_commands_uses_configured_extensions_and_connection_status() {
+    let server = MockServer::start(vec![MockResponse::json(json!({
+        "extensions": [
+            {"name": "utils", "description": "Utility helpers", "authSatisfiedForCaller": true},
+            {"name": "secret", "description": "Needs more auth", "authSatisfiedForCaller": false}
+        ]
+    }))]);
     let catalog_path = write_extensions_catalog(
         "bl-tools-describe-commands",
         r#"
-- name: secret
-  about: Needs more auth
-- name: utils
-  about: Utility helpers
+- name: catalog-only
+  about: Should not appear
 "#,
     );
+    let temp = temp_test_dir("bl-tools-live-discovery-session");
+    let storage_path = temp.join("auth-sessions.json");
+    let storage_key =
+        browser_auth_storage_key("default", &format!("{}/cash-app/goose", server.base_url));
+    fs::write(
+        &storage_path,
+        json!({storage_key: {"sessionCredential": "discovery-session"}}).to_string(),
+    )
+    .expect("write auth storage");
 
     let output = server
         .bl_tools_command()
         .env("KGOOSE_EXTENSIONS_CATALOG", &catalog_path)
+        .env("BL_AUTH_STORAGE", "file")
+        .env("BL_AUTH_STORAGE_FILE", &storage_path)
         .arg("--describe-commands")
         .output()
         .expect("run bl tools describe-commands");
     let requests = server.finish();
     let (stdout, stderr) = output_text(&output);
     fs::remove_file(&catalog_path).expect("remove extensions catalog");
+    fs::remove_dir_all(temp).expect("remove temp dir");
 
     assert!(output.status.success(), "stderr was: {stderr}");
     let description = serde_json::from_str::<Value>(&stdout).expect("parse describe output");
@@ -4616,7 +4704,7 @@ fn bl_tools_describe_commands_uses_static_catalog_without_network() {
             },
             {
                 "name": "secret",
-                "summary": "Needs more auth"
+                "summary": "[not connected] Needs more auth"
             },
             {
                 "name": "utils",
@@ -4625,5 +4713,13 @@ fn bl_tools_describe_commands_uses_static_catalog_without_network() {
         ])
     );
     assert!(stderr.is_empty(), "stderr was: {stderr}");
-    assert!(requests.is_empty(), "requests were: {requests:#?}");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/api/v3/list-extensions");
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("x-bb-session-credential")
+            .map(String::as_str),
+        Some("discovery-session")
+    );
 }
