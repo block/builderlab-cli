@@ -1987,7 +1987,8 @@ fn control_plane_http_failure(
         .and_then(|value| value.pointer("/error/code"))
         .and_then(Value::as_str)
         .unwrap_or("control_plane_request_failed");
-    let code = credential.redact(&terminal_safe_text(code));
+    let validation = manifest_validation_diagnostic(status, code, parsed.as_ref());
+    let code = terminal_safe_text(&credential.redact(code));
     let next_action = if status == StatusCode::UNAUTHORIZED {
         Some("Run `bl auth logout`, then `bl auth login` to replace your session.".to_string())
     } else {
@@ -1999,10 +2000,17 @@ fn control_plane_http_failure(
                     .or_else(|| value.pointer("/error/next_action"))
             })
             .and_then(Value::as_str)
-            .map(terminal_safe_text)
-            .map(|value| credential.redact(&value))
+            .map(|value| terminal_safe_text(&credential.redact(value)))
     };
-    let mut message = format!("{method} {path} failed with {status}");
+    let mut message = format!("{method} {path} failed with {status} ({code})");
+    let mut details = json!({"http_status": status.as_u16()});
+    if let Some((diagnostic, guidance)) = validation {
+        message.push_str("\nvalidation: ");
+        message.push_str(diagnostic);
+        message.push_str("\nrepair: ");
+        message.push_str(guidance);
+        details["validation"] = json!({"message": diagnostic, "next_action": guidance});
+    }
     if let Some(next_action) = next_action {
         message.push_str("\nnext_action: ");
         message.push_str(&next_action);
@@ -2013,7 +2021,40 @@ fn control_plane_http_failure(
         value if value >= 500 => exit_codes::NETWORK,
         _ => exit_codes::GENERAL,
     };
-    failure(exit_code, &code, message)
+    let mut error = CliFailure::new(exit_code, &code, message);
+    error.details = Some(details);
+    anyhow::Error::new(error)
+}
+
+fn manifest_validation_diagnostic(
+    status: StatusCode,
+    code: &str,
+    parsed: Option<&Value>,
+) -> Option<(&'static str, &'static str)> {
+    if status != StatusCode::BAD_REQUEST || code != "artifact_manifest_invalid" {
+        return None;
+    }
+    // This code also covers decoder/reader errors and reflected manifest values.
+    // Recognize only fixed public validator messages, returning CLI-owned text.
+    // Never expose arbitrary error.message, even under a known validation code.
+    Some(match parsed.and_then(|value| value.pointer("/error/message")).and_then(Value::as_str) {
+        Some("artifact is missing hotpod.manifest.json") => (
+            "artifact is missing hotpod.manifest.json",
+            "Add hotpod.manifest.json at the archive root. Use the schema endpoint advertised by the selected control plane's `bl apps contract --json` runtime_info.contracts_path, then rebuild the artifact before deploying again.",
+        ),
+        Some("fetch-js manifest is missing required binding ASSETS") => (
+            "fetch-js manifest is missing required binding ASSETS",
+            "Add the ASSETS binding to hotpod.manifest.json. Check all required_bindings in the selected control plane's `bl apps contract --json` runtime_info, then rebuild the artifact before deploying again.",
+        ),
+        Some("fetch-js manifest is missing required binding HOTPOD") => (
+            "fetch-js manifest is missing required binding HOTPOD",
+            "Add the HOTPOD binding to hotpod.manifest.json. Check all required_bindings in the selected control plane's `bl apps contract --json` runtime_info, then rebuild the artifact before deploying again.",
+        ),
+        _ => (
+            "artifact manifest was rejected",
+            "Check hotpod.manifest.json against the schema endpoint and runtime requirements advertised by the selected control plane's `bl apps contract --json` runtime_info (contracts_path and required_bindings), then rebuild the artifact before deploying again.",
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -2228,7 +2269,7 @@ mod tests {
             std::env::set_var("BLOX_WORKSTATION_ID", "test-workstation");
         }
         println!("{PROCESS_STDOUT_BEGIN}");
-        crate::run_bl_with_argv(args).expect("run bl Apps process command");
+        crate::finish_bl(crate::run_bl_with_argv(args));
         println!("{PROCESS_STDOUT_END}");
     }
 
@@ -4314,6 +4355,124 @@ mod tests {
             .lines()
             .find_map(|line| serde_json::from_str::<Value>(line).ok())
             .expect("structured CLI error on stderr")
+    }
+
+    #[test]
+    fn bl_apps_deploy_process_reports_safe_manifest_repairs() {
+        for diagnostic in [
+            "artifact is missing hotpod.manifest.json",
+            "fetch-js manifest is missing required binding ASSETS",
+            "fetch-js manifest is missing required binding HOTPOD",
+        ] {
+            for json_output in [false, true] {
+                let credential = "apps-e2e-only.validation.session+credential";
+                let auth_server = ProcessServer::start(vec![process_auth_response()]);
+                // The deployed backend's error envelope has no details/next_action.
+                let control_plane = ProcessServer::start(vec![ProcessResponse::json_status(
+                    400,
+                    json!({"ok":false, "error":{
+                        "code":"artifact_manifest_invalid", "message":diagnostic
+                    }, "trace_id":REQUEST_TRACE_ID}),
+                )]);
+                let temp = tempfile::tempdir().expect("create invalid artifact directory");
+                let artifact = temp.path().join("artifact.tar.gz");
+                fs::write(&artifact, "invalid artifact fixture").expect("write invalid artifact");
+                let mut args = vec![
+                    "apps",
+                    "deploy",
+                    "validation-fixture",
+                    artifact.to_str().unwrap(),
+                    "--version-id",
+                    "fixture-v1",
+                    "--deployment-id",
+                    "fixture-d1",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                ];
+                if json_output {
+                    args.push("--json");
+                }
+                let output = process_command(&auth_server, &control_plane, &args, credential)
+                    .output()
+                    .expect("run rejected deployment process");
+                assert_eq!(output.status.code(), Some(exit_codes::GENERAL));
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains(diagnostic));
+                assert!(stderr.contains("bl apps contract --json"));
+                assert!(stderr.contains("rebuild the artifact"));
+                assert!(stderr.contains(REQUEST_TRACE_ID));
+                if json_output {
+                    let payload = process_error(&output);
+                    assert_eq!(payload["error"]["code"], "artifact_manifest_invalid");
+                    assert_eq!(payload["error"]["trace_id"], REQUEST_TRACE_ID);
+                    assert_eq!(payload["error"]["details"]["http_status"], 400);
+                    assert_eq!(
+                        payload["error"]["details"]["validation"]["message"],
+                        diagnostic
+                    );
+                    assert!(payload["error"]["details"]["validation"]["next_action"].is_string());
+                }
+                auth_server.finish();
+                let requests = control_plane.finish();
+                assert_eq!(requests.len(), 1, "failed mutations must not be retried");
+                assert_process_control_plane(
+                    &requests[0],
+                    "POST",
+                    "/v1/agent/apps/validation-fixture/deploy",
+                    credential,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bl_apps_deploy_process_hides_unknown_messages_and_handles_unavailable_responses() {
+        let credential = "apps-e2e-only.validation-untrusted.session+credential";
+        let hostile = format!("internal exception {credential}\u{1b}]52;c;hidden\u{7}\u{202e}");
+        for (status, body, expected_code, expected_exit, validation) in [
+            (400, json!({"error":{"code":"artifact_manifest_invalid", "message":hostile,
+                "details":{hostile.clone():hostile.clone()}},
+                "next_action":format!("repair {credential}\u{1b}[31m\u{202e}")}).to_string(),
+                "artifact_manifest_invalid", exit_codes::GENERAL, true),
+            (400, "{ malformed private-body".to_string(), "control_plane_request_failed", exit_codes::GENERAL, false),
+            (502, "<html>unavailable private-body</html>".to_string(), "control_plane_request_failed", exit_codes::NETWORK, false),
+            (502, json!({"error":{"code":"artifact_manifest_invalid", "message":hostile}}).to_string(),
+                "artifact_manifest_invalid", exit_codes::NETWORK, false),
+            (401, json!({"error":{"code":"artifact_manifest_invalid", "message":hostile}, "next_action":hostile}).to_string(),
+                "artifact_manifest_invalid", exit_codes::AUTH_REQUIRED, false),
+            (403, json!({"error":{"code":"access_denied", "message":hostile}}).to_string(),
+                "access_denied", exit_codes::FORBIDDEN, false),
+        ] {
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![ProcessResponse::raw(status, body).with_trace_id(REQUEST_TRACE_ID)]);
+            let temp = tempfile::tempdir().expect("create deployment fixture directory");
+            let artifact = temp.path().join("artifact.tar.gz");
+            fs::write(&artifact, "invalid artifact fixture").expect("write fixture");
+            let output = process_command(&auth_server, &control_plane, &[
+                "apps", "deploy", "validation-fixture", artifact.to_str().unwrap(),
+                "--base-url", APPROVED_TEST_BASE_URL, "--json",
+            ], credential).output().expect("run failing deployment process");
+            let payload = process_error(&output);
+            assert_eq!(output.status.code(), Some(expected_exit));
+            assert_eq!(payload["error"]["code"], expected_code);
+            assert_eq!(payload["error"]["details"]["http_status"], status);
+            assert_eq!(payload["error"]["trace_id"], REQUEST_TRACE_ID);
+            assert_eq!(payload["error"]["details"]["validation"].is_object(), validation);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for forbidden in [credential, "internal exception", "private-body", "\u{1b}", "\u{7}", "\u{202e}"] {
+                assert!(!stderr.contains(forbidden), "unsafe backend text in error output");
+            }
+            if validation {
+                assert!(stderr.contains("[REDACTED]"));
+                assert!(payload["error"]["message"].as_str().unwrap().contains(r"\u{1b}[31m\u{202e}"));
+            }
+            if status == 401 {
+                assert!(stderr.contains("bl auth login"));
+                assert!(!stderr.contains("rebuild the artifact"));
+            }
+            auth_server.finish();
+            assert_eq!(control_plane.finish().len(), 1);
+        }
     }
 
     #[test]

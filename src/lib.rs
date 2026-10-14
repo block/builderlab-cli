@@ -88,7 +88,11 @@ pub fn agent_tools_main() {
 }
 
 pub fn bl_main() {
-    if let Err(err) = run_bl() {
+    finish_bl(run_bl());
+}
+
+fn finish_bl(result: Result<()>) {
+    if let Err(err) = result {
         // `bl skills --json` failures already printed a structured error to
         // stderr; exit silently with the recorded code.
         if let Some(silent) = err
