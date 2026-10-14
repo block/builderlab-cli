@@ -89,8 +89,8 @@ pub fn agent_tools_main() {
 
 pub fn bl_main() {
     if let Err(err) = run_bl() {
-        // `bl skills --json` failures already printed a structured error to
-        // stderr; exit silently with the recorded code.
+        // JSON failures and remote process results are already reported;
+        // exit silently with the recorded code.
         if let Some(silent) = err
             .chain()
             .find_map(|cause| cause.downcast_ref::<bl::skills_api::SilentJsonExit>())
@@ -132,6 +132,7 @@ fn run_bl_with_argv(argv: Vec<String>) -> Result<()> {
                 bl::skills::describe_auth_commands(),
                 bl::workspace::describe_commands(),
                 bl::apps::describe_commands(),
+                bl::blox::describe_commands(),
                 bl::skills::describe_config_commands(),
                 bl::skills::describe_commands(),
                 bl::agents::describe_commands(),
@@ -154,6 +155,7 @@ fn run_bl_with_argv(argv: Vec<String>) -> Result<()> {
         Some(("auth", auth_matches)) => bl::skills::run_auth(auth_matches),
         Some(("workspace", workspace_matches)) => bl::workspace::run(workspace_matches),
         Some(("apps", apps_matches)) => bl::apps::run(apps_matches),
+        Some(("blox", blox_matches)) => bl::blox::run(blox_matches),
         Some(("config", config_matches)) => bl::skills::run_config(config_matches),
         Some(("completions", completions_matches)) => {
             let shell = completions_matches
@@ -180,6 +182,7 @@ fn build_bl_command() -> Command {
         .subcommand(bl::skills::auth_command())
         .subcommand(bl::workspace::command())
         .subcommand(bl::apps::command())
+        .subcommand(bl::blox::command())
         .subcommand(bl::skills::config_command())
         .subcommand(bl::skills::skills_command())
         .subcommand(bl::agents::agents_command())

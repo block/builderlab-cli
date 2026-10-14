@@ -75,8 +75,8 @@ pub fn failure(exit_code: i32, code: &str, message: impl Into<String>) -> anyhow
     anyhow::Error::new(CliFailure::new(exit_code, code, message))
 }
 
-/// Marker error: the failure was already reported as structured JSON on
-/// stderr; `bl_main` should exit with this code without printing again.
+/// Marker for an already reported result or remote process exit status.
+/// `bl_main` should exit with this code without printing again.
 #[derive(Debug)]
 pub struct SilentJsonExit(pub i32);
 

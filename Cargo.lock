@@ -176,6 +176,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "blox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pbjson",
+ "pbjson-build",
+ "prost",
+ "protoc-bin-vendored",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tiny_http",
+ "tonic-prost-build",
+ "url",
+]
+
+[[package]]
 name = "builderlab-auth"
 version = "0.1.0"
 dependencies = [
@@ -1733,6 +1750,7 @@ name = "sq-kgoose"
 version = "0.0.1-beta.1"
 dependencies = [
  "anyhow",
+ "blox",
  "builderlab-auth",
  "clap",
  "clap_complete",

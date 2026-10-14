@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/builderlab-auth"]
+members = ["crates/blox", "crates/builderlab-auth"]
 resolver = "2"
 
 [package]
@@ -20,6 +20,7 @@ path = "src/bin/bl.rs"
 
 [dependencies]
 anyhow = "1"
+blox = { path = "crates/blox" }
 builderlab-auth = { path = "crates/builderlab-auth", features = ["blocking-client"] }
 clap = { version = "4.5", features = ["env"] }
 clap_complete = "4.5"
