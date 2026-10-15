@@ -72,7 +72,7 @@ mod tests {
             &auth,
             &service,
             &[
-                "blox",
+                "compute",
                 "get",
                 "123",
                 "--base-url",
@@ -100,7 +100,7 @@ mod tests {
             &auth,
             &service,
             &[
-                "blox",
+                "compute",
                 "get",
                 "project",
                 "--base-url",
@@ -125,7 +125,7 @@ mod tests {
             &auth,
             &service,
             &[
-                "blox",
+                "compute",
                 "get",
                 "project",
                 "--base-url",

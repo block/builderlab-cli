@@ -93,46 +93,48 @@ mod tests {
 
     #[test]
     fn list_uses_shared_session_and_preserves_protobuf_json() {
-        let auth = auth_service();
-        let service = MockService::start(
-            200,
-            json!({"workstations":[{"workstationId":"9223372036854775806", "name":"project", "status":999}], "totalCount":"9007199254740993", "recentlyDeletedCount":"7"}),
-        );
-        let output = run_process(
-            &auth,
-            &service,
-            &[
-                "blox",
-                "--base-url",
-                "https://blox.public.builderlab.xyz",
-                "list",
-                "--include-deleted",
-                "--limit",
-                "2",
-                "--offset",
-                "3",
-                "--json",
-            ],
-        );
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("9007199254740993"));
-        assert!(stdout.contains("9223372036854775806"));
-        assert!(!stdout.contains("999")); // Forward enum variants become unspecified.
+        for namespace in ["compute", "blox"] {
+            let auth = auth_service();
+            let service = MockService::start(
+                200,
+                json!({"workstations":[{"workstationId":"9223372036854775806", "name":"project", "status":999}], "totalCount":"9007199254740993", "recentlyDeletedCount":"7"}),
+            );
+            let output = run_process(
+                &auth,
+                &service,
+                &[
+                    namespace,
+                    "--base-url",
+                    "https://blox.public.builderlab.xyz",
+                    "list",
+                    "--include-deleted",
+                    "--limit",
+                    "2",
+                    "--offset",
+                    "3",
+                    "--json",
+                ],
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("9007199254740993"));
+            assert!(stdout.contains("9223372036854775806"));
+            assert!(!stdout.contains("999")); // Forward enum variants become unspecified.
 
-        let (path, body) = assert_shared_auth(auth, service);
-        assert!(
-            path.ends_with("/OrchestratorService/ListWorkstations")
-                || path.ends_with(".OrchestratorService/ListWorkstations")
-        );
-        assert_eq!(
-            body,
-            json!({"includeDeleted":true, "pageLimit":2, "pageOffset":3, "skipAccessDetails":true})
-        );
+            let (path, body) = assert_shared_auth(auth, service);
+            assert!(
+                path.ends_with("/OrchestratorService/ListWorkstations")
+                    || path.ends_with(".OrchestratorService/ListWorkstations")
+            );
+            assert_eq!(
+                body,
+                json!({"includeDeleted":true, "pageLimit":2, "pageOffset":3, "skipAccessDetails":true})
+            );
+        }
     }
 
     #[test]
@@ -142,7 +144,7 @@ mod tests {
             &auth,
             &auth,
             &[
-                "blox",
+                "compute",
                 "list",
                 "--base-url",
                 "https://blox.test.blockstaging.build",

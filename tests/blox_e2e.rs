@@ -25,30 +25,48 @@ fn text(output: &Output) -> (String, String) {
 }
 
 #[test]
-fn blox_help_is_available_without_authentication_or_network() {
-    for args in [
-        vec!["blox", "--help"],
-        vec!["blox", "list", "--help"],
-        vec!["blox", "get", "--help"],
-        vec!["blox", "create", "--help"],
-        vec!["blox", "skus", "--help"],
-        vec!["blox", "exec", "--help"],
-        vec!["blox", "suspend", "--help"],
-        vec!["blox", "resume", "--help"],
-        vec!["blox", "delete", "--help"],
+fn compute_help_is_available_without_authentication_or_network() {
+    for operation in [
+        None,
+        Some("list"),
+        Some("get"),
+        Some("create"),
+        Some("skus"),
+        Some("exec"),
+        Some("suspend"),
+        Some("resume"),
+        Some("delete"),
     ] {
-        let (mut command, _home) = offline_command();
-        let output = command.args(&args).output().expect("bl help");
-        let (stdout, stderr) = text(&output);
-        assert!(output.status.success(), "{stderr}");
-        assert!(stdout.contains("Usage: bl blox"));
-        assert!(!stdout.contains("--token"));
-        assert!(!stdout.contains("StartWorkstation"));
+        let mut canonical_help = None;
+        for namespace in ["compute", "blox"] {
+            let mut args = vec![namespace];
+            args.extend(operation);
+            args.push("--help");
+            let (mut command, _home) = offline_command();
+            let output = command.args(&args).output().expect("bl help");
+            let (stdout, stderr) = text(&output);
+            assert!(output.status.success(), "{stderr}");
+            assert!(stdout.contains("Usage: bl compute"));
+            assert!(!stdout.contains("--token"));
+            assert!(!stdout.contains("StartWorkstation"));
+            if let Some(expected) = &canonical_help {
+                assert_eq!(&stdout, expected);
+            } else {
+                canonical_help = Some(stdout);
+            }
+        }
     }
 }
 
 #[test]
-fn blox_is_registered_in_descriptions_and_shell_completions() {
+fn compute_is_registered_in_descriptions_and_shell_completions() {
+    let (mut command, _home) = offline_command();
+    let output = command.arg("--help").output().expect("bl help");
+    assert!(output.status.success());
+    let (stdout, _) = text(&output);
+    assert!(stdout.contains("compute"));
+    assert!(!stdout.contains("blox"));
+
     let (mut command, _home) = offline_command();
     let output = command
         .arg("--describe-commands")
@@ -56,13 +74,18 @@ fn blox_is_registered_in_descriptions_and_shell_completions() {
         .expect("describe bl");
     assert!(output.status.success());
     let description: Value = serde_json::from_slice(&output.stdout).expect("command description");
-    let blox = description["commands"]
+    assert!(!description["commands"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|command| command["name"] == "blox")
-        .expect("blox namespace");
-    let mut names: Vec<_> = blox["commands"]
+        .any(|command| command["name"] == "blox"));
+    let compute = description["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|command| command["name"] == "compute")
+        .expect("compute namespace");
+    let mut names: Vec<_> = compute["commands"]
         .as_array()
         .unwrap()
         .iter()
@@ -74,36 +97,40 @@ fn blox_is_registered_in_descriptions_and_shell_completions() {
         ["create", "delete", "exec", "get", "list", "resume", "skus", "suspend"]
     );
 
-    let (mut command, _home) = offline_command();
-    let output = command
-        .args(["completions", "bash"])
-        .output()
-        .expect("bl completions");
-    assert!(output.status.success());
-    assert!(text(&output).0.contains("blox"));
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let (mut command, _home) = offline_command();
+        let output = command
+            .args(["completions", shell])
+            .output()
+            .expect("bl completions");
+        assert!(output.status.success());
+        let (stdout, _) = text(&output);
+        assert!(stdout.contains("compute"), "{shell}");
+        assert!(!stdout.contains("blox"), "{shell}");
+    }
 }
 
 #[test]
-fn invalid_blox_inputs_fail_before_session_loading() {
+fn invalid_compute_inputs_fail_before_session_loading() {
     for args in [
-        vec!["blox", "list", "--limit=-1"],
-        vec!["blox", "list", "--offset=-1"],
-        vec!["blox", "get"],
-        vec!["blox", "execute"],
-        vec!["blox", "exec"],
-        vec!["blox", "suspend"],
-        vec!["blox", "resume"],
-        vec!["blox", "delete"],
-        vec!["blox", "exec", "my-workstation"],
-        vec!["blox", "create", "--multiple", "0"],
-        vec!["blox", "create", "--multiple=-1"],
-        vec!["blox", "create", "--repo", "https://example.com/repo"],
-        vec!["blox", "create", "--cpu", "2"],
-        vec!["blox", "create", "--memory", "4"],
-        vec!["blox", "create", "--provider", "kube"],
-        vec!["blox", "create", "--architecture", "amd64"],
+        vec!["compute", "list", "--limit=-1"],
+        vec!["compute", "list", "--offset=-1"],
+        vec!["compute", "get"],
+        vec!["compute", "execute"],
+        vec!["compute", "exec"],
+        vec!["compute", "suspend"],
+        vec!["compute", "resume"],
+        vec!["compute", "delete"],
+        vec!["compute", "exec", "my-workstation"],
+        vec!["compute", "create", "--multiple", "0"],
+        vec!["compute", "create", "--multiple=-1"],
+        vec!["compute", "create", "--repo", "https://example.com/repo"],
+        vec!["compute", "create", "--cpu", "2"],
+        vec!["compute", "create", "--memory", "4"],
+        vec!["compute", "create", "--provider", "kube"],
+        vec!["compute", "create", "--architecture", "amd64"],
         vec![
-            "blox",
+            "compute",
             "create",
             "my-workstation",
             "https://example.com/repo",
@@ -118,17 +145,17 @@ fn invalid_blox_inputs_fail_before_session_loading() {
 
     for (args, expected_code) in [
         (
-            vec!["--json", "blox", "exec", "ws", "--", ""],
+            vec!["--json", "compute", "exec", "ws", "--", ""],
             "invalid_command",
         ),
         (
-            vec!["--json", "blox", "list", "--limit", "0", "--offset", "1"],
+            vec!["--json", "compute", "list", "--limit", "0", "--offset", "1"],
             "invalid_pagination",
         ),
         (
             vec![
                 "--json",
-                "blox",
+                "compute",
                 "list",
                 "--base-url",
                 "https://unapproved.example",

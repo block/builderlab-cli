@@ -82,14 +82,14 @@ pub(super) fn print_result<T: Serialize>(
         println!("Message: {}", terminal_safe_text(summary.message));
     }
     println!(
-        "Inspect progress with `bl blox get {}` (preserve any --base-url override).",
+        "Inspect progress with `bl compute get {}` (preserve any --base-url override).",
         terminal_safe_text(requested_id)
     );
     Ok(())
 }
 
 fn lifecycle_unknown(operation: &str, id: &str, server_message: Option<&str>) -> anyhow::Error {
-    let mut message = format!("Blox {operation} result is unknown for workstation {}. Inspect `bl blox get {}` with the same Blox endpoint before trying again; the transition may already be underway. Preserve any --base-url override.", terminal_safe_text(id), terminal_safe_text(id));
+    let mut message = format!("Blox {operation} result is unknown for workstation {}. Inspect `bl compute get {}` with the same Blox endpoint before trying again; the transition may already be underway. Preserve any --base-url override.", terminal_safe_text(id), terminal_safe_text(id));
     if let Some(server_message) = server_message.filter(|message| !message.is_empty()) {
         message.push_str(&format!(
             " Server message: {}",

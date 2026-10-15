@@ -45,7 +45,7 @@ mod tests {
             let catalog = json!({"computeSkuRequired":true, "computeSkus":[{"code":"DEFAULT_AMD64", "displayName":"Default", "cpu":1, "memoryGb":8, "maxMultiple":8, "computeProvider":"worker-cells"}]});
             let service = MockService::start(200, catalog.clone());
             let mut args = vec![
-                "blox",
+                "compute",
                 "skus",
                 "--base-url",
                 "https://blox.test.blockstaging.build",

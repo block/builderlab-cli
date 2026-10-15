@@ -188,7 +188,7 @@ mod tests {
             &auth,
             &service,
             &[
-                "blox",
+                "compute",
                 "exec",
                 "my-workstation",
                 "--workdir",
@@ -234,7 +234,7 @@ mod tests {
             &service,
             &[
                 "--json",
-                "blox",
+                "compute",
                 "exec",
                 "my-workstation",
                 "--base-url",
@@ -271,7 +271,7 @@ mod tests {
                 &auth,
                 &service,
                 &[
-                    "blox",
+                    "compute",
                     "exec",
                     "my-workstation",
                     "--base-url",
@@ -303,7 +303,7 @@ mod tests {
                 &service,
                 &[
                     "--json",
-                    "blox",
+                    "compute",
                     "exec",
                     "my-workstation",
                     "--base-url",
@@ -332,7 +332,7 @@ mod tests {
             &auth,
             &[
                 "--json",
-                "blox",
+                "compute",
                 "exec",
                 "my-workstation",
                 "--base-url",
@@ -386,7 +386,7 @@ mod tests {
                 &service,
                 &[
                     "--json",
-                    "blox",
+                    "compute",
                     "exec",
                     "my-workstation",
                     "--base-url",

@@ -20,7 +20,8 @@ use clap::{ArgMatches, Command};
 use serde_json::Value;
 
 pub fn command() -> Command {
-    context::args(Command::new("blox")
+    context::args(Command::new("compute")
+        .alias("blox")
         .about("Manage Blox workstations")
         .long_about("Manage your Blox workstations using your BuilderLab login. Names are resolved by the orchestrator; use the full ID to identify an archived workstation.")
         .subcommand_required(true)
@@ -45,7 +46,9 @@ pub fn run(matches: &ArgMatches) -> Result<()> {
 }
 
 fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
-    let (operation, args) = matches.subcommand().context("expected a blox subcommand")?;
+    let (operation, args) = matches
+        .subcommand()
+        .context("expected a compute subcommand")?;
     match operation {
         "list" => list::run(config, args),
         "get" => get::run(config, args),
@@ -55,6 +58,6 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         "suspend" => suspend::run(config, args),
         "resume" => resume::run(config, args),
         "delete" => delete::run(config, args),
-        _ => anyhow::bail!("expected a blox subcommand"),
+        _ => anyhow::bail!("expected a compute subcommand"),
     }
 }

@@ -11,7 +11,7 @@ to see the current command surface:
 auth         Manage BuilderLab marketplace authentication
 workspace    Manage BuilderLab workspaces
 apps         Manage apps through Apps Platform
-blox         Manage Blox workstations
+compute      Manage Blox workstations
 config       Get and set bl preferences
 skills       Manage BuilderLab skills
 agents       Manage BuilderLab marketplace agents
@@ -88,21 +88,23 @@ approved HTTPS ingress and requires `bl auth login`.
 Use your existing `bl auth login` session to create and inspect Blox workstations:
 
 ```bash
-bl blox skus
-bl blox create my-workstation --multiple 2
-bl blox list
-bl blox get <name-or-full-id>
-bl blox list --include-deleted --limit 20 --offset 20 --json
-bl blox exec my-workstation -- uname -a
-bl blox suspend my-workstation
-bl blox resume my-workstation
-bl blox delete my-workstation
+bl compute skus
+bl compute create my-workstation --multiple 2
+bl compute list
+bl compute get <name-or-full-id>
+bl compute list --include-deleted --limit 20 --offset 20 --json
+bl compute exec my-workstation -- uname -a
+bl compute suspend my-workstation
+bl compute resume my-workstation
+bl compute delete my-workstation
 ```
+
+`bl blox` remains available as a hidden compatibility alias for `bl compute`.
 
 The Blox endpoint defaults to the deployment associated with your BuilderLab
 login: Block staging, public staging, or public production. Block production
 does not currently deploy Blox. Override the endpoint with
-`bl blox --base-url <url> list` or `BL_BLOX_CONTROL_PLANE_URL`. The CLI accepts
+`bl compute --base-url <url> list` or `BL_BLOX_CONTROL_PLANE_URL`. The CLI accepts
 only the approved HTTPS ingress origins `blox.test.blockstaging.build`,
 `blox.public.builderlabstaging.xyz`, and `blox.public.builderlab.xyz`.
 
@@ -120,21 +122,21 @@ completions work offline.
 
 `create [NAME]` always requests a new workstation. Its default SKU is
 `DEFAULT_AMD64`, the SKU available in public BuilderLab staging; `--multiple`
-defaults to 1 and must be positive. Use `bl blox skus` to see the codes and
+defaults to 1 and must be positive. Use `bl compute skus` to see the codes and
 maximum multiples available to your account, and override with `--sku CODE`
 when needed. The deployment validates SKU availability and multiples. The CLI
 accepts no CPU, memory, repository, or prompt options. It requests no project
 repositories; the deployment may still bootstrap your configured home repository.
 
 Creation returns the initial workstation ID and status without waiting for
-readiness. Inspect it with `bl blox get <id>`. If the response is lost or cannot
+readiness. Inspect it with `bl compute get <id>`. If the response is lost or cannot
 be read, the CLI reports an unknown result and does not retry automatically.
-Inspect `bl blox list` or `bl blox get <name>` before trying again to avoid
+Inspect `bl compute list` or `bl compute get <name>` before trying again to avoid
 creating a second workstation. Preserve any `--base-url` override for these checks.
 
 `suspend`, `resume`, and `delete` accept a canonical workstation name or full ID.
 The CLI resolves the target once and sends one transition request. It reports
-the server's response without waiting for the final state; use `bl blox get <id>`
+the server's response without waiting for the final state; use `bl compute get <id>`
 to inspect progress. Suspension can take several minutes while capturing a
 snapshot, then resource teardown may continue after the response. A resume
 response does not establish readiness, and deletion may continue asynchronously.
@@ -152,7 +154,7 @@ otherwise Blox selects the workstation's configured directory. Shell expansion
 and pipelines require an explicit shell, for example:
 
 ```bash
-bl blox exec my-workstation -- sh -c 'printf hello; uname -a'
+bl compute exec my-workstation -- sh -c 'printf hello; uname -a'
 ```
 
 Execution is noninteractive: stdin and PTY allocation are unsupported. Commands

@@ -155,7 +155,7 @@ fn run_bl_with_argv(argv: Vec<String>) -> Result<()> {
         Some(("auth", auth_matches)) => bl::skills::run_auth(auth_matches),
         Some(("workspace", workspace_matches)) => bl::workspace::run(workspace_matches),
         Some(("apps", apps_matches)) => bl::apps::run(apps_matches),
-        Some(("blox", blox_matches)) => bl::blox::run(blox_matches),
+        Some(("compute", compute_matches)) => bl::blox::run(compute_matches),
         Some(("config", config_matches)) => bl::skills::run_config(config_matches),
         Some(("completions", completions_matches)) => {
             let shell = completions_matches

@@ -7,7 +7,7 @@ use clap::{Arg, ArgMatches, Command};
 
 pub(super) fn command() -> Command {
     Command::new("delete").about("Request workstation deletion")
-        .long_about("Request this transition for a workstation identified by canonical name or full ID. Reports the server response without waiting for the final state; inspect progress with `bl blox get <id>`. Use the full ID for an archived workstation.")
+        .long_about("Request this transition for a workstation identified by canonical name or full ID. Reports the server response without waiting for the final state; inspect progress with `bl compute get <id>`. Use the full ID for an archived workstation.")
         .arg(Arg::new("workstation").value_name("WORKSTATION").required(true).value_parser(clap::builder::NonEmptyStringValueParser::new()))
 }
 
@@ -50,7 +50,7 @@ mod tests {
             &service,
             &[
                 "--json",
-                "blox",
+                "compute",
                 operation,
                 "123",
                 "--base-url",
@@ -78,7 +78,7 @@ mod tests {
             &service,
             &[
                 "--json",
-                "blox",
+                "compute",
                 operation,
                 "123",
                 "--base-url",
@@ -117,7 +117,7 @@ mod tests {
                 &service,
                 &[
                     "--json",
-                    "blox",
+                    "compute",
                     operation,
                     "123",
                     "--base-url",
@@ -129,7 +129,7 @@ mod tests {
             assert_eq!(failure["error"]["code"], "lifecycle_outcome_unknown");
             let message = failure["error"]["message"].as_str().unwrap();
             assert!(message.contains(operation));
-            assert!(message.contains("bl blox get known-id"));
+            assert!(message.contains("bl compute get known-id"));
             assert!(message.contains("--base-url"));
             assert!(message.contains("before trying again"));
             assert_lifecycle_requests(auth, service, operation, "known-id");
@@ -145,7 +145,7 @@ mod tests {
             &auth,
             &[
                 "--json",
-                "blox",
+                "compute",
                 operation,
                 "123",
                 "--base-url",
@@ -172,7 +172,7 @@ mod tests {
             &service,
             &[
                 "--json",
-                "blox",
+                "compute",
                 operation,
                 "123",
                 "--base-url",
