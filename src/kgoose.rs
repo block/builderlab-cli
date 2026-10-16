@@ -145,7 +145,7 @@ impl HttpKgooseClient {
         // Note: Cloudflare returns 200 OK with an HTML login page, not an error status
         if final_url.contains("cloudflareaccess.com") {
             anyhow::bail!(
-                "Cannot connect to kgoose - received Cloudflare Access redirect.\n\
+                "Cannot connect to the tools service - received Cloudflare Access redirect.\n\
                  This usually means you need to connect to the corporate VPN (WARP).\n\
                  Please enable WARP and try again."
             );
@@ -252,7 +252,7 @@ fn debug_enabled() -> bool {
 
 fn debug_log(message: String) {
     if debug_enabled() {
-        eprintln!("{KGOOSE_DEBUG_ENV_VAR}: {message}");
+        eprintln!("tools: {message}");
     }
 }
 
