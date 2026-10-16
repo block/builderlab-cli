@@ -453,7 +453,7 @@ pub fn skills_global_args(command: Command) -> Command {
                 .hide(true)
                 .env(super::skills_config::KGOOSE_SERVICE_PATH_ENV_VAR)
                 .value_name("PATH")
-                .help("Path prefix for kgoose endpoints. [default: /cash-app/goose]"),
+                .help("Path prefix for service endpoints. [default: /cash-app/goose]"),
         )
 }
 
@@ -579,8 +579,8 @@ fn auth_status(config: &SkillsConfig) -> Result<()> {
         if !config.json {
             println!("BuilderLab CLI auth");
             println!("  profile: {}", config.profile);
-            println!("  kgoose base: {}", config.kgoose_base_url);
-            println!("  kgoose service path: {}", config.kgoose_service_path);
+            println!("  server URL: {}", config.kgoose_base_url);
+            println!("  service path: {}", config.kgoose_service_path);
             println!("  authenticated: no");
             return Ok(());
         }
@@ -598,8 +598,8 @@ fn auth_status(config: &SkillsConfig) -> Result<()> {
         let workspace_name = terminal_safe_text(workspace_name);
         println!("BuilderLab CLI auth");
         println!("  profile: {}", config.profile);
-        println!("  kgoose base: {}", config.kgoose_base_url);
-        println!("  kgoose service path: {}", config.kgoose_service_path);
+        println!("  server URL: {}", config.kgoose_base_url);
+        println!("  service path: {}", config.kgoose_service_path);
         println!("  authenticated: yes");
         println!("  workspace: {workspace_name}");
         if let Some(expires_at) = &me.expires_at {
@@ -633,8 +633,8 @@ fn auth_login_browser(config: &SkillsConfig) -> Result<()> {
             .style
             .success("BuilderLab CLI auth browser login succeeded"),
     }
-    println!("  kgoose base: {}", summary.kgoose_base_url);
-    println!("  kgoose service path: {}", summary.kgoose_service_path);
+    println!("  server URL: {}", summary.kgoose_base_url);
+    println!("  service path: {}", summary.kgoose_service_path);
     println!("  storage: {}", summary.storage);
     println!(
         "  workspace: {}",
@@ -707,8 +707,8 @@ fn auth_logout_browser(config: &SkillsConfig) -> Result<()> {
         config.style.warn(&warning);
     }
     println!("  profile: {}", config.profile);
-    println!("  kgoose base: {}", config.kgoose_base_url);
-    println!("  kgoose service path: {}", config.kgoose_service_path);
+    println!("  server URL: {}", config.kgoose_base_url);
+    println!("  service path: {}", config.kgoose_service_path);
     println!("  storage: {}", storage.kind());
     Ok(())
 }
@@ -1552,8 +1552,8 @@ fn doctor(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     println!("BuilderLab skills doctor");
     println!("  profile: {}", config.profile);
     println!("  local dev: {}", yes_no(config.local_dev));
-    println!("  kgoose base: {}", config.kgoose_base_url);
-    println!("  kgoose service path: {}", config.kgoose_service_path);
+    println!("  server URL: {}", config.kgoose_base_url);
+    println!("  service path: {}", config.kgoose_service_path);
     println!("  config: {}", config.config_path.display());
     println!("  bl home: {}", config.bl_home.display());
     println!("  skills home: {}", config.skills_home.display());

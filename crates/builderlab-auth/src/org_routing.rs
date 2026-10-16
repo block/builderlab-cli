@@ -44,7 +44,7 @@ pub fn resolve_org_kgoose_base_url(
     } else {
         format!("https://{base_url}")
     };
-    let mut url = Url::parse(&absolute).context("kGoose base URL must be absolute")?;
+    let mut url = Url::parse(&absolute).context("server URL must be absolute")?;
     match url.host() {
         Some(Host::Domain(host)) if should_route_org_host(host) => {
             let routed_host = if host.starts_with(&format!("{org}.")) {
@@ -53,10 +53,10 @@ pub fn resolve_org_kgoose_base_url(
                 format!("{org}.{host}")
             };
             url.set_host(Some(&routed_host))
-                .map_err(|_| anyhow::anyhow!("failed to route kGoose base URL for org"))?;
+                .map_err(|_| anyhow::anyhow!("failed to route server URL for org"))?;
         }
         Some(Host::Domain(_)) | Some(Host::Ipv4(_)) | Some(Host::Ipv6(_)) => {}
-        None => anyhow::bail!("kGoose base URL must include a host"),
+        None => anyhow::bail!("server URL must include a host"),
     }
     Ok(url.as_str().trim_end_matches('/').to_string())
 }

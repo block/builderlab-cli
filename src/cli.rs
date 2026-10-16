@@ -361,7 +361,7 @@ fn global_args() -> Vec<Arg> {
             .hide(true)
             .env("KGOOSE_BASE_URL")
             .value_name("URL")
-            .help("Base URL for the kgoose service. [default: prod, use https://kgoose.stage.sqprod.co for staging]")
+            .help("Base URL for the tools service.")
             .value_hint(ValueHint::Url),
         Arg::new("playpen")
             .long("playpen")
@@ -370,14 +370,14 @@ fn global_args() -> Vec<Arg> {
             .hide(true)
             .env("KGOOSE_PLAYPEN")
             .value_name("NAME")
-            .help("Route the kgoose service with `Baggage: kgoose-playpen=<name>`."),
+            .help("Route tools requests to a playpen."),
         Arg::new("kgoose-service-path")
             .long("kgoose-service-path")
             .global(true)
             .hide(true)
             .env(KGOOSE_SERVICE_PATH_ENV_VAR)
             .value_name("PATH")
-            .help("Path prefix for kgoose endpoints. [default: /cash-app/goose]"),
+            .help("Path prefix for service endpoints. [default: /cash-app/goose]"),
         Arg::new("goosemcp-playpen")
             .long("goosemcp-playpen")
             .global(true)
