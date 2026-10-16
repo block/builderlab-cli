@@ -106,7 +106,9 @@ login: Block staging, public staging, or public production. Block production
 does not currently deploy Blox. Override the endpoint with
 `bl compute --base-url <url> list` or `BL_BLOX_CONTROL_PLANE_URL`. The CLI accepts
 only the approved HTTPS ingress origins `blox.test.blockstaging.build`,
-`blox.public.builderlabstaging.xyz`, and `blox.public.builderlab.xyz`.
+`blox.public.builderlabstaging.xyz`, and `blox.builderlab.xyz`. Public production
+defaults to `https://blox.builderlab.xyz`; the legacy
+`blox.public.builderlab.xyz` origin remains accepted for explicit overrides.
 
 The CLI verifies the same stored session used by the other BuilderLab commands
 and sends it as `Authorization: BBIdentity` to Blox ingress. No additional

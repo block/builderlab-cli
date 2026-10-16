@@ -12,6 +12,7 @@ const APPROVED_HOSTS: &[&str] = &[
     "blox.test.blockstaging.build",
     "blox.public.builderlabstaging.xyz",
     "blox.public.builderlab.xyz",
+    "blox.builderlab.xyz",
 ];
 
 pub(super) fn args(command: Command) -> Command {
@@ -96,7 +97,7 @@ fn default_endpoint(auth_base_url: &str) -> Result<String> {
     let endpoint = match origin.as_str() {
         "https://test.blockstaging.build" => "https://blox.test.blockstaging.build",
         "https://app.builderlabstaging.xyz" => "https://blox.public.builderlabstaging.xyz",
-        "https://app.builderlab.xyz" => "https://blox.public.builderlab.xyz",
+        "https://app.builderlab.xyz" => "https://blox.builderlab.xyz",
         "https://block.builderlab.xyz" => return Err(failure(exit_codes::GENERAL, "blox_unavailable", "Blox is not deployed in this BuilderLab environment")),
         _ => return Err(failure(exit_codes::GENERAL, "endpoint_required", "No Blox endpoint is configured for this BuilderLab environment; set an approved ingress with --base-url or BL_BLOX_CONTROL_PLANE_URL")),
     };
@@ -161,14 +162,12 @@ mod tests {
                 "https://app.builderlabstaging.xyz",
                 "https://blox.public.builderlabstaging.xyz",
             ),
-            (
-                "https://app.builderlab.xyz",
-                "https://blox.public.builderlab.xyz",
-            ),
+            ("https://app.builderlab.xyz", "https://blox.builderlab.xyz"),
         ] {
             assert_eq!(default_endpoint(auth).unwrap(), blox);
             assert!(validate_endpoint(blox).is_ok());
         }
+        assert!(validate_endpoint("https://blox.public.builderlab.xyz").is_ok());
         assert!(default_endpoint("https://block.builderlab.xyz")
             .unwrap_err()
             .to_string()
@@ -192,6 +191,13 @@ mod tests {
             "https://blox.public.builderlab.xyz/path",
             "https://blox.public.builderlab.xyz/?q=1",
             "https://blox.public.builderlab.xyz/#fragment",
+            "http://blox.builderlab.xyz",
+            "https://blox.builderlab.xyz:8443",
+            "https://blox.builderlab.xyz.evil.test",
+            "https://user@blox.builderlab.xyz",
+            "https://blox.builderlab.xyz/path",
+            "https://blox.builderlab.xyz/?q=1",
+            "https://blox.builderlab.xyz/#fragment",
             "http://127.0.0.1:8895",
         ] {
             assert!(validate_endpoint(endpoint).is_err(), "accepted {endpoint}");
