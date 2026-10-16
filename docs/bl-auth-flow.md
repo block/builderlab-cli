@@ -10,8 +10,8 @@ sequenceDiagram
     participant Auth0
     participant Store as Backend Data Store
 
-    CLI->>CLI: Start localhost callback server
-    CLI->>Browser: Open /v1/auth/login?type=cli&returnTo=http://127.0.0.1:<port>/callback
+    CLI->>CLI: Generate random state and PKCE verifier; start localhost callback server
+    CLI->>Browser: Open /v1/auth/login?type=cli&returnTo=http://127.0.0.1:<port>/callback&state=...&code_challenge=...&code_challenge_method=S256
     Browser->>Backend: Begin CLI login
     Backend->>Store: Store AuthTransaction with type=cli and loopback returnTo
     Backend-->>Browser: Set oauth state cookie, 302 to Auth0 authorize
@@ -21,10 +21,11 @@ sequenceDiagram
     Backend->>Auth0: Exchange code using stored PKCE verifier
     Auth0-->>Backend: ID/access token response
     Backend->>Store: Create short-lived one-time code for CLI login
-    Backend-->>Browser: 302 to localhost callback with code
-    Browser->>CLI: GET /callback?code=...
-    CLI->>Backend: POST /v1/auth/login/exchange { code }
-    Backend->>Store: Verify code is valid, unused, unexpired, and type=cli
+    Backend-->>Browser: 302 to localhost callback with code and client state
+    Browser->>CLI: GET /callback?code=...&state=...
+    CLI->>CLI: Require exactly one matching state before accepting code or error
+    CLI->>Backend: POST /v1/auth/login/exchange { code, code_verifier }
+    Backend->>Store: Verify code is valid, unused, unexpired, type=cli, and matches PKCE challenge
     Backend->>Store: Create cli session credential
     Backend-->>CLI: Return cli session credential
     CLI->>Backend: API request with X-BB-Session-Credential: <cli session>
@@ -37,3 +38,5 @@ Security constraints:
 - Durable session credentials are never placed in redirect URLs.
 - The localhost redirect carries only a short-lived, single-use exchange code.
 - CLI `returnTo` targets must be loopback URLs.
+- Each login generates independent 256-bit random state and PKCE verifier values. The CLI sends only the S256 challenge in the login URL and keeps the verifier in memory until exchange.
+- Callbacks with missing, mismatched, or duplicate state are rejected without consuming the pending login.

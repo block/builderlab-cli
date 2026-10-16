@@ -1,17 +1,52 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use reqwest::blocking::{Client, ClientBuilder};
 use reqwest::header::{ACCEPT, USER_AGENT};
 use reqwest::redirect::Policy;
 use reqwest::StatusCode as HttpStatusCode;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::auth::SESSION_CREDENTIAL_HEADER;
 use crate::auth_storage::StoredSessionCredential;
 
 pub const CLI_USER_AGENT: &str = "sq-kgoose-bl-auth-login";
+
+// Kept in memory for one browser login; never persist or log the verifier.
+pub struct LoginAttempt {
+    state: String,
+    code_verifier: String,
+}
+
+impl LoginAttempt {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            state: random_token()?,
+            code_verifier: random_token()?,
+        })
+    }
+
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+
+    pub fn code_verifier(&self) -> &str {
+        &self.code_verifier
+    }
+
+    fn code_challenge(&self) -> String {
+        URL_SAFE_NO_PAD.encode(Sha256::digest(self.code_verifier.as_bytes()))
+    }
+}
+
+fn random_token() -> Result<String> {
+    let mut bytes = [0; 32];
+    getrandom::fill(&mut bytes).map_err(|_| anyhow!("generate secure login randomness"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct LoginExchangeResponse {
@@ -54,9 +89,10 @@ pub struct VerifiedLoginSession {
     pub me: AuthMeResponse,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct LoginExchangeRequest<'a> {
     code: &'a str,
+    code_verifier: &'a str,
 }
 
 pub fn build_auth_http_client(timeout: Duration) -> Result<Client> {
@@ -72,13 +108,17 @@ pub fn exchange_login_code(
     playpen: Option<&str>,
     server_url: &str,
     code: &str,
+    code_verifier: &str,
 ) -> Result<LoginExchangeResponse> {
     let url = auth_url(server_url, "/v1/auth/login/exchange")?;
     let mut request = client
         .post(url)
         .header(USER_AGENT, CLI_USER_AGENT)
         .header(ACCEPT, "application/json")
-        .json(&LoginExchangeRequest { code });
+        .json(&LoginExchangeRequest {
+            code,
+            code_verifier,
+        });
     if let Some(baggage) = playpen_baggage(playpen) {
         request = request.header("Baggage", baggage);
     }
@@ -96,8 +136,9 @@ pub fn exchange_login_code_and_verify(
     playpen: Option<&str>,
     server_url: &str,
     code: &str,
+    code_verifier: &str,
 ) -> Result<VerifiedLoginSession> {
-    let exchange = exchange_login_code(client, playpen, server_url, code)?;
+    let exchange = exchange_login_code(client, playpen, server_url, code, code_verifier)?;
     let credential = StoredSessionCredential {
         session_credential: exchange.session_credential,
         expires_at: Some(exchange.expires_at),
@@ -173,11 +214,14 @@ pub fn logout_session_credential(
     Ok(true)
 }
 
-pub fn login_url(server_url: &str, callback_url: &str) -> Result<Url> {
+pub fn login_url(server_url: &str, callback_url: &str, attempt: &LoginAttempt) -> Result<Url> {
     let mut url = auth_url(server_url, "/v1/auth/login")?;
     url.query_pairs_mut()
         .append_pair("type", "cli")
-        .append_pair("returnTo", callback_url);
+        .append_pair("returnTo", callback_url)
+        .append_pair("state", attempt.state())
+        .append_pair("code_challenge", &attempt.code_challenge())
+        .append_pair("code_challenge_method", "S256");
     Ok(url)
 }
 
@@ -202,16 +246,15 @@ pub fn playpen_baggage(playpen: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use super::*;
 
     #[test]
     fn verify_session_credential_treats_unauthorized_as_invalid() {
-        let server = SingleResponseServer::start(401, r#"{}"#);
+        let server = TestServer::single(401, r#"{}"#);
         let client = build_auth_http_client(Duration::from_secs(5)).expect("client");
         let credential = StoredSessionCredential {
             session_credential: "expired-session".to_string(),
@@ -220,7 +263,7 @@ mod tests {
 
         let verified = verify_session_credential(&client, None, &server.base_url, &credential)
             .expect("verify session");
-        let request = server.finish();
+        let request = server.finish_one();
 
         assert!(verified.is_none());
         assert_eq!(request.path, "/v1/auth/me");
@@ -233,7 +276,7 @@ mod tests {
     #[test]
     fn verify_session_credential_does_not_echo_failure_body() {
         let secret = "reflected_session_credential_123456";
-        let server = SingleResponseServer::start(500, secret);
+        let server = TestServer::single(500, secret);
         let client = build_auth_http_client(Duration::from_secs(5)).expect("client");
         let credential = StoredSessionCredential {
             session_credential: secret.to_string(),
@@ -242,7 +285,7 @@ mod tests {
 
         let error = verify_session_credential(&client, None, &server.base_url, &credential)
             .expect_err("reject failed session check");
-        let request = server.finish();
+        let request = server.finish_one();
         let message = format!("{error:#}");
 
         assert!(message.contains("/v1/auth/me failed with 500"));
@@ -268,7 +311,7 @@ mod tests {
 
     #[test]
     fn logout_session_credential_posts_logout_and_accepts_success() {
-        let server = SingleResponseServer::start(200, r#"{}"#);
+        let server = TestServer::single(200, r#"{}"#);
         let client = build_auth_http_client(Duration::from_secs(5)).expect("client");
         let credential = StoredSessionCredential {
             session_credential: "valid-session".to_string(),
@@ -277,7 +320,7 @@ mod tests {
 
         let logged_out = logout_session_credential(&client, None, &server.base_url, &credential)
             .expect("logout session");
-        let request = server.finish();
+        let request = server.finish_one();
 
         assert!(logged_out);
         assert_eq!(request.path, "/v1/auth/logout");
@@ -289,7 +332,7 @@ mod tests {
 
     #[test]
     fn logout_session_credential_treats_unauthorized_as_already_invalid() {
-        let server = SingleResponseServer::start(401, r#"{}"#);
+        let server = TestServer::single(401, r#"{}"#);
         let client = build_auth_http_client(Duration::from_secs(5)).expect("client");
         let credential = StoredSessionCredential {
             session_credential: "expired-session".to_string(),
@@ -298,7 +341,7 @@ mod tests {
 
         let logged_out = logout_session_credential(&client, None, &server.base_url, &credential)
             .expect("logout session");
-        let request = server.finish();
+        let request = server.finish_one();
 
         assert!(!logged_out);
         assert_eq!(request.path, "/v1/auth/logout");
@@ -310,7 +353,7 @@ mod tests {
 
     #[test]
     fn verify_session_credential_accepts_successful_me_response() {
-        let server = SingleResponseServer::start(
+        let server = TestServer::single(
             200,
             r#"{"subject":"auth0|user_123","email":"test@example.com","name":"Test User","expires_at":"2026-06-15T00:00:00Z","roles":["ROLE_USER"],"workspaces":{"active":[{"name":"Test Workspace"},{"name":"Other Workspace"}]}}"#,
         );
@@ -323,7 +366,7 @@ mod tests {
         let verified = verify_session_credential(&client, None, &server.base_url, &credential)
             .expect("verify session")
             .expect("authenticated");
-        let request = server.finish();
+        let request = server.finish_one();
 
         assert_eq!(verified.subject.as_deref(), Some("auth0|user_123"));
         assert_eq!(verified.expires_at.as_deref(), Some("2026-06-15T00:00:00Z"));
@@ -339,36 +382,70 @@ mod tests {
     }
 
     #[test]
-    fn login_url_uses_v1_route() {
+    fn login_attempts_have_independent_random_state_and_verifiers() {
+        let first = LoginAttempt::new().expect("first attempt");
+        let second = LoginAttempt::new().expect("second attempt");
+        for token in [
+            first.state(),
+            first.code_verifier(),
+            second.state(),
+            second.code_verifier(),
+        ] {
+            assert_eq!(token.len(), 43);
+            assert_eq!(
+                URL_SAFE_NO_PAD
+                    .decode(token)
+                    .expect("base64url token")
+                    .len(),
+                32
+            );
+        }
+        assert_ne!(first.state(), first.code_verifier());
+        assert_ne!(first.state(), second.state());
+        assert_ne!(first.code_verifier(), second.code_verifier());
+    }
+
+    #[test]
+    fn exchange_failure_does_not_echo_secrets() {
+        let secret = "reflected-code-and-verifier";
+        let server = TestServer::single(400, secret);
+        let client = build_auth_http_client(Duration::from_secs(5)).expect("client");
+        let error = exchange_login_code(&client, None, &server.base_url, secret, secret)
+            .expect_err("reject failed exchange");
+        server.finish_one();
+        assert!(error.to_string().contains("400"));
+        assert!(!format!("{error:#}").contains(secret));
+    }
+
+    #[test]
+    fn login_url_includes_state_and_s256_challenge_without_verifier() {
         let url = login_url(
             "https://example.com/cash-app/goose",
             "http://127.0.0.1:1234/callback",
+            &LoginAttempt {
+                state: "client-state".to_string(),
+                code_verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_string(),
+            },
         )
         .expect("login URL");
 
         assert_eq!(url.path(), "/cash-app/goose/v1/auth/login");
-    }
-
-    #[test]
-    fn exchange_login_code_uses_v1_route() {
-        let server = SingleResponseServer::start(
-            200,
-            r#"{"session_credential":"session","expires_at":"2026-06-15T00:00:00Z"}"#,
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(query["type"], "cli");
+        assert_eq!(query["returnTo"], "http://127.0.0.1:1234/callback");
+        assert_eq!(query["state"], "client-state");
+        // RFC 7636 Appendix B S256 test vector.
+        assert_eq!(
+            query["code_challenge"],
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
-        let client = build_auth_http_client(Duration::from_secs(5)).expect("client");
-
-        let exchange = exchange_login_code(&client, None, &server.base_url, "one-time-code")
-            .expect("exchange");
-        let request = server.finish();
-
-        assert_eq!(exchange.session_credential, "session");
-        assert_eq!(exchange.expires_at, "2026-06-15T00:00:00Z");
-        assert_eq!(request.path, "/v1/auth/login/exchange");
+        assert_eq!(query["code_challenge_method"], "S256");
+        assert!(!query.contains_key("code_verifier"));
     }
 
     #[test]
-    fn exchange_login_code_and_verify_checks_auth_me() {
-        let server = SequentialResponseServer::start(vec![
+    fn login_exchange_sends_verifier_and_returns_verified_session() {
+        let server = TestServer::start(vec![
             (
                 200,
                 r#"{"session_credential":"session","expires_at":"2026-06-15T00:00:00Z"}"#,
@@ -380,9 +457,14 @@ mod tests {
         ]);
         let client = build_auth_http_client(Duration::from_secs(5)).expect("client");
 
-        let verified =
-            exchange_login_code_and_verify(&client, None, &server.base_url, "one-time-code")
-                .expect("verified login");
+        let verified = exchange_login_code_and_verify(
+            &client,
+            None,
+            &server.base_url,
+            "one-time-code",
+            "test-verifier",
+        )
+        .expect("verified login");
         let requests = server.finish();
 
         assert_eq!(verified.credential.session_credential, "session");
@@ -400,6 +482,10 @@ mod tests {
         );
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].path, "/v1/auth/login/exchange");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&requests[0].body).expect("exchange JSON"),
+            serde_json::json!({"code": "one-time-code", "code_verifier": "test-verifier"})
+        );
         assert_eq!(requests[1].path, "/v1/auth/me");
         assert_eq!(
             requests[1].bl_session_credential.as_deref(),
@@ -409,7 +495,7 @@ mod tests {
 
     #[test]
     fn exchange_login_code_and_verify_requires_auth_me_success() {
-        let server = SequentialResponseServer::start(vec![
+        let server = TestServer::start(vec![
             (
                 200,
                 r#"{"session_credential":"session","expires_at":"2026-06-15T00:00:00Z"}"#,
@@ -418,9 +504,14 @@ mod tests {
         ]);
         let client = build_auth_http_client(Duration::from_secs(5)).expect("client");
 
-        let error =
-            exchange_login_code_and_verify(&client, None, &server.base_url, "one-time-code")
-                .expect_err("auth/me rejection fails login");
+        let error = exchange_login_code_and_verify(
+            &client,
+            None,
+            &server.base_url,
+            "one-time-code",
+            "test-verifier",
+        )
+        .expect_err("auth/me rejection fails login");
         let requests = server.finish();
 
         assert!(
@@ -435,42 +526,25 @@ mod tests {
     struct RecordedRequest {
         path: String,
         bl_session_credential: Option<String>,
+        body: String,
     }
 
-    struct SingleResponseServer {
-        base_url: String,
-        handle: thread::JoinHandle<RecordedRequest>,
-    }
-
-    impl SingleResponseServer {
-        fn start(status: u16, body: &'static str) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-            let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
-            let request = Arc::new(Mutex::new(None));
-            let thread_request = Arc::clone(&request);
-            let handle = thread::spawn(move || {
-                let (stream, _) = listener.accept().expect("accept request");
-                handle_connection(stream, status, body, &thread_request);
-                thread_request
-                    .lock()
-                    .expect("request mutex")
-                    .take()
-                    .expect("recorded request")
-            });
-            Self { base_url, handle }
-        }
-
-        fn finish(self) -> RecordedRequest {
-            self.handle.join().expect("join test server")
-        }
-    }
-
-    struct SequentialResponseServer {
+    struct TestServer {
         base_url: String,
         handle: thread::JoinHandle<Vec<RecordedRequest>>,
     }
 
-    impl SequentialResponseServer {
+    impl TestServer {
+        fn single(status: u16, body: &'static str) -> Self {
+            Self::start(vec![(status, body)])
+        }
+
+        fn finish_one(self) -> RecordedRequest {
+            let mut requests = self.finish();
+            assert_eq!(requests.len(), 1, "expected a single request");
+            requests.pop().expect("recorded request")
+        }
+
         fn start(responses: Vec<(u16, &'static str)>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
             let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
@@ -478,15 +552,7 @@ mod tests {
                 let mut requests = Vec::new();
                 for (status, body) in responses {
                     let (stream, _) = listener.accept().expect("accept request");
-                    let request = Arc::new(Mutex::new(None));
-                    handle_connection(stream, status, body, &request);
-                    requests.push(
-                        request
-                            .lock()
-                            .expect("request mutex")
-                            .take()
-                            .expect("recorded request"),
-                    );
+                    requests.push(handle_connection(stream, status, body));
                 }
                 requests
             });
@@ -498,12 +564,7 @@ mod tests {
         }
     }
 
-    fn handle_connection(
-        mut stream: TcpStream,
-        status: u16,
-        body: &str,
-        request: &Arc<Mutex<Option<RecordedRequest>>>,
-    ) {
+    fn handle_connection(mut stream: TcpStream, status: u16, body: &str) -> RecordedRequest {
         let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
         let mut request_line = String::new();
         reader.read_line(&mut request_line).expect("request line");
@@ -514,6 +575,7 @@ mod tests {
             .to_string();
 
         let mut bl_session_credential = None;
+        let mut content_length = 0;
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).expect("request header");
@@ -521,16 +583,16 @@ mod tests {
                 break;
             }
             if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().expect("content length");
+                }
                 if name.eq_ignore_ascii_case(SESSION_CREDENTIAL_HEADER) {
                     bl_session_credential = Some(value.trim().to_string());
                 }
             }
         }
-        *request.lock().expect("request mutex") = Some(RecordedRequest {
-            path,
-            bl_session_credential,
-        });
-
+        let mut body_bytes = vec![0; content_length];
+        reader.read_exact(&mut body_bytes).expect("request body");
         let response = format!(
             "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -538,5 +600,10 @@ mod tests {
         stream
             .write_all(response.as_bytes())
             .expect("write response");
+        RecordedRequest {
+            path,
+            bl_session_credential,
+            body: String::from_utf8(body_bytes).expect("UTF-8 body"),
+        }
     }
 }

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use builderlab_auth::auth_login::{
     build_auth_http_client, exchange_login_code_and_verify, login_url, logout_session_credential,
-    verify_session_credential, AuthMeResponse, VerifiedLoginSession,
+    verify_session_credential, AuthMeResponse, LoginAttempt, VerifiedLoginSession,
 };
 use builderlab_auth::auth_storage::StoredSessionCredential;
 use serde::Serialize;
@@ -122,11 +122,13 @@ fn run_browser_login_inner(
     let server = Server::http("127.0.0.1:0")
         .map_err(|error| anyhow!("listen on loopback callback port: {error}"))?;
     let callback_url = format!("http://{}{}", server.server_addr(), CALLBACK_PATH);
-    let login_url = login_url(&service_url, &callback_url)?;
+    let attempt = LoginAttempt::new()?;
+    let login_url = login_url(&service_url, &callback_url, &attempt)?;
+    let expected_state = attempt.state().to_string();
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let result = receive_exchange_code(server);
+        let result = receive_exchange_code(server, &expected_state);
         let _ = tx.send(result);
     });
 
@@ -146,8 +148,13 @@ fn run_browser_login_inner(
     let code = rx
         .recv()
         .context("loopback auth server stopped before login completed")??;
-    let verified =
-        exchange_login_code_and_verify(&client, config.playpen.as_deref(), &service_url, &code)?;
+    let verified = exchange_login_code_and_verify(
+        &client,
+        config.playpen.as_deref(),
+        &service_url,
+        &code,
+        attempt.code_verifier(),
+    )?;
     let (stored, me, workspace_name) =
         validate_and_store_login_credential(storage, &storage_key, verified)?;
     auth_info(
@@ -234,7 +241,7 @@ pub fn logout_stored_session(
     logout_session_credential(&client, config.playpen.as_deref(), &service_url, &stored)
 }
 
-fn receive_exchange_code(server: Server) -> Result<String> {
+fn receive_exchange_code(server: Server, expected_state: &str) -> Result<String> {
     for request in server.incoming_requests() {
         let url = request.url().to_string();
         let parsed =
@@ -248,28 +255,48 @@ fn receive_exchange_code(server: Server) -> Result<String> {
             continue;
         }
 
-        let error = parsed
+        let mut states = parsed
             .query_pairs()
-            .find(|(key, _)| key == "error")
-            .map(|(_, value)| value.into_owned());
-        if let Some(error) = error {
+            .filter(|(key, _)| key == "state")
+            .map(|(_, value)| value);
+        if states.next().as_deref() != Some(expected_state) || states.next().is_some() {
             respond_auth_page(request, StatusCode(400), AuthCallbackPage::Failure)?;
-            return Err(anyhow!("auth callback returned error: {error}"));
+            continue;
         }
 
-        let code = parsed
-            .query_pairs()
-            .find(|(key, _)| key == "code")
-            .map(|(_, value)| value.into_owned())
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow!("auth callback did not include an exchange code"))?;
-        respond_auth_page(request, StatusCode(200), AuthCallbackPage::Success)?;
-        return Ok(code);
+        let result = callback_exchange_code(&parsed);
+        let (status, page) = if result.is_ok() {
+            (StatusCode(200), AuthCallbackPage::Success)
+        } else {
+            (StatusCode(400), AuthCallbackPage::Failure)
+        };
+        respond_auth_page(request, status, page)?;
+        return result;
     }
 
     Err(anyhow!(
         "loopback auth server stopped without receiving a callback"
     ))
+}
+
+// Only parse the login result after the caller has validated the callback state.
+fn callback_exchange_code(url: &Url) -> Result<String> {
+    if url.query_pairs().any(|(key, _)| key == "error") {
+        return Err(anyhow!("auth callback returned an authentication error"));
+    }
+
+    let mut codes = url
+        .query_pairs()
+        .filter(|(key, _)| key == "code")
+        .map(|(_, value)| value);
+    let code = codes
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("auth callback did not include an exchange code"))?;
+    if codes.next().is_some() {
+        return Err(anyhow!("auth callback included duplicate exchange codes"));
+    }
+    Ok(code.into_owned())
 }
 
 fn respond_text(request: tiny_http::Request, status: StatusCode, body: &str) -> Result<()> {
@@ -373,9 +400,88 @@ mod tests {
     };
 
     use super::{
-        auth_callback_page, store_login_credential, validate_and_store_login_credential,
-        verify_stored_session_with, AuthCallbackPage,
+        auth_callback_page, receive_exchange_code, store_login_credential,
+        validate_and_store_login_credential, verify_stored_session_with, AuthCallbackPage,
     };
+
+    fn callback_server() -> (String, std::thread::JoinHandle<Result<String>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("callback server");
+        let url = format!("http://{}/callback", server.server_addr());
+        let handle = std::thread::spawn(move || receive_exchange_code(server, "expected-state"));
+        (url, handle)
+    }
+
+    #[test]
+    fn invalid_state_cannot_complete_or_cancel_pending_login() {
+        let (url, handle) = callback_server();
+        let client =
+            builderlab_auth::auth_login::build_auth_http_client(std::time::Duration::from_secs(5))
+                .expect("client");
+        for query in [
+            "code=attacker-code",
+            "code=attacker-code&state=",
+            "code=attacker-code&state=wrong",
+            "error=denied&state=wrong",
+            "code=attacker-code&state=expected-state&state=wrong",
+            "code=attacker-code&state=expected-state&state=expected-state",
+        ] {
+            let response = client
+                .get(format!("{url}?{query}"))
+                .send()
+                .expect("callback");
+            assert_eq!(response.status().as_u16(), 400, "callback query: {query}");
+            assert!(response
+                .text()
+                .expect("failure page")
+                .contains("Sign-in didn’t finish"));
+            assert!(!handle.is_finished());
+        }
+        let response = client
+            .get(format!("{url}?code=valid-code&state=expected-state"))
+            .send()
+            .expect("valid callback");
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            handle.join().expect("callback thread").expect("code"),
+            "valid-code"
+        );
+    }
+
+    #[test]
+    fn matching_state_rejects_malformed_codes_and_provider_errors() {
+        let client =
+            builderlab_auth::auth_login::build_auth_http_client(std::time::Duration::from_secs(5))
+                .expect("client");
+        for (query, expected_error) in [
+            ("", "auth callback did not include an exchange code"),
+            ("code=", "auth callback did not include an exchange code"),
+            (
+                "code=one&code=two",
+                "auth callback included duplicate exchange codes",
+            ),
+            (
+                "error=private-provider-error&code=one",
+                "auth callback returned an authentication error",
+            ),
+        ] {
+            let (url, handle) = callback_server();
+            let response = client
+                .get(format!("{url}?state=expected-state&{query}"))
+                .send()
+                .expect("invalid callback");
+            assert_eq!(response.status().as_u16(), 400, "callback query: {query}");
+            let error = handle
+                .join()
+                .expect("callback thread")
+                .expect_err("invalid callback");
+            // The full error must describe the failure without reflecting provider details.
+            assert_eq!(
+                format!("{error:#}"),
+                expected_error,
+                "callback query: {query}"
+            );
+        }
+    }
 
     struct SwappingStorage {
         reads: RefCell<VecDeque<StoredSessionCredential>>,
