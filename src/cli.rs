@@ -13,7 +13,7 @@ use crate::runtime::{LoadedExtension, ParameterKind, RuntimeTool, ScalarKind, To
 
 pub const ROOT_COMMAND_NAME: &str = "agent-tools";
 pub const ROOT_BIN_NAME: &str = "sq agent-tools";
-pub const ROOT_SUMMARY: &str = "Discover auth-backed tool extensions exposed through kGoose";
+pub const ROOT_SUMMARY: &str = "Discover auth-backed tool extensions";
 pub const TOOLS_COMMAND_NAME: &str = "tools";
 pub const BL_TOOLS_BIN_NAME: &str = "bl tools";
 pub const APPKIT_COMMAND_NAME: &str = "appkit";
