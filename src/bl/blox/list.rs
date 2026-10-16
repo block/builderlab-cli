@@ -105,7 +105,7 @@ mod tests {
                 &[
                     namespace,
                     "--base-url",
-                    "https://blox.public.builderlab.xyz",
+                    "https://blox.builderlab.xyz",
                     "list",
                     "--include-deleted",
                     "--limit",
