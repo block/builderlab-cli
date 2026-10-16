@@ -193,6 +193,7 @@ impl Client {
             .send()
             .context("call Blox StreamCommandOutput")?;
         let status = response.status();
+        let response_headers = response.headers().clone();
         if !status.is_success() {
             let mut body = Vec::new();
             response
@@ -203,7 +204,12 @@ impl Client {
                 body.len() as u64 <= MAX_RESPONSE_BYTES,
                 "Blox StreamCommandOutput error exceeds 2 MiB"
             );
-            return Err(self.response_error(status, &body, "StreamCommandOutput"));
+            return Err(self.response_error(
+                status,
+                &body,
+                "StreamCommandOutput",
+                &response_headers,
+            ));
         }
         let content_type = response
             .headers()
@@ -290,6 +296,7 @@ impl Client {
             .send()
             .with_context(|| format!("call Blox {method}"))?;
         let status = response.status();
+        let response_headers = response.headers().clone();
         let mut body = Vec::new();
         response
             .take(MAX_RESPONSE_BYTES + 1)
@@ -300,7 +307,7 @@ impl Client {
             "Blox {method} response exceeds 2 MiB"
         );
         if !status.is_success() {
-            return Err(self.response_error(status, &body, method));
+            return Err(self.response_error(status, &body, method, &response_headers));
         }
         self.decode_response(&body, method)
     }
@@ -310,10 +317,19 @@ impl Client {
         status: reqwest::StatusCode,
         body: &[u8],
         method: &str,
+        headers: &HeaderMap,
     ) -> anyhow::Error {
+        let context = self.response_error_context(headers);
         if let Ok(mut error) = serde_json::from_slice::<RpcError>(body) {
-            error.code = self.redact(&error.code);
-            error.message = self.redact(&error.message);
+            error.code = strip_bidi_controls(&strip_ansi(&self.redact(&error.code)))
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect();
+            error.message = format!(
+                "Blox {method} failed with HTTP {status}: {}{}",
+                self.sanitize_detail(&error.message),
+                context
+            );
             return error.into();
         }
         let code = match status.as_u16() {
@@ -327,9 +343,115 @@ impl Client {
         };
         RpcError {
             code: code.to_owned(),
-            message: format!("Blox {method} failed with HTTP {status}"),
+            message: format!(
+                "Blox {method} failed with HTTP {status}{}{}",
+                context,
+                self.response_body_detail(body, headers)
+                    .map(|detail| format!(" (detail={detail})"))
+                    .unwrap_or_default()
+            ),
         }
         .into()
+    }
+
+    fn response_error_context(&self, headers: &HeaderMap) -> String {
+        let mut details = Vec::new();
+        for name in ["x-request-id", "x-correlation-id"] {
+            if let Some(value) = headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= 96
+                        && self.redact(value) == *value
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+                })
+            {
+                details.push(format!("{name}={value}"));
+                break;
+            }
+        }
+        if let Some(value) = headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| {
+                value.len() <= 128
+                    && self.redact(value) == *value
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"/;=+.- _".contains(&byte))
+            })
+        {
+            details.push(format!("content-type={value}"));
+        }
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", details.join(", "))
+        }
+    }
+
+    fn response_body_detail(&self, body: &[u8], headers: &HeaderMap) -> Option<String> {
+        if body.is_empty() {
+            return None;
+        }
+        let content_type = headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()?
+            .trim()
+            .to_ascii_lowercase();
+        let text = if content_type == "application/json"
+            || content_type.ends_with("+json")
+            || content_type == "application/connect+json"
+        {
+            let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+            value
+                .get("message")
+                .or_else(|| value.get("detail"))
+                .or_else(|| value.get("error"))?
+                .as_str()?
+                .to_owned()
+        } else {
+            return None;
+        };
+        let detail = self.sanitize_detail(&text);
+        (!detail.is_empty()).then_some(detail)
+    }
+
+    fn sanitize_detail(&self, value: &str) -> String {
+        let value = strip_bidi_controls(&strip_ansi(value));
+        // Drop controls before classification so they cannot split a sensitive marker.
+        let value: String = value
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        let value = self.redact(&value);
+        if contains_sensitive_marker(&value) || contains_url(&value) {
+            return "[response detail omitted: may contain sensitive data]".to_owned();
+        }
+        let mut safe = String::with_capacity(value.len().min(256));
+        let mut pending_space = false;
+        for character in value.chars() {
+            if character.is_control() || character.is_whitespace() {
+                pending_space = !safe.is_empty();
+                continue;
+            }
+            if pending_space {
+                safe.push(' ');
+                pending_space = false;
+            }
+            if safe.len() + character.len_utf8() > 240 {
+                safe.push('…');
+                break;
+            }
+            safe.push(character);
+        }
+        safe
     }
 
     fn decode_response<R: DeserializeOwned>(&self, body: &[u8], method: &str) -> Result<R> {
@@ -379,6 +501,86 @@ impl Client {
             _ => false,
         }
     }
+}
+
+fn contains_sensitive_marker(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "authorization",
+        "cookie",
+        "token",
+        "password",
+        "secret",
+        "api_key",
+        "api-key",
+        "apikey",
+        "accesstoken",
+        "refreshtoken",
+        "client_secret",
+        "clientsecret",
+        "credential",
+        "session",
+        "passwd",
+        "bearer ",
+        "set-cookie",
+        "bbidentity ",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn contains_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("://") || lower.contains('?')
+}
+
+fn strip_bidi_controls(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !matches!(
+                *character as u32,
+                0x00ad
+                    | 0x061c
+                    | 0x200b..=0x200f
+                    | 0x202a..=0x202e
+                    | 0x2060..=0x206f
+                    | 0xfeff
+            )
+        })
+        .collect()
+}
+
+fn strip_ansi(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\u{1b}' {
+            safe.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('[') => {
+                for character in characters.by_ref() {
+                    if ('@'..='~').contains(&character) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let mut previous_escape = false;
+                for character in characters.by_ref() {
+                    if character == '\u{7}' || (previous_escape && character == '\\') {
+                        break;
+                    }
+                    previous_escape = character == '\u{1b}';
+                }
+            }
+            Some(_) => {}
+            None => {}
+        }
+    }
+    safe
 }
 
 #[cfg(test)]
@@ -724,6 +926,10 @@ mod tests {
                 let mut response = Response::from_string(body)
                     .with_status_code(status)
                     .with_header(Header::from_bytes("Content-Type", content_type).unwrap());
+                if status == 401 {
+                    response = response
+                        .with_header(Header::from_bytes("X-Request-Id", "stream-req-401").unwrap());
+                }
                 if let Some(compression) = compression {
                     response = response.with_header(
                         Header::from_bytes("Connect-Content-Encoding", compression).unwrap(),
@@ -741,6 +947,8 @@ mod tests {
                     error.downcast_ref::<RpcError>().unwrap().code,
                     "unauthenticated"
                 );
+                assert!(error.to_string().contains("x-request-id=stream-req-401"));
+                assert!(error.to_string().contains("Blox StreamCommandOutput"));
             }
             assert!(!format!("{error:?}").contains("secret-session"));
             worker.join().unwrap();
@@ -886,6 +1094,167 @@ mod tests {
             r#"{"workstation":{"status":"secret-session"}}"#.to_owned(),
         );
         assert!(!format!("{error:?}").contains("secret-session"));
+    }
+
+    #[test]
+    fn non_connect_503_includes_operation_status_request_id_and_safe_json_detail() {
+        let client = Client::new("https://blox.example").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("req-123.ab"));
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        let error = client.response_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            br#"{"message":"upstream unavailable"}"#,
+            "GetWorkstation",
+            &headers,
+        );
+        let message = error.to_string();
+        assert!(message.contains("Blox GetWorkstation failed with HTTP 503"));
+        assert!(message.contains("x-request-id=req-123.ab"));
+        assert!(message.contains("content-type=application/json; charset=utf-8"));
+        assert!(message.contains("detail=upstream unavailable"));
+        assert_eq!(
+            error.downcast_ref::<RpcError>().unwrap().code,
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn response_error_details_omit_sensitive_or_unsafe_values() {
+        let client = Client::new("https://blox.example")
+            .unwrap()
+            .with_session_credential("secret-session")
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("secret-session"));
+        headers.insert(
+            "x-correlation-id",
+            HeaderValue::from_static("req/with?query"),
+        );
+        headers.insert("content-type", HeaderValue::from_static("text/html"));
+        let error = client.response_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            br#"{"message":"upstream token=do-not-print"}"#,
+            "GetWorkstation",
+            &headers,
+        );
+        let message = error.to_string();
+        assert!(message.contains("HTTP 503"));
+        assert!(!message.contains("secret-session"));
+        assert!(!message.contains("req/with?query"));
+        assert!(message.contains("content-type=text/html"));
+        assert!(!message.contains("do-not-print"));
+        assert!(!message.contains("detail="));
+
+        let body = serde_json::json!({
+            "message": "reflected secret-\u{001b}[31msession"
+        })
+        .to_string();
+        let detail_headers = HeaderMap::from_iter([(
+            "content-type".parse().unwrap(),
+            HeaderValue::from_static("application/json"),
+        )]);
+        let error = client.response_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body.as_bytes(),
+            "GetWorkstation",
+            &detail_headers,
+        );
+        assert!(error.to_string().contains("[REDACTED]"));
+        assert!(!error.to_string().contains("secret-session"));
+    }
+
+    #[test]
+    fn unary_503_diagnostics_include_http_response_headers() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let client = Client::new(&format!("http://{}", server.server_addr())).unwrap();
+        let worker = thread::spawn(move || {
+            server
+                .recv()
+                .unwrap()
+                .respond(
+                    Response::from_string(r#"{"message":"upstream unavailable"}"#)
+                        .with_status_code(503)
+                        .with_header(
+                            Header::from_bytes("Content-Type", "application/json").unwrap(),
+                        )
+                        .with_header(Header::from_bytes("X-Request-Id", "unary-req-503").unwrap()),
+                )
+                .unwrap();
+        });
+        let error = client.get_workstation("ws-1").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Blox GetWorkstation failed with HTTP 503"));
+        assert!(error.to_string().contains("x-request-id=unary-req-503"));
+        assert!(error.to_string().contains("detail=upstream unavailable"));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn response_error_details_omit_urls_and_strip_ansi_and_controls() {
+        let client = Client::new("https://blox.example").unwrap();
+        let headers = HeaderMap::from_iter([(
+            "content-type".parse().unwrap(),
+            HeaderValue::from_static("application/problem+json"),
+        )]);
+        let body = serde_json::json!({
+            "detail": "reset\u{001b}[31m\nvia https://mesh.example/path?token=hidden"
+        })
+        .to_string();
+        let error = client.response_error(
+            reqwest::StatusCode::BAD_GATEWAY,
+            body.as_bytes(),
+            "GetWorkstation",
+            &headers,
+        );
+        let message = error.to_string();
+        assert!(message.contains("response detail omitted"));
+        assert!(!message.contains("\u{001b}"));
+        assert!(!message.contains("token=hidden"));
+
+        let body = serde_json::json!({
+            "detail": "reset\u{001b}[31m\nvia\u{202e} now"
+        })
+        .to_string();
+        let error = client.response_error(
+            reqwest::StatusCode::BAD_GATEWAY,
+            body.as_bytes(),
+            "GetWorkstation",
+            &headers,
+        );
+        let message = error.to_string();
+        assert!(message.contains("detail=resetvia now"));
+        assert!(!message.contains("\u{001b}"));
+        assert!(!message.contains("\u{202e}"));
+
+        let long_detail = format!("{{\"message\":\"{}\"}}", "x".repeat(400));
+        let error = client.response_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            long_detail.as_bytes(),
+            "GetWorkstation",
+            &headers,
+        );
+        assert!(error.to_string().len() < 400);
+        assert!(error.to_string().contains('…'));
+    }
+
+    #[test]
+    fn response_error_without_safe_headers_or_body_still_names_operation_and_status() {
+        let client = Client::new("https://blox.example").unwrap();
+        let error = client.response_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            b"<html>proxy error</html>",
+            "GetWorkstation",
+            &HeaderMap::new(),
+        );
+        assert_eq!(
+            error.to_string(),
+            "unavailable: Blox GetWorkstation failed with HTTP 503 Service Unavailable"
+        );
     }
 
     #[test]
