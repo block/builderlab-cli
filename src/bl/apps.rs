@@ -63,6 +63,10 @@ const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
     "compose-ctrl.block.builderlab.xyz",
     "compose-ctrl.apps.builderlab.xyz",
     "compose-ctrl.apps.builderlabstaging.xyz",
+    "compose-ctrl.public.builderlab.xyz",
+    "compose-ctrl.public.builderlabstaging.xyz",
+    "compose-ctrl.builderlab.xyz",
+    "compose-ctrl.builderlabstaging.xyz",
 ];
 
 pub fn command() -> Command {
@@ -5318,11 +5322,19 @@ mod tests {
             "https://compose-ctrl.apps.builderlab.xyz:443",
             "https://compose-ctrl.apps.builderlabstaging.xyz",
             "https://compose-ctrl.apps.builderlabstaging.xyz:443",
+            "https://compose-ctrl.public.builderlab.xyz",
+            "https://compose-ctrl.public.builderlab.xyz:443",
+            "https://compose-ctrl.public.builderlabstaging.xyz",
+            "https://compose-ctrl.public.builderlabstaging.xyz:443",
+            "https://compose-ctrl.builderlab.xyz",
+            "https://compose-ctrl.builderlab.xyz:443",
+            "https://compose-ctrl.builderlabstaging.xyz",
+            "https://compose-ctrl.builderlabstaging.xyz:443",
             "https://compose-ctrl.test.blockstaging.build:443",
         ] {
             assert!(
                 ControlPlaneClient::new(trusted, "1.0.0", style).is_ok(),
-                "allowlisted control-plane origin should be accepted"
+                "allowlisted control-plane origin should be accepted: {trusted}"
             );
         }
 
@@ -5347,6 +5359,30 @@ mod tests {
             "https://compose-ctrl.apps.builderlabstaging.xyz.attacker.example",
             "https://compose-ctrl.apps.builderlabstaging.xyz:444",
             "https://user@compose-ctrl.apps.builderlabstaging.xyz",
+            "http://compose-ctrl.public.builderlab.xyz",
+            "https://user@compose-ctrl.public.builderlab.xyz",
+            "https://compose-ctrl.public.builderlab.xyz.attacker.example",
+            "https://compose-ctrl.public.builderlab.xyz:444",
+            "http://compose-ctrl.public.builderlabstaging.xyz",
+            "https://user@compose-ctrl.public.builderlabstaging.xyz",
+            "https://compose-ctrl.public.builderlabstaging.xyz.attacker.example",
+            "https://compose-ctrl.public.builderlabstaging.xyz:444",
+            "http://compose-ctrl.builderlab.xyz",
+            "https://user@compose-ctrl.builderlab.xyz",
+            "https://:password@compose-ctrl.builderlab.xyz",
+            "https://compose-ctrl.builderlab.xyz@attacker.example",
+            "https://compose-ctrl.builderlab.xyz.attacker.example",
+            "https://attacker.compose-ctrl.builderlab.xyz",
+            "https://compose-ctrl.builderlab.xyz:80",
+            "https://compose-ctrl.builderlab.xyz:444",
+            "http://compose-ctrl.builderlabstaging.xyz",
+            "https://user@compose-ctrl.builderlabstaging.xyz",
+            "https://:password@compose-ctrl.builderlabstaging.xyz",
+            "https://compose-ctrl.builderlabstaging.xyz@attacker.example",
+            "https://compose-ctrl.builderlabstaging.xyz.attacker.example",
+            "https://attacker.compose-ctrl.builderlabstaging.xyz",
+            "https://compose-ctrl.builderlabstaging.xyz:80",
+            "https://compose-ctrl.builderlabstaging.xyz:444",
             "https://app.builderlabstaging.xyz",
             "https://user@compose-ctrl.test.blockstaging.build",
             "http://localhost:8080",
