@@ -40,3 +40,4 @@ Security constraints:
 - CLI `returnTo` targets must be loopback URLs.
 - Each login generates independent 256-bit random state and PKCE verifier values. The CLI sends only the S256 challenge in the login URL and keeps the verifier in memory until exchange.
 - Callbacks with missing, mismatched, or duplicate state are rejected without consuming the pending login.
+- Waiting for the browser callback times out after ten minutes; rerun `bl auth login` to start a fresh attempt.
