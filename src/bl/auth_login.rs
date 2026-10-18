@@ -19,6 +19,7 @@ use super::auth_storage::{session_storage_key_from_config, SessionCredentialStor
 use super::skills_config::{kgoose_service_url, SkillsConfig};
 
 const CALLBACK_PATH: &str = "/callback";
+const LOGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Copy)]
 enum AuthCallbackPage {
@@ -145,9 +146,7 @@ fn run_browser_login_inner(
         println!("Could not open a browser automatically. Open the URL above manually.");
     }
 
-    let code = rx
-        .recv()
-        .context("loopback auth server stopped before login completed")??;
+    let code = wait_for_exchange_code(&rx, LOGIN_CALLBACK_TIMEOUT)?;
     let verified = exchange_login_code_and_verify(
         &client,
         config.playpen.as_deref(),
@@ -239,6 +238,21 @@ pub fn logout_stored_session(
     };
 
     logout_session_credential(&client, config.playpen.as_deref(), &service_url, &stored)
+}
+
+fn wait_for_exchange_code(
+    receiver: &mpsc::Receiver<Result<String>>,
+    timeout: Duration,
+) -> Result<String> {
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(
+            "BuilderLab CLI auth login timed out; rerun `bl auth login`"
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!(
+            "loopback auth server stopped before login completed"
+        )),
+    }
 }
 
 fn receive_exchange_code(server: Server, expected_state: &str) -> Result<String> {
@@ -390,6 +404,8 @@ fn auth_info(config: &SkillsConfig, message: &str) {
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use anyhow::Result;
     use builderlab_auth::auth_login::{
@@ -401,19 +417,51 @@ mod tests {
 
     use super::{
         auth_callback_page, receive_exchange_code, store_login_credential,
-        validate_and_store_login_credential, verify_stored_session_with, AuthCallbackPage,
+        validate_and_store_login_credential, verify_stored_session_with, wait_for_exchange_code,
+        AuthCallbackPage,
     };
 
-    fn callback_server() -> (String, std::thread::JoinHandle<Result<String>>) {
+    #[test]
+    fn callback_wait_times_out_with_retry_guidance() {
+        let (_sender, receiver) = mpsc::channel();
+
+        let error = wait_for_exchange_code(&receiver, Duration::ZERO)
+            .expect_err("pending login must time out");
+
+        assert_eq!(
+            error.to_string(),
+            "BuilderLab CLI auth login timed out; rerun `bl auth login`"
+        );
+    }
+
+    #[test]
+    fn callback_wait_reports_stopped_server_without_timeout_guidance() {
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+
+        let error = wait_for_exchange_code(&receiver, Duration::ZERO)
+            .expect_err("stopped callback server must fail login");
+
+        assert_eq!(
+            error.to_string(),
+            "loopback auth server stopped before login completed"
+        );
+    }
+
+    fn callback_server() -> (String, mpsc::Receiver<Result<String>>) {
         let server = tiny_http::Server::http("127.0.0.1:0").expect("callback server");
         let url = format!("http://{}/callback", server.server_addr());
-        let handle = std::thread::spawn(move || receive_exchange_code(server, "expected-state"));
-        (url, handle)
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = receive_exchange_code(server, "expected-state");
+            let _ = sender.send(result);
+        });
+        (url, receiver)
     }
 
     #[test]
     fn invalid_state_cannot_complete_or_cancel_pending_login() {
-        let (url, handle) = callback_server();
+        let (url, receiver) = callback_server();
         let client =
             builderlab_auth::auth_login::build_auth_http_client(std::time::Duration::from_secs(5))
                 .expect("client");
@@ -434,7 +482,10 @@ mod tests {
                 .text()
                 .expect("failure page")
                 .contains("Sign-in didn’t finish"));
-            assert!(!handle.is_finished());
+            assert!(
+                matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "invalid state must leave the login pending: {query}"
+            );
         }
         let response = client
             .get(format!("{url}?code=valid-code&state=expected-state"))
@@ -442,7 +493,7 @@ mod tests {
             .expect("valid callback");
         assert_eq!(response.status().as_u16(), 200);
         assert_eq!(
-            handle.join().expect("callback thread").expect("code"),
+            wait_for_exchange_code(&receiver, Duration::from_secs(5)).expect("callback code"),
             "valid-code"
         );
     }
@@ -464,15 +515,13 @@ mod tests {
                 "auth callback returned an authentication error",
             ),
         ] {
-            let (url, handle) = callback_server();
+            let (url, receiver) = callback_server();
             let response = client
                 .get(format!("{url}?state=expected-state&{query}"))
                 .send()
                 .expect("invalid callback");
             assert_eq!(response.status().as_u16(), 400, "callback query: {query}");
-            let error = handle
-                .join()
-                .expect("callback thread")
+            let error = wait_for_exchange_code(&receiver, Duration::from_secs(5))
                 .expect_err("invalid callback");
             // The full error must describe the failure without reflecting provider details.
             assert_eq!(
