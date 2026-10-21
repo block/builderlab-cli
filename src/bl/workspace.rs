@@ -20,9 +20,9 @@ use super::display::{print_json, stdin_is_tty, terminal_safe_text, Style};
 use super::runner;
 use super::skills_api::{exit_codes, failure};
 use super::skills_config::{
-    default_kgoose_service_path, kgoose_service_url, normalize_kgoose_service_path,
-    read_optional_env, SkillsConfig, BL_KGOOSE_PLAYPEN_ENV_VAR, KGOOSE_BASE_URL_ENV_VAR,
-    KGOOSE_PLAYPEN_ENV_VAR, KGOOSE_SERVICE_PATH_ENV_VAR,
+    kgoose_service_url, normalize_kgoose_service_path, read_optional_env, SkillsConfig,
+    BL_KGOOSE_PLAYPEN_ENV_VAR, DEFAULT_KGOOSE_SERVICE_PATH, KGOOSE_PLAYPEN_ENV_VAR,
+    KGOOSE_SERVICE_PATH_ENV_VAR,
 };
 
 pub fn command() -> Command {
@@ -87,18 +87,13 @@ fn run_list(config: &SkillsConfig) -> Result<()> {
 }
 
 fn run_workstation_list(matches: &ArgMatches, base_url: &str) -> Result<()> {
-    let configured_base_url = read_optional_env(KGOOSE_BASE_URL_ENV_VAR)?
-        .unwrap_or_else(|| crate::kgoose::DEFAULT_KGOOSE_BASE_URL.to_string());
     let service_path = matches
         .get_one::<String>("kgoose-service-path")
         .cloned()
         .or(read_optional_env(KGOOSE_SERVICE_PATH_ENV_VAR)?)
         .map(|value| normalize_kgoose_service_path(&value))
         .transpose()?
-        .unwrap_or_else(|| {
-            default_kgoose_service_path(matches.get_flag("local-dev"), &configured_base_url)
-                .to_string()
-        });
+        .unwrap_or_else(|| DEFAULT_KGOOSE_SERVICE_PATH.to_string());
     let playpen = read_optional_env(BL_KGOOSE_PLAYPEN_ENV_VAR)?
         .or(read_optional_env(KGOOSE_PLAYPEN_ENV_VAR)?)
         .map(|value| value.trim().to_string())

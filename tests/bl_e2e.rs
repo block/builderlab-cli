@@ -4200,6 +4200,39 @@ fn bl_workspace_blox_lists_without_org_or_local_credentials() {
 }
 
 #[test]
+fn bl_workspace_blox_routes_same_origin_overrides_with_tools_service_path() {
+    for (env_path, cli_path, expected_path) in [
+        (None, None, "/cash-app/goose"),
+        (Some("/env/goose/"), None, "/env/goose"),
+        (None, Some("/cli/goose/"), "/cli/goose"),
+        (Some("/env/goose/"), Some("/cli/goose/"), "/cli/goose"),
+    ] {
+        let server = MockServer::start(vec![MockResponse::json(json!({"workspaces": []}))]);
+        let temp = temp_test_dir("bl-workspace-blox-service-path");
+        let mut command = blox_tools_command(&temp, &server.base_url);
+        command
+            .env("KGOOSE_BASE_URL", format!("{}/proxy", server.base_url))
+            .args(["workspace", "list", "--json"]);
+        if let Some(path) = env_path {
+            command.env("KGOOSE_SERVICE_PATH", path);
+        }
+        if let Some(path) = cli_path {
+            command.args(["--kgoose-service-path", path]);
+        }
+        let output = command.output().unwrap();
+        let (_, stderr) = output_text(&output);
+        assert!(output.status.success(), "stderr was: {stderr}");
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path,
+            format!("/proxy{expected_path}/v1/workstation/workspaces/list")
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+}
+
+#[test]
 fn bl_workspace_blox_ignores_invalid_local_configuration() {
     for filename in ["skills.yaml", "config.yaml"] {
         for unreadable in [false, true] {
