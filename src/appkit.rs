@@ -11,6 +11,23 @@ use anyhow::{anyhow, Result};
 
 use crate::cli::{global_arg_skip_count, APPKIT_COMMAND_NAME};
 
+pub(crate) const ENABLED: bool = cfg!(feature = "internal-appkit");
+
+fn ensure_available() -> Result<()> {
+    anyhow::ensure!(
+        ENABLED,
+        "Internal Block App Kit is not available in this CLI build. Use `bl apps` for BuilderLab Apps."
+    );
+    Ok(())
+}
+
+pub(crate) fn ensure_command_available(command_tokens: &[String]) -> Result<()> {
+    if is_appkit_command(command_tokens) {
+        ensure_available()?;
+    }
+    Ok(())
+}
+
 pub(crate) fn is_appkit_command(command_tokens: &[String]) -> bool {
     command_tokens.first().map(String::as_str) == Some(APPKIT_COMMAND_NAME)
 }
@@ -27,6 +44,7 @@ pub(crate) fn should_run_before_bootstrap(raw_args: &[String]) -> bool {
 }
 
 pub(crate) fn run(raw_args: &[String]) -> Result<()> {
+    ensure_available()?;
     let args = raw_args_after_appkit(raw_args);
     exec_appkit(&args)
 }

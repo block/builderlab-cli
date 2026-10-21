@@ -313,7 +313,9 @@ pub fn build_tools_command(
         command = command.arg(arg);
     }
 
-    command = command.subcommand(appkit_command());
+    if crate::appkit::ENABLED {
+        command = command.subcommand(appkit_command());
+    }
 
     for extension in extensions
         .iter()
@@ -863,8 +865,11 @@ mod tests {
         );
 
         let help = command.render_long_help().to_string();
-        assert!(help.contains("appkit"));
-        assert!(help.contains("Block App Kit CLI (local exec)"));
+        assert_eq!(help.contains("appkit"), cfg!(feature = "internal-appkit"));
+        assert_eq!(
+            help.contains("Block App Kit CLI (local exec)"),
+            cfg!(feature = "internal-appkit")
+        );
         assert!(help.contains("utils"));
         assert!(help.contains("Extensions"));
         assert!(help.contains("--timeout"));

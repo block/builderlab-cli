@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use common::temp_test_dir;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "internal-appkit"))]
 use common::write_fake_executable;
 use common::{
     calculate_tool_schema, list_tools_response, output_text, post_message_tool_schema,
@@ -622,28 +622,30 @@ fn describe_commands_uses_static_catalog_without_network() {
     assert!(output.status.success(), "stderr was: {stderr}");
     let description = serde_json::from_str::<Value>(&stdout).expect("parse describe output");
     assert_eq!(description["name"], json!("agent-tools"));
-    assert_eq!(
-        description["commands"],
-        json!([
-            {
-                "name": "appkit",
-                "summary": "Cloudflare-backed internal Block App Kit CLI (local exec)"
-            },
-            {
-                "name": "secret",
-                "summary": "Needs more auth"
-            },
-            {
-                "name": "utils",
-                "summary": "Utility helpers"
-            }
-        ])
-    );
+    let mut expected_commands = json!([
+        {
+            "name": "appkit",
+            "summary": "Cloudflare-backed internal Block App Kit CLI (local exec)"
+        },
+        {
+            "name": "secret",
+            "summary": "Needs more auth"
+        },
+        {
+            "name": "utils",
+            "summary": "Utility helpers"
+        }
+    ]);
+    if !cfg!(feature = "internal-appkit") {
+        expected_commands.as_array_mut().unwrap().remove(0);
+    }
+    assert_eq!(description["commands"], expected_commands);
     assert!(stderr.is_empty(), "stderr was: {stderr}");
     assert!(requests.is_empty(), "requests were: {requests:#?}");
 }
 
 #[cfg(unix)]
+#[cfg(feature = "internal-appkit")]
 #[test]
 fn appkit_no_args_passes_through_to_real_cli() {
     let fake_bin = temp_test_dir("appkit-no-args-passthrough");
@@ -670,6 +672,7 @@ fn appkit_no_args_passes_through_to_real_cli() {
 }
 
 #[cfg(unix)]
+#[cfg(feature = "internal-appkit")]
 #[test]
 fn appkit_help_flag_passes_through_to_real_cli() {
     let fake_bin = temp_test_dir("appkit-help-passthrough");
@@ -696,6 +699,7 @@ fn appkit_help_flag_passes_through_to_real_cli() {
 }
 
 #[cfg(unix)]
+#[cfg(feature = "internal-appkit")]
 #[test]
 fn appkit_on_path_is_preferred_over_uvx() {
     let fake_bin = temp_test_dir("appkit-preferred");
@@ -724,6 +728,7 @@ fn appkit_on_path_is_preferred_over_uvx() {
 }
 
 #[cfg(unix)]
+#[cfg(feature = "internal-appkit")]
 #[test]
 fn appkit_owned_sq_flags_are_forwarded_before_bootstrap() {
     let fake_bin = temp_test_dir("appkit-owned-flags");
@@ -760,6 +765,7 @@ fn appkit_owned_sq_flags_are_forwarded_before_bootstrap() {
 }
 
 #[cfg(unix)]
+#[cfg(feature = "internal-appkit")]
 #[test]
 fn appkit_falls_back_to_uvx_and_preserves_environment() {
     let fake_bin = temp_test_dir("appkit-uvx-fallback");
@@ -787,6 +793,7 @@ fn appkit_falls_back_to_uvx_and_preserves_environment() {
     assert!(requests.is_empty(), "requests were: {requests:#?}");
 }
 
+#[cfg(feature = "internal-appkit")]
 #[test]
 fn appkit_missing_binary_prints_clear_error() {
     let server = MockServer::start(vec![]);

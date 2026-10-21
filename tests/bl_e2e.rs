@@ -3652,9 +3652,6 @@ fn bl_apps_help_distinguishes_external_and_internal_paths() {
         "Apps Platform",
         "bb-block",
         "bb-public",
-        "Cloudflare-backed internal App Kit",
-        "bl tools appkit",
-        "separate internal Compose workflow",
         "list",
         "get",
         "versions",
@@ -3666,6 +3663,17 @@ fn bl_apps_help_distinguishes_external_and_internal_paths() {
         assert!(
             stdout.contains(expected),
             "help did not explain {expected:?}: {stdout}"
+        );
+    }
+    for internal_help in [
+        "Cloudflare-backed internal App Kit",
+        "bl tools appkit",
+        "separate internal Compose workflow",
+    ] {
+        assert_eq!(
+            stdout.contains(internal_help),
+            cfg!(feature = "internal-appkit"),
+            "{stdout}"
         );
     }
 }
@@ -4839,23 +4847,24 @@ fn bl_tools_describe_commands_uses_configured_extensions_and_connection_status()
     assert!(output.status.success(), "stderr was: {stderr}");
     let description = serde_json::from_str::<Value>(&stdout).expect("parse describe output");
     assert_eq!(description["name"], json!("tools"));
-    assert_eq!(
-        description["commands"],
-        json!([
-            {
-                "name": "appkit",
-                "summary": "Cloudflare-backed internal Block App Kit CLI (local exec)"
-            },
-            {
-                "name": "secret",
-                "summary": "[not connected] Needs more auth"
-            },
-            {
-                "name": "utils",
-                "summary": "Utility helpers"
-            }
-        ])
-    );
+    let mut expected_commands = json!([
+        {
+            "name": "appkit",
+            "summary": "Cloudflare-backed internal Block App Kit CLI (local exec)"
+        },
+        {
+            "name": "secret",
+            "summary": "[not connected] Needs more auth"
+        },
+        {
+            "name": "utils",
+            "summary": "Utility helpers"
+        }
+    ]);
+    if !cfg!(feature = "internal-appkit") {
+        expected_commands.as_array_mut().unwrap().remove(0);
+    }
+    assert_eq!(description["commands"], expected_commands);
     assert!(stderr.is_empty(), "stderr was: {stderr}");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].path, "/api/v3/list-extensions");

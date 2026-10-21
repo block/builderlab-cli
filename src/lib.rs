@@ -219,6 +219,7 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
     } else {
         bootstrap_args(raw_args.iter().cloned())?
     };
+    appkit::ensure_command_available(&bootstrap.command_tokens)?;
 
     let mut kgoose_config = KgooseConfig {
         base_url: bootstrap.base_url.clone(),
@@ -462,6 +463,7 @@ fn load_command_description(
     command_tokens: &[String],
     tools_cli: ToolsCliConfig,
 ) -> Result<CommandDescription> {
+    appkit::ensure_command_available(command_tokens)?;
     let command_path = command_tokens
         .iter()
         .take_while(|token| !token.starts_with('-'))
@@ -606,7 +608,10 @@ fn root_command_description(
     extensions: &[runtime::ExtensionSummary],
     root_name: &str,
 ) -> CommandDescription {
-    let mut commands = vec![appkit_command_description()];
+    let mut commands = Vec::new();
+    if appkit::ENABLED {
+        commands.push(appkit_command_description());
+    }
     commands.extend(extensions.iter().filter_map(|extension| {
         if extension.name == APPKIT_COMMAND_NAME {
             None
@@ -1206,31 +1211,32 @@ mod tests {
             "agent-tools",
         );
 
-        assert_eq!(
-            description,
-            CommandDescription {
-                name: "agent-tools".to_string(),
-                summary: ROOT_SUMMARY.to_string(),
-                commands: vec![
-                    CommandDescription {
-                        name: "appkit".to_string(),
-                        summary: "Cloudflare-backed internal Block App Kit CLI (local exec)"
-                            .to_string(),
-                        commands: Vec::new(),
-                    },
-                    CommandDescription {
-                        name: "slack".to_string(),
-                        summary: "Slack tools for chat".to_string(),
-                        commands: Vec::new(),
-                    },
-                    CommandDescription {
-                        name: "utils".to_string(),
-                        summary: "Utility helpers".to_string(),
-                        commands: Vec::new(),
-                    },
-                ],
-            }
-        );
+        let mut expected = CommandDescription {
+            name: "agent-tools".to_string(),
+            summary: ROOT_SUMMARY.to_string(),
+            commands: vec![
+                CommandDescription {
+                    name: "appkit".to_string(),
+                    summary: "Cloudflare-backed internal Block App Kit CLI (local exec)"
+                        .to_string(),
+                    commands: Vec::new(),
+                },
+                CommandDescription {
+                    name: "slack".to_string(),
+                    summary: "Slack tools for chat".to_string(),
+                    commands: Vec::new(),
+                },
+                CommandDescription {
+                    name: "utils".to_string(),
+                    summary: "Utility helpers".to_string(),
+                    commands: Vec::new(),
+                },
+            ],
+        };
+        if !cfg!(feature = "internal-appkit") {
+            expected.commands.remove(0);
+        }
+        assert_eq!(description, expected);
     }
 
     #[test]
@@ -1247,15 +1253,23 @@ mod tests {
 
     #[test]
     fn appkit_description_does_not_load_extension_metadata() {
-        let description = load_command_description(
+        let result = load_command_description(
             &PanickingKgooseClient,
             &kgoose_config(),
             &["appkit".to_string()],
             agent_tools_config(),
-        )
-        .expect("load appkit command description");
-
-        assert_eq!(description, appkit_command_description());
+        );
+        if cfg!(feature = "internal-appkit") {
+            assert_eq!(
+                result.expect("load appkit command description"),
+                appkit_command_description()
+            );
+        } else {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("Internal Block App Kit is not available"));
+        }
     }
 
     #[test]
@@ -1273,8 +1287,12 @@ mod tests {
         .expect_err("nested appkit description should fail locally");
 
         let message = error.to_string();
-        assert!(message.contains("does not inspect nested appkit commands"));
-        assert!(message.contains("sq agent-tools appkit --help"));
+        if cfg!(feature = "internal-appkit") {
+            assert!(message.contains("does not inspect nested appkit commands"));
+            assert!(message.contains("sq agent-tools appkit --help"));
+        } else {
+            assert!(message.contains("Internal Block App Kit is not available"));
+        }
     }
 
     #[test]
@@ -1292,8 +1310,12 @@ mod tests {
         .expect_err("nested appkit description should fail locally");
 
         let message = error.to_string();
-        assert!(message.contains("does not inspect nested appkit commands"));
-        assert!(message.contains("bl tools appkit --help"));
+        if cfg!(feature = "internal-appkit") {
+            assert!(message.contains("does not inspect nested appkit commands"));
+            assert!(message.contains("bl tools appkit --help"));
+        } else {
+            assert!(message.contains("Internal Block App Kit is not available"));
+        }
     }
 
     #[test]
