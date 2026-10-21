@@ -16,10 +16,14 @@ use serde_json::json;
 use super::auth_storage::{
     default_session_storage, session_storage_key_from_config, SessionStorageKey,
 };
-use super::display::{print_json, stdin_is_tty, terminal_safe_text};
+use super::display::{print_json, stdin_is_tty, terminal_safe_text, Style};
 use super::runner;
 use super::skills_api::{exit_codes, failure};
-use super::skills_config::{kgoose_service_url, read_optional_env, SkillsConfig};
+use super::skills_config::{
+    default_kgoose_service_path, kgoose_service_url, normalize_kgoose_service_path,
+    read_optional_env, SkillsConfig, BL_KGOOSE_PLAYPEN_ENV_VAR, KGOOSE_BASE_URL_ENV_VAR,
+    KGOOSE_PLAYPEN_ENV_VAR, KGOOSE_SERVICE_PATH_ENV_VAR,
+};
 
 pub fn command() -> Command {
     Command::new("workspace")
@@ -46,11 +50,14 @@ pub fn command() -> Command {
 }
 
 pub fn run(matches: &ArgMatches) -> Result<()> {
-    if matches.subcommand_name() == Some("list") && workstation_base_url()?.is_some() {
-        runner::run_for_config(matches, dispatch)
-    } else {
-        runner::run(matches, dispatch)
+    if matches.subcommand_name() == Some("list") {
+        if let Some(base_url) = workstation_base_url()? {
+            return runner::run_with_output(matches.get_flag("json"), || {
+                run_workstation_list(matches, &base_url)
+            });
+        }
     }
+    runner::run(matches, dispatch)
 }
 
 fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
@@ -66,24 +73,53 @@ pub fn describe_commands() -> serde_json::Value {
 }
 
 fn run_list(config: &SkillsConfig) -> Result<()> {
-    let response = if let Some(base_url) = workstation_base_url()? {
-        let client = build_auth_http_client(Duration::from_secs(30))?;
-        list_workstation_workspaces(
-            &client,
-            config.playpen.as_deref(),
-            &kgoose_service_url(&base_url, &config.kgoose_service_path),
-        )
-    } else {
-        runner::ensure_org_configured(config)?;
-        WorkspaceSession::load(config)?.list(config)
-    }
-    .map_err(map_workspace_request_error)?;
+    runner::ensure_org_configured(config)?;
+    let response = WorkspaceSession::load(config)?
+        .list(config)
+        .map_err(map_workspace_request_error)?;
 
     if config.json {
         return print_json(&response);
     }
 
-    print_workspace_list(config, &response);
+    print_workspace_list(&config.style, &response);
+    Ok(())
+}
+
+fn run_workstation_list(matches: &ArgMatches, base_url: &str) -> Result<()> {
+    let configured_base_url = read_optional_env(KGOOSE_BASE_URL_ENV_VAR)?
+        .unwrap_or_else(|| crate::kgoose::DEFAULT_KGOOSE_BASE_URL.to_string());
+    let service_path = matches
+        .get_one::<String>("kgoose-service-path")
+        .cloned()
+        .or(read_optional_env(KGOOSE_SERVICE_PATH_ENV_VAR)?)
+        .map(|value| normalize_kgoose_service_path(&value))
+        .transpose()?
+        .unwrap_or_else(|| {
+            default_kgoose_service_path(matches.get_flag("local-dev"), &configured_base_url)
+                .to_string()
+        });
+    let playpen = read_optional_env(BL_KGOOSE_PLAYPEN_ENV_VAR)?
+        .or(read_optional_env(KGOOSE_PLAYPEN_ENV_VAR)?)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let client = build_auth_http_client(Duration::from_secs(30))?;
+    let response = list_workstation_workspaces(
+        &client,
+        playpen.as_deref(),
+        &kgoose_service_url(base_url, &service_path),
+    )
+    .map_err(map_workspace_request_error)?;
+    let json = matches.get_flag("json");
+    if json {
+        return print_json(&response);
+    }
+    let style = Style::new(
+        matches.get_flag("no-color"),
+        json,
+        matches.get_flag("verbose"),
+    );
+    print_workspace_list(&style, &response);
     Ok(())
 }
 
@@ -263,7 +299,7 @@ fn map_workspace_request_error(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
-fn print_workspace_list(config: &SkillsConfig, response: &ListWorkspacesResponse) {
+fn print_workspace_list(style: &Style, response: &ListWorkspacesResponse) {
     if response.workspaces.is_empty() {
         println!("No workspaces found.");
         return;
@@ -271,7 +307,7 @@ fn print_workspace_list(config: &SkillsConfig, response: &ListWorkspacesResponse
     for workspace in &response.workspaces {
         let active = workspace.workspace_identifier.as_deref()
             == response.active_workspace_identifier.as_deref();
-        println!("{}", workspace_line(config, workspace, active));
+        println!("{}", workspace_line(style, workspace, active));
     }
 }
 
@@ -289,7 +325,7 @@ fn prompt_for_workspace(
         eprintln!(
             "  {}) {}",
             index + 1,
-            workspace_line(config, workspace, active)
+            workspace_line(&config.style, workspace, active)
         );
     }
     eprint!("Selection: ");
@@ -317,7 +353,7 @@ fn select_workspace(workspaces: &[Workspace], answer: &str) -> Result<String> {
         .context("Selected workspace has no identifier")
 }
 
-fn workspace_line(config: &SkillsConfig, workspace: &Workspace, active: bool) -> String {
+fn workspace_line(style: &Style, workspace: &Workspace, active: bool) -> String {
     let display_name = workspace
         .display_name
         .as_deref()
@@ -330,11 +366,10 @@ fn workspace_line(config: &SkillsConfig, workspace: &Workspace, active: bool) ->
     let mut line = format!(
         "{}  {}",
         terminal_safe_text(display_name),
-        config.style.dim(&terminal_safe_text(identifier))
+        style.dim(&terminal_safe_text(identifier))
     );
     if active {
-        write!(line, "  {}", config.style.green("(active)"))
-            .expect("writing to a String cannot fail");
+        write!(line, "  {}", style.green("(active)")).expect("writing to a String cannot fail");
     }
     line
 }

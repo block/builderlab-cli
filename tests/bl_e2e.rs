@@ -4200,6 +4200,52 @@ fn bl_workspace_blox_lists_without_org_or_local_credentials() {
 }
 
 #[test]
+fn bl_workspace_blox_ignores_invalid_local_configuration() {
+    for filename in ["skills.yaml", "config.yaml"] {
+        for unreadable in [false, true] {
+            let server = MockServer::start(vec![MockResponse::json(json!({
+                "workspaces": [{"workspace_identifier": "workspace-team", "display_name": "Team", "roles": ["ROLE_USER"]}],
+                "active_workspace_identifier": "workspace-team"
+            }))]);
+            let temp = temp_test_dir("bl-workspace-blox-invalid-config");
+            let config_path = temp.join(filename);
+            if unreadable {
+                fs::create_dir(&config_path).unwrap();
+            } else {
+                fs::write(&config_path, "invalid: [").unwrap();
+            }
+            let output = blox_tools_command(&temp, &server.base_url)
+                .args(["workspace", "list", "--json"])
+                .output()
+                .unwrap();
+            let (stdout, stderr) = output_text(&output);
+            assert!(
+                output.status.success(),
+                "{filename}, unreadable={unreadable}: {stderr}"
+            );
+            let result: Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(
+                result["workspaces"][0]["workspace_identifier"],
+                "workspace-team"
+            );
+            let requests = server.finish();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].path,
+                "/cash-app/goose/v1/workstation/workspaces/list"
+            );
+            if unreadable {
+                assert!(config_path.is_dir());
+            } else {
+                assert_eq!(fs::read_to_string(&config_path).unwrap(), "invalid: [");
+            }
+            assert!(!temp.join("sessions.json").exists());
+            fs::remove_dir_all(temp).unwrap();
+        }
+    }
+}
+
+#[test]
 fn bl_workspace_blox_does_not_proxy_switch_or_unmanaged_requests() {
     let temp = temp_test_dir("bl-workspace-blox-boundaries");
     let server = MockServer::start(vec![]);

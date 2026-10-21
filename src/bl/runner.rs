@@ -40,9 +40,13 @@ fn run_resolved(
     matches: &ArgMatches,
     dispatch: fn(&SkillsConfig, &ArgMatches) -> Result<()>,
 ) -> Result<()> {
-    match dispatch(config, matches) {
+    run_with_output(config.json, || dispatch(config, matches))
+}
+
+pub fn run_with_output(json: bool, dispatch: impl FnOnce() -> Result<()>) -> Result<()> {
+    match dispatch() {
         Ok(()) => Ok(()),
-        Err(error) if config.json => {
+        Err(error) if json => {
             let (exit_code, payload) = failure_info(&error);
             eprintln!("{payload}");
             Err(anyhow::Error::new(SilentJsonExit(exit_code)))
