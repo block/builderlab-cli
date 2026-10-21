@@ -98,7 +98,7 @@ initializes the same ID without another reservation. It does not reclaim
 deleted apps or migrate an existing database to another engine. Use the same
 selected endpoint and environment throughout. Check the returned
 `initialize.persistence` is `mysql` before deploying the process artifact.
-Deleting a MySQL app also deletes its managed database.
+Deleting a MySQL app revokes its database access, but the database data is retained.
 
 For inherited Apps Platform trace context and failure correlation, see
 [Apps operation correlation](docs/apps-operation-correlation.md).
