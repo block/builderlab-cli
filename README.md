@@ -72,6 +72,34 @@ Use `--json` for machine-readable output and `--verbose` for request
 diagnostics. Do not include credentials or other sensitive data when sharing
 verbose output.
 
+## Managed MySQL apps
+
+When the selected Apps Platform contract and server support managed MySQL,
+create a process app with:
+
+```bash
+bl apps create --app-id inventory --runtime-profile process --persistence mysql --json
+```
+
+The command plans, reserves the exact app ID, and initializes its database
+before returning success. MySQL is unavailable for `static` and `fetch-js`.
+The client preserves server availability errors; it does not fall back to SQLite.
+
+For an existing app, inspect it first. To resume failed initialization or
+enable MySQL on a compatible stateless process app, use:
+
+```bash
+bl apps get inventory --json
+bl apps initialize inventory --runtime-profile process --persistence mysql --json
+```
+
+`initialize` checks that the app exists, plans the requested settings, and
+initializes the same ID without another reservation. It does not reclaim
+deleted apps or migrate an existing database to another engine. Use the same
+selected endpoint and environment throughout. Check the returned
+`initialize.persistence` is `mysql` before deploying the process artifact.
+Deleting a MySQL app also deletes its managed database.
+
 For inherited Apps Platform trace context and failure correlation, see
 [Apps operation correlation](docs/apps-operation-correlation.md).
 
