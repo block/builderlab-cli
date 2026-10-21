@@ -4176,10 +4176,7 @@ fn bl_workspace_blox_lists_without_org_or_local_credentials() {
     );
     let requests = server.finish();
     assert_eq!(requests.len(), 1);
-    assert_eq!(
-        requests[0].path,
-        "/cash-app/goose/v1/workstation/workspaces/list"
-    );
+    assert_eq!(requests[0].path, "/cash-app/goose/v1/workspaces/list");
     for header in [
         "authorization",
         "cookie",
@@ -4226,7 +4223,7 @@ fn bl_workspace_blox_routes_same_origin_overrides_with_tools_service_path() {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].path,
-            format!("/proxy{expected_path}/v1/workstation/workspaces/list")
+            format!("/proxy{expected_path}/v1/workspaces/list")
         );
         fs::remove_dir_all(temp).unwrap();
     }
@@ -4263,10 +4260,7 @@ fn bl_workspace_blox_ignores_invalid_local_configuration() {
             );
             let requests = server.finish();
             assert_eq!(requests.len(), 1);
-            assert_eq!(
-                requests[0].path,
-                "/cash-app/goose/v1/workstation/workspaces/list"
-            );
+            assert_eq!(requests[0].path, "/cash-app/goose/v1/workspaces/list");
             if unreadable {
                 assert!(config_path.is_dir());
             } else {
@@ -4306,6 +4300,46 @@ fn bl_workspace_blox_does_not_proxy_switch_or_unmanaged_requests() {
     assert_eq!(output.status.code(), Some(3));
     assert!(server.finish().is_empty());
     fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn bl_workspace_session_auth_failure_requests_a_local_login() {
+    for args in [
+        vec!["workspace", "list", "--json"],
+        vec![
+            "workspace",
+            "switch",
+            "--workspace",
+            "workspace-team",
+            "--json",
+        ],
+    ] {
+        let temp = temp_test_dir("bl-workspace-session-auth-failure");
+        let bl_home = temp.join("bl-home");
+        let storage_path = temp.join("sessions.json");
+        write_bl_org_config(&bl_home, "test");
+        let server = MockServer::start(vec![MockResponse::text(401, "Unauthorized")]);
+        write_browser_auth_session(
+            &storage_path,
+            &server.base_url,
+            "stored-cli-session",
+            "2026-06-15T00:00:00Z",
+        );
+        let output = bl_command()
+            .env("BL_HOME", &bl_home)
+            .env("BL_AUTH_STORAGE", "file")
+            .env("BL_AUTH_STORAGE_FILE", &storage_path)
+            .env("KGOOSE_BASE_URL", &server.base_url)
+            .args(args)
+            .output()
+            .unwrap();
+        let (_, stderr) = output_text(&output);
+        assert_eq!(output.status.code(), Some(3));
+        assert!(stderr.contains("bl auth login"), "stderr was: {stderr}");
+        assert!(!stderr.contains("workstation_auth_required"));
+        assert_eq!(server.finish().len(), 1);
+        fs::remove_dir_all(temp).unwrap();
+    }
 }
 
 #[test]

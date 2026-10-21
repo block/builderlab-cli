@@ -242,6 +242,7 @@ operator-configured Kgoose endpoint and Roxy owner identity as `bl tools`.
 It needs no local org setting or `bl auth login`, and does not read or write
 local session credentials. The server derives the org from the verified owner
 and returns that owner's current workspace memberships. This requires the
-workstation workspace-list endpoint and matching Roxy policy to be deployed.
+shared workspace-list endpoint to accept workstation authentication, with the
+matching Roxy policy deployed.
 `bl workspace switch` continues to require a local CLI login; listing does not
 change the workstation's active workspace or rotate a session.

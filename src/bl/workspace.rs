@@ -7,7 +7,7 @@ use builderlab_auth::auth_login::build_auth_http_client;
 use builderlab_auth::auth_storage::{SessionCredentialStorage, StoredSessionCredential};
 use builderlab_auth::workspace::{
     list_workspaces, list_workstation_workspaces, switch_workspace, ListWorkspacesResponse,
-    Workspace, WorkspaceHttpError, LIST_WORKSTATION_WORKSPACES_PATH,
+    Workspace, WorkspaceHttpError,
 };
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use reqwest::header::HeaderValue;
@@ -76,7 +76,7 @@ fn run_list(config: &SkillsConfig) -> Result<()> {
     runner::ensure_org_configured(config)?;
     let response = WorkspaceSession::load(config)?
         .list(config)
-        .map_err(map_workspace_request_error)?;
+        .map_err(|error| map_workspace_request_error(error, false))?;
 
     if config.json {
         return print_json(&response);
@@ -104,7 +104,7 @@ fn run_workstation_list(matches: &ArgMatches, base_url: &str) -> Result<()> {
         playpen.as_deref(),
         &kgoose_service_url(base_url, &service_path),
     )
-    .map_err(map_workspace_request_error)?;
+    .map_err(|error| map_workspace_request_error(error, true))?;
     let json = matches.get_flag("json");
     if json {
         return print_json(&response);
@@ -150,14 +150,16 @@ fn run_switch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
             ))
         }
         None => {
-            let response = session.list(config).map_err(map_workspace_request_error)?;
+            let response = session
+                .list(config)
+                .map_err(|error| map_workspace_request_error(error, false))?;
             prompt_for_workspace(config, &response)?
         }
     };
 
     let response = session
         .switch(config, &workspace_identifier)
-        .map_err(map_workspace_request_error)?;
+        .map_err(|error| map_workspace_request_error(error, false))?;
     let switched = if let Some(new_credential) = response.session_credential {
         if new_credential.trim().is_empty() {
             anyhow::bail!(
@@ -274,12 +276,12 @@ fn auth_required_error() -> anyhow::Error {
     )
 }
 
-fn map_workspace_request_error(error: anyhow::Error) -> anyhow::Error {
+fn map_workspace_request_error(error: anyhow::Error, workstation: bool) -> anyhow::Error {
     let Some(http_error) = error.downcast_ref::<WorkspaceHttpError>() else {
         return error;
     };
     match http_error.status {
-        401 if http_error.path == LIST_WORKSTATION_WORKSPACES_PATH => failure(
+        401 if workstation => failure(
             exit_codes::AUTH_REQUIRED,
             "workstation_auth_required",
             "Workstation authentication failed; ask the platform operator to check the workstation's credentials",
