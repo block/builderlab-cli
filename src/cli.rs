@@ -16,12 +16,6 @@ pub const ROOT_BIN_NAME: &str = "sq agent-tools";
 pub const ROOT_SUMMARY: &str = "Discover auth-backed tool extensions";
 pub const TOOLS_COMMAND_NAME: &str = "tools";
 pub const BL_TOOLS_BIN_NAME: &str = "bl tools";
-pub const APPKIT_COMMAND_NAME: &str = "appkit";
-pub const APPKIT_COMMAND_ABOUT: &str = "Cloudflare-backed internal Block App Kit CLI (local exec)";
-pub const APPKIT_COMMAND_LONG_ABOUT: &str =
-    "Proxies to the Cloudflare-backed internal appkit CLI. This is separate from the external \
- BuilderLab Apps Platform control plane exposed at root `bl apps`.\n\
- Requires appkit on PATH, or uvx to run mcp_block_app_kit on demand.";
 pub const EXTENSION_DESCRIBE_COMMAND_NAME: &str = "describe";
 pub const EXTENSION_DESCRIBE_COMMAND_ABOUT: &str =
     "Print the full extension description/instructions.";
@@ -81,26 +75,9 @@ impl GlobalValueFlag {
     }
 }
 
-pub fn global_arg_skip_count(arg: &str) -> usize {
-    if GlobalValueFlag::from_name(arg).is_some() {
-        2
-    } else if split_global_value_assignment(arg).is_some() || is_global_switch_flag(arg) {
-        1
-    } else {
-        0
-    }
-}
-
 fn split_global_value_assignment(arg: &str) -> Option<(GlobalValueFlag, &str)> {
     let (name, value) = arg.split_once('=')?;
     GlobalValueFlag::from_name(name).map(|flag| (flag, value))
-}
-
-fn is_global_switch_flag(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--describe-commands" | "--summary" | "--version" | "-V"
-    )
 }
 
 pub fn bootstrap_args<I, S>(args: I) -> Result<BootstrapArgs>
@@ -313,11 +290,9 @@ pub fn build_tools_command(
         command = command.arg(arg);
     }
 
-    command = command.subcommand(appkit_command());
-
     for extension in extensions
         .iter()
-        .filter(|extension| extension.name != APPKIT_COMMAND_NAME)
+        .filter(|extension| is_supported_extension(&extension.name))
     {
         let mut subcommand = Command::new(leak_str(extension.name.clone()))
             .about(leak_str(extension.about.clone()))
@@ -340,12 +315,10 @@ pub fn build_tools_command(
     command
 }
 
-fn appkit_command() -> Command {
-    Command::new(APPKIT_COMMAND_NAME)
-        .about(APPKIT_COMMAND_ABOUT)
-        .long_about(APPKIT_COMMAND_LONG_ABOUT)
-        .arg_required_else_help(true)
-        .disable_help_subcommand(true)
+// App Kit belongs to the private employee CLI, including when an old catalog
+// or backend still advertises it. It must not fall through to remote dispatch.
+pub fn is_supported_extension(name: &str) -> bool {
+    name != "appkit"
 }
 
 fn extension_describe_command() -> Command {
@@ -863,8 +836,8 @@ mod tests {
         );
 
         let help = command.render_long_help().to_string();
-        assert!(help.contains("appkit"));
-        assert!(help.contains("Block App Kit CLI (local exec)"));
+        assert!(!help.contains("appkit"));
+        assert!(!help.contains("Block App Kit CLI (local exec)"));
         assert!(help.contains("utils"));
         assert!(help.contains("Extensions"));
         assert!(help.contains("--timeout"));

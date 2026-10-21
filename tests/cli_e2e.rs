@@ -10,8 +10,6 @@ use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use common::temp_test_dir;
-#[cfg(unix)]
-use common::write_fake_executable;
 use common::{
     calculate_tool_schema, list_tools_response, output_text, post_message_tool_schema,
     tool_response, tool_response_with_extension_description, unique_suffix,
@@ -622,187 +620,18 @@ fn describe_commands_uses_static_catalog_without_network() {
     assert!(output.status.success(), "stderr was: {stderr}");
     let description = serde_json::from_str::<Value>(&stdout).expect("parse describe output");
     assert_eq!(description["name"], json!("agent-tools"));
-    assert_eq!(
-        description["commands"],
-        json!([
-            {
-                "name": "appkit",
-                "summary": "Cloudflare-backed internal Block App Kit CLI (local exec)"
-            },
-            {
-                "name": "secret",
-                "summary": "Needs more auth"
-            },
-            {
-                "name": "utils",
-                "summary": "Utility helpers"
-            }
-        ])
-    );
+    let expected_commands = json!([
+        {
+            "name": "secret",
+            "summary": "Needs more auth"
+        },
+        {
+            "name": "utils",
+            "summary": "Utility helpers"
+        }
+    ]);
+    assert_eq!(description["commands"], expected_commands);
     assert!(stderr.is_empty(), "stderr was: {stderr}");
-    assert!(requests.is_empty(), "requests were: {requests:#?}");
-}
-
-#[cfg(unix)]
-#[test]
-fn appkit_no_args_passes_through_to_real_cli() {
-    let fake_bin = temp_test_dir("appkit-no-args-passthrough");
-    write_fake_executable(
-        &fake_bin,
-        "appkit",
-        "#!/bin/sh\nprintf 'appkit:%s\\n' \"$*\"\n",
-    );
-    let server = MockServer::start(vec![]);
-
-    let output = server
-        .command()
-        .env("PATH", &fake_bin)
-        .args(["appkit"])
-        .output()
-        .expect("run appkit no args");
-    let requests = server.finish();
-    let (stdout, stderr) = output_text(&output);
-    fs::remove_dir_all(&fake_bin).expect("remove fake bin");
-
-    assert!(output.status.success(), "stderr was: {stderr}");
-    assert_eq!(stdout.trim(), "appkit:");
-    assert!(requests.is_empty(), "requests were: {requests:#?}");
-}
-
-#[cfg(unix)]
-#[test]
-fn appkit_help_flag_passes_through_to_real_cli() {
-    let fake_bin = temp_test_dir("appkit-help-passthrough");
-    write_fake_executable(
-        &fake_bin,
-        "appkit",
-        "#!/bin/sh\nprintf 'appkit:%s\\n' \"$*\"\n",
-    );
-    let server = MockServer::start(vec![]);
-
-    let output = server
-        .command()
-        .env("PATH", &fake_bin)
-        .args(["appkit", "--help"])
-        .output()
-        .expect("run appkit --help");
-    let requests = server.finish();
-    let (stdout, stderr) = output_text(&output);
-    fs::remove_dir_all(&fake_bin).expect("remove fake bin");
-
-    assert!(output.status.success(), "stderr was: {stderr}");
-    assert_eq!(stdout.trim(), "appkit:--help");
-    assert!(requests.is_empty(), "requests were: {requests:#?}");
-}
-
-#[cfg(unix)]
-#[test]
-fn appkit_on_path_is_preferred_over_uvx() {
-    let fake_bin = temp_test_dir("appkit-preferred");
-    write_fake_executable(
-        &fake_bin,
-        "appkit",
-        "#!/bin/sh\nprintf 'appkit:%s\\n' \"$*\"\n",
-    );
-    write_fake_executable(&fake_bin, "uvx", "#!/bin/sh\nprintf 'uvx:%s\\n' \"$*\"\n");
-    let server = MockServer::start(vec![]);
-
-    let output = server
-        .command()
-        .env("PATH", &fake_bin)
-        .args(["appkit", "deploy", "my-site", "./build"])
-        .output()
-        .expect("run fake appkit");
-    let requests = server.finish();
-    let (stdout, stderr) = output_text(&output);
-    fs::remove_dir_all(&fake_bin).expect("remove fake bin");
-
-    assert!(output.status.success(), "stderr was: {stderr}");
-    assert_eq!(stdout.trim(), "appkit:deploy my-site ./build");
-    assert!(!stdout.contains("uvx:"));
-    assert!(requests.is_empty(), "requests were: {requests:#?}");
-}
-
-#[cfg(unix)]
-#[test]
-fn appkit_owned_sq_flags_are_forwarded_before_bootstrap() {
-    let fake_bin = temp_test_dir("appkit-owned-flags");
-    write_fake_executable(
-        &fake_bin,
-        "appkit",
-        "#!/bin/sh\nprintf 'appkit:%s\\n' \"$*\"\n",
-    );
-    let server = MockServer::start(vec![]);
-
-    let output = server
-        .command()
-        .env("PATH", &fake_bin)
-        .env("KGOOSE_TIMEOUT", "not-a-number")
-        .args([
-            "appkit",
-            "deploy",
-            "--timeout",
-            "also-not-a-number",
-            "--summary",
-        ])
-        .output()
-        .expect("run fake appkit with sq-looking args");
-    let requests = server.finish();
-    let (stdout, stderr) = output_text(&output);
-    fs::remove_dir_all(&fake_bin).expect("remove fake bin");
-
-    assert!(output.status.success(), "stderr was: {stderr}");
-    assert_eq!(
-        stdout.trim(),
-        "appkit:deploy --timeout also-not-a-number --summary"
-    );
-    assert!(requests.is_empty(), "requests were: {requests:#?}");
-}
-
-#[cfg(unix)]
-#[test]
-fn appkit_falls_back_to_uvx_and_preserves_environment() {
-    let fake_bin = temp_test_dir("appkit-uvx-fallback");
-    write_fake_executable(
-        &fake_bin,
-        "uvx",
-        "#!/bin/sh\nprintf 'uvx:%s\\n' \"$*\"\nprintf 'sts:%s\\n' \"${STS_ACCESS_TOKEN:-}\"\n",
-    );
-    let server = MockServer::start(vec![]);
-
-    let output = server
-        .command()
-        .env("PATH", &fake_bin)
-        .env("STS_ACCESS_TOKEN", "test-sts-token")
-        .args(["appkit", "deploy", "my-site", "./build"])
-        .output()
-        .expect("run fake uvx fallback");
-    let requests = server.finish();
-    let (stdout, stderr) = output_text(&output);
-    fs::remove_dir_all(&fake_bin).expect("remove fake bin");
-
-    assert!(output.status.success(), "stderr was: {stderr}");
-    assert!(stdout.contains("uvx:--from mcp_block_app_kit appkit deploy my-site ./build"));
-    assert!(stdout.contains("sts:test-sts-token"));
-    assert!(requests.is_empty(), "requests were: {requests:#?}");
-}
-
-#[test]
-fn appkit_missing_binary_prints_clear_error() {
-    let server = MockServer::start(vec![]);
-
-    let output = server
-        .command()
-        .env("PATH", "")
-        .args(["appkit", "list"])
-        .output()
-        .expect("run missing appkit command");
-    let requests = server.finish();
-    let (_stdout, stderr) = output_text(&output);
-
-    assert!(!output.status.success());
-    assert!(stderr.contains("appkit or uvx not found"));
-    assert!(stderr.contains("sq agent-tools can run mcp_block_app_kit on demand"));
     assert!(requests.is_empty(), "requests were: {requests:#?}");
 }
 
