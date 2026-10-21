@@ -67,7 +67,7 @@ const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
 ];
 
 pub fn command() -> Command {
-    let about = "Manage apps through the BuilderLab Apps Platform."
+    let about = "Manage apps through the BuilderLab Apps Platform.";
     Command::new("apps")
         .about("Manage apps through Apps Platform")
         .long_about(about)
