@@ -4230,6 +4230,27 @@ fn bl_workspace_blox_does_not_proxy_switch_or_unmanaged_requests() {
 }
 
 #[test]
+fn bl_workspace_blox_auth_failure_does_not_request_a_local_login() {
+    let server = MockServer::start(vec![MockResponse::text(401, "Unauthorized")]);
+    let temp = temp_test_dir("bl-workspace-blox-auth-failure");
+    let output = blox_tools_command(&temp, &server.base_url)
+        .args(["workspace", "list", "--json"])
+        .output()
+        .unwrap();
+    let (_, stderr) = output_text(&output);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        stderr.contains("workstation_auth_required"),
+        "stderr was: {stderr}"
+    );
+    assert!(!stderr.contains("bl auth login"));
+    assert!(!temp.join("sessions.json").exists());
+    assert!(!temp.join("config.yaml").exists());
+    assert_eq!(server.finish().len(), 1);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
 fn bl_workspace_blox_does_not_follow_redirects() {
     let destination = MockServer::start(vec![]);
     let server = MockServer::start(vec![MockResponse {

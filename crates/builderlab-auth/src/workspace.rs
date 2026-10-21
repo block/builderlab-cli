@@ -10,7 +10,8 @@ use crate::auth_login::{auth_url, playpen_baggage, CLI_USER_AGENT};
 use crate::auth_storage::StoredSessionCredential;
 
 const LIST_WORKSPACES_PATH: &str = "/v1/workspaces/list";
-const LIST_WORKSTATION_WORKSPACES_PATH: &str = "/v1/workstation/workspaces/list";
+/// Read-only workspace discovery authenticated by the workstation proxy.
+pub const LIST_WORKSTATION_WORKSPACES_PATH: &str = "/v1/workstation/workspaces/list";
 const SWITCH_WORKSPACE_PATH: &str = "/v1/workspaces/switch";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

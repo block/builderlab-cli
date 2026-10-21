@@ -7,7 +7,7 @@ use builderlab_auth::auth_login::build_auth_http_client;
 use builderlab_auth::auth_storage::{SessionCredentialStorage, StoredSessionCredential};
 use builderlab_auth::workspace::{
     list_workspaces, list_workstation_workspaces, switch_workspace, ListWorkspacesResponse,
-    Workspace, WorkspaceHttpError,
+    Workspace, WorkspaceHttpError, LIST_WORKSTATION_WORKSPACES_PATH,
 };
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use reqwest::header::HeaderValue;
@@ -248,6 +248,11 @@ fn map_workspace_request_error(error: anyhow::Error) -> anyhow::Error {
         return error;
     };
     match http_error.status {
+        401 if http_error.path == LIST_WORKSTATION_WORKSPACES_PATH => failure(
+            exit_codes::AUTH_REQUIRED,
+            "workstation_auth_required",
+            "Workstation authentication failed; ask the platform operator to check the workstation's credentials",
+        ),
         401 => auth_required_error(),
         403 => failure(
             exit_codes::FORBIDDEN,
