@@ -236,3 +236,12 @@ The backend `X-BB-Session-Credential` header, `BBIdentity` authorization scheme,
 Playpen routing key are protocol identifiers and retain their existing names.
 On Linux and Windows, keyring login storage is not implemented; the explicit
 `BL_AUTH_STORAGE=file` option is available as described in the local auth guide.
+
+On managed bb-public Blox workstations, `bl workspace list` uses the same
+operator-configured Kgoose endpoint and Roxy owner identity as `bl tools`.
+It needs no local org setting or `bl auth login`, and does not read or write
+local session credentials. The server derives the org from the verified owner
+and returns that owner's current workspace memberships. This requires the
+workstation workspace-list endpoint and matching Roxy policy to be deployed.
+`bl workspace switch` continues to require a local CLI login; listing does not
+change the workstation's active workspace or rotate a session.

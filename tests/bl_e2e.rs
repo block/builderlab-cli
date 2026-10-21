@@ -4155,6 +4155,100 @@ fn blox_tools_command(bl_home: &Path, base_url: &str) -> std::process::Command {
 }
 
 #[test]
+fn bl_workspace_blox_lists_without_org_or_local_credentials() {
+    let server = MockServer::start(vec![MockResponse::json(json!({
+        "workspaces": [{"workspace_identifier": "workspace-team", "display_name": "Team", "roles": ["ROLE_USER"]}],
+        "active_workspace_identifier": "workspace-team"
+    }))]);
+    let temp = temp_test_dir("bl-workspace-blox-list");
+    fs::write(temp.join("sessions.json"), "not json").unwrap();
+    let output = blox_tools_command(&temp, &server.base_url)
+        .env("STS_ACCESS_TOKEN", "ambient-token")
+        .args(["workspace", "list", "--json"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = output_text(&output);
+    assert!(output.status.success(), "stderr was: {stderr}");
+    let result: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        result["workspaces"][0]["workspace_identifier"],
+        "workspace-team"
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].path,
+        "/cash-app/goose/v1/workstation/workspaces/list"
+    );
+    for header in [
+        "authorization",
+        "cookie",
+        "x-bb-session-credential",
+        "x-forwarded-identity-token",
+    ] {
+        assert!(
+            !requests[0].headers.contains_key(header),
+            "unexpected {header}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(temp.join("sessions.json")).unwrap(),
+        "not json"
+    );
+    assert!(!temp.join("config.yaml").exists());
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn bl_workspace_blox_does_not_proxy_switch_or_unmanaged_requests() {
+    let temp = temp_test_dir("bl-workspace-blox-boundaries");
+    let server = MockServer::start(vec![]);
+    for args in [
+        vec!["workspace", "list"],
+        vec!["workspace", "switch", "--workspace", "workspace-team"],
+    ] {
+        let output = blox_tools_command(&temp, &server.base_url)
+            .env("IS_BLOX", "false")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3), "{:?}", output_text(&output));
+    }
+    let output = blox_tools_command(&temp, &server.base_url)
+        .args(["workspace", "switch", "--workspace", "workspace-team"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let output = blox_tools_command(&temp, &server.base_url)
+        .env("KGOOSE_BASE_URL", "http://other.example.test")
+        .args(["workspace", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(server.finish().is_empty());
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn bl_workspace_blox_does_not_follow_redirects() {
+    let destination = MockServer::start(vec![]);
+    let server = MockServer::start(vec![MockResponse {
+        status: 307,
+        headers: [("Location".to_string(), destination.base_url.clone())].into(),
+        body: Vec::new(),
+    }]);
+    let temp = temp_test_dir("bl-workspace-blox-redirect");
+    let output = blox_tools_command(&temp, &server.base_url)
+        .args(["workspace", "list"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(server.finish().len(), 1);
+    assert!(destination.finish().is_empty());
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
 fn bl_tools_blox_discovers_and_calls_tools_without_local_configuration_or_credentials() {
     let server = MockServer::start(vec![
         list_tools_response("utils", calculate_tool_schema(false)),

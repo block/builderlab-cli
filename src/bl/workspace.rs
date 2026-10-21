@@ -6,7 +6,8 @@ use anyhow::{anyhow, Context, Result};
 use builderlab_auth::auth_login::build_auth_http_client;
 use builderlab_auth::auth_storage::{SessionCredentialStorage, StoredSessionCredential};
 use builderlab_auth::workspace::{
-    list_workspaces, switch_workspace, ListWorkspacesResponse, Workspace, WorkspaceHttpError,
+    list_workspaces, list_workstation_workspaces, switch_workspace, ListWorkspacesResponse,
+    Workspace, WorkspaceHttpError,
 };
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use reqwest::header::HeaderValue;
@@ -18,7 +19,7 @@ use super::auth_storage::{
 use super::display::{print_json, stdin_is_tty, terminal_safe_text};
 use super::runner;
 use super::skills_api::{exit_codes, failure};
-use super::skills_config::{kgoose_service_url, SkillsConfig};
+use super::skills_config::{kgoose_service_url, read_optional_env, SkillsConfig};
 
 pub fn command() -> Command {
     Command::new("workspace")
@@ -45,7 +46,11 @@ pub fn command() -> Command {
 }
 
 pub fn run(matches: &ArgMatches) -> Result<()> {
-    runner::run(matches, dispatch)
+    if matches.subcommand_name() == Some("list") && workstation_base_url()?.is_some() {
+        runner::run_for_config(matches, dispatch)
+    } else {
+        runner::run(matches, dispatch)
+    }
 }
 
 fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
@@ -61,9 +66,18 @@ pub fn describe_commands() -> serde_json::Value {
 }
 
 fn run_list(config: &SkillsConfig) -> Result<()> {
-    runner::ensure_org_configured(config)?;
-    let session = WorkspaceSession::load(config)?;
-    let response = session.list(config).map_err(map_workspace_request_error)?;
+    let response = if let Some(base_url) = workstation_base_url()? {
+        let client = build_auth_http_client(Duration::from_secs(30))?;
+        list_workstation_workspaces(
+            &client,
+            config.playpen.as_deref(),
+            &kgoose_service_url(&base_url, &config.kgoose_service_path),
+        )
+    } else {
+        runner::ensure_org_configured(config)?;
+        WorkspaceSession::load(config)?.list(config)
+    }
+    .map_err(map_workspace_request_error)?;
 
     if config.json {
         return print_json(&response);
@@ -71,6 +85,14 @@ fn run_list(config: &SkillsConfig) -> Result<()> {
 
     print_workspace_list(config, &response);
     Ok(())
+}
+
+fn workstation_base_url() -> Result<Option<String>> {
+    let Some(default_base_url) = crate::blox_tools_base_url()? else {
+        return Ok(None);
+    };
+    let base_url = read_optional_env("KGOOSE_BASE_URL")?.unwrap_or(default_base_url);
+    Ok(crate::tools_proxy_auth_for_url(&base_url).then_some(base_url))
 }
 
 fn run_switch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {

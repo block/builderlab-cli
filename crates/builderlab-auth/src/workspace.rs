@@ -10,6 +10,7 @@ use crate::auth_login::{auth_url, playpen_baggage, CLI_USER_AGENT};
 use crate::auth_storage::StoredSessionCredential;
 
 const LIST_WORKSPACES_PATH: &str = "/v1/workspaces/list";
+const LIST_WORKSTATION_WORKSPACES_PATH: &str = "/v1/workstation/workspaces/list";
 const SWITCH_WORKSPACE_PATH: &str = "/v1/workspaces/switch";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -76,6 +77,22 @@ pub fn list_workspaces(
     )
 }
 
+/// Uses the workstation proxy's owner credential without exposing a local session.
+pub fn list_workstation_workspaces(
+    client: &Client,
+    playpen: Option<&str>,
+    server_url: &str,
+) -> Result<ListWorkspacesResponse> {
+    post_json(
+        client,
+        playpen,
+        server_url,
+        LIST_WORKSTATION_WORKSPACES_PATH,
+        None,
+        &ListWorkspacesRequest {},
+    )
+}
+
 pub fn switch_workspace(
     client: &Client,
     playpen: Option<&str>,
@@ -110,13 +127,37 @@ where
     let session_credential = credential
         .session_credential_header_value()
         .ok_or_else(|| anyhow!("stored BuilderLab CLI auth session is empty"))?;
+    post_json(
+        client,
+        playpen,
+        server_url,
+        path,
+        Some(&session_credential),
+        body,
+    )
+}
+
+fn post_json<T, B>(
+    client: &Client,
+    playpen: Option<&str>,
+    server_url: &str,
+    path: &'static str,
+    session_credential: Option<&str>,
+    body: &B,
+) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+    B: Serialize + ?Sized,
+{
     let url = auth_url(server_url, path)?;
     let mut request = client
         .post(url)
         .header(USER_AGENT, CLI_USER_AGENT)
         .header(ACCEPT, "application/json")
-        .header(SESSION_CREDENTIAL_HEADER, session_credential)
         .json(body);
+    if let Some(credential) = session_credential {
+        request = request.header(SESSION_CREDENTIAL_HEADER, credential);
+    }
     if let Some(baggage) = playpen_baggage(playpen) {
         request = request.header("Baggage", baggage);
     }
