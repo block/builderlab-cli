@@ -110,7 +110,6 @@ lint: fmt-check
 
 test:
   cargo test --locked --workspace --all-features
-  cargo test --locked --no-default-features --test appkit_capability_e2e
 
 package-smoke: build-sq
   ./sqbin/{{BIN_NAME}}.exoskeleton --version

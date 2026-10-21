@@ -1,10 +1,7 @@
 //! External BuilderLab Apps Platform control-plane commands.
 //!
-//! This module serves only the external BuilderLab Apps Platform pilot in
-//! `bb-block` and the multi-tenant `bb-public` environment. It does not replace the
-//! existing Cloudflare-backed internal Block App Kit CLI exposed through
-//! `bl tools appkit`, and it does not migrate the separate internal Compose
-//! workflow. Both internal paths remain unchanged.
+//! This module serves the BuilderLab Apps Platform in `bb-block` and the
+//! multi-tenant `bb-public` environment.
 //!
 //! The CLI sends its stored bbidentity session only to the allowlisted Compose
 //! control-plane origins. Public ingress authorizes that session through kgoose
@@ -72,17 +69,9 @@ const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
 pub fn command() -> Command {
     let about = "Manage apps through the BuilderLab Apps Platform control plane on Compose in \
                  `bb-block` and multi-tenant `bb-public`.";
-    let long_about = if crate::appkit::ENABLED {
-        format!(
-            "{about} This does not replace the Cloudflare-backed internal App Kit CLI \
-             (`bl tools appkit`) or migrate the separate internal Compose workflow."
-        )
-    } else {
-        about.to_string()
-    };
     Command::new("apps")
         .about("Manage apps through Apps Platform")
-        .long_about(long_about)
+        .long_about(about)
         .subcommand_required(true)
         .arg_required_else_help(true)
         .disable_help_subcommand(true)

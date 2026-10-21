@@ -1,4 +1,3 @@
-mod appkit;
 mod bl;
 mod catalog;
 mod cli;
@@ -16,10 +15,9 @@ use clap::error::ErrorKind;
 use clap::{ArgMatches, Command};
 use cli::{
     bool_false_id, bool_true_id, bootstrap_args, bootstrap_args_with_default_base_url,
-    build_tools_command, parameter_id, ToolCommandConfig, APPKIT_COMMAND_ABOUT,
-    APPKIT_COMMAND_NAME, BL_TOOLS_BIN_NAME, EXTENSION_DESCRIBE_COMMAND_ABOUT,
-    EXTENSION_DESCRIBE_COMMAND_NAME, ROOT_BIN_NAME, ROOT_COMMAND_NAME, ROOT_SUMMARY,
-    TOOLS_COMMAND_NAME,
+    build_tools_command, is_supported_extension, parameter_id, ToolCommandConfig,
+    BL_TOOLS_BIN_NAME, EXTENSION_DESCRIBE_COMMAND_ABOUT, EXTENSION_DESCRIBE_COMMAND_NAME,
+    ROOT_BIN_NAME, ROOT_COMMAND_NAME, ROOT_SUMMARY, TOOLS_COMMAND_NAME,
 };
 use runtime::{
     load_extension, load_extensions, load_extensions_with_auth_status, LoadedExtension,
@@ -48,7 +46,6 @@ struct ToolsCliConfig {
     command: ToolCommandConfig,
     describe_root_name: &'static str,
     version_bin_name: &'static str,
-    nested_appkit_help: &'static str,
     builderlab_mode: bool,
 }
 
@@ -61,7 +58,6 @@ fn agent_tools_config() -> ToolsCliConfig {
         },
         describe_root_name: ROOT_COMMAND_NAME,
         version_bin_name: ROOT_BIN_NAME,
-        nested_appkit_help: "sq agent-tools appkit --help",
         builderlab_mode: false,
     }
 }
@@ -75,7 +71,6 @@ fn bl_tools_config() -> ToolsCliConfig {
         },
         describe_root_name: TOOLS_COMMAND_NAME,
         version_bin_name: BL_TOOLS_BIN_NAME,
-        nested_appkit_help: "bl tools appkit --help",
         builderlab_mode: true,
     }
 }
@@ -205,10 +200,6 @@ fn build_bl_command() -> Command {
 }
 
 fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Result<()> {
-    if appkit::should_run_before_bootstrap(raw_args) {
-        return appkit::run(raw_args);
-    }
-
     let proxy_base_url = if config.builderlab_mode {
         blox_tools_base_url()?
     } else {
@@ -219,7 +210,7 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
     } else {
         bootstrap_args(raw_args.iter().cloned())?
     };
-    appkit::ensure_command_available(&bootstrap.command_tokens)?;
+    ensure_supported_extension(&bootstrap.command_tokens)?;
 
     let mut kgoose_config = KgooseConfig {
         base_url: bootstrap.base_url.clone(),
@@ -277,14 +268,6 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
     if bootstrap.version_only && bootstrap.command_tokens.is_empty() {
         println!("{} {}", config.version_bin_name, env!("CARGO_PKG_VERSION"));
         return Ok(());
-    }
-
-    // The Cloudflare-backed internal App Kit deploy needs direct access to the
-    // local workspace so it can tar files and upload them. Keep this compatibility
-    // path as a local process; root `bl apps` is the separate Apps Platform
-    // control-plane client.
-    if appkit::is_appkit_command(&bootstrap.command_tokens) {
-        return appkit::run(raw_args);
     }
 
     let selected_extension_name = bootstrap
@@ -463,7 +446,7 @@ fn load_command_description(
     command_tokens: &[String],
     tools_cli: ToolsCliConfig,
 ) -> Result<CommandDescription> {
-    appkit::ensure_command_available(command_tokens)?;
+    ensure_supported_extension(command_tokens)?;
     let command_path = command_tokens
         .iter()
         .take_while(|token| !token.starts_with('-'))
@@ -472,13 +455,6 @@ fn load_command_description(
 
     match command_path.as_slice() {
         [] => load_root_command_description(client, config, tools_cli),
-        [APPKIT_COMMAND_NAME] => Ok(appkit_command_description()),
-        [APPKIT_COMMAND_NAME, ..] => {
-            anyhow::bail!(
-                "`--describe-commands` does not inspect nested appkit commands; run `{}`",
-                tools_cli.nested_appkit_help
-            )
-        }
         [extension_name] => load_extension_command_description(
             client,
             config,
@@ -608,21 +584,15 @@ fn root_command_description(
     extensions: &[runtime::ExtensionSummary],
     root_name: &str,
 ) -> CommandDescription {
-    let mut commands = Vec::new();
-    if appkit::ENABLED {
-        commands.push(appkit_command_description());
-    }
-    commands.extend(extensions.iter().filter_map(|extension| {
-        if extension.name == APPKIT_COMMAND_NAME {
-            None
-        } else {
-            Some(CommandDescription {
-                name: extension.name.clone(),
-                summary: sq_command_summary(&extension.about),
-                commands: Vec::new(),
-            })
-        }
-    }));
+    let commands = extensions
+        .iter()
+        .filter(|extension| is_supported_extension(&extension.name))
+        .map(|extension| CommandDescription {
+            name: extension.name.clone(),
+            summary: sq_command_summary(&extension.about),
+            commands: Vec::new(),
+        })
+        .collect();
 
     CommandDescription {
         name: root_name.to_string(),
@@ -631,12 +601,11 @@ fn root_command_description(
     }
 }
 
-fn appkit_command_description() -> CommandDescription {
-    CommandDescription {
-        name: APPKIT_COMMAND_NAME.to_string(),
-        summary: sq_command_summary(APPKIT_COMMAND_ABOUT),
-        commands: Vec::new(),
+fn ensure_supported_extension(command_tokens: &[String]) -> Result<()> {
+    if let Some(name) = command_tokens.first() {
+        anyhow::ensure!(is_supported_extension(name), "unknown extension `{name}`");
     }
+    Ok(())
 }
 
 fn tool_command_description(tool: &RuntimeTool) -> CommandDescription {
@@ -955,12 +924,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        agent_tools_config, appkit_command_description, bl_tools_config, build_tool_request,
-        extension_command_description, load_command_description, parse_bool_value, parse_header,
-        render_tool_response, root_command_description, sq_command_summary,
-        tool_command_description, CommandDescription,
+        agent_tools_config, bl_tools_config, build_tool_request, extension_command_description,
+        load_command_description, parse_bool_value, parse_header, render_tool_response,
+        root_command_description, sq_command_summary, tool_command_description, CommandDescription,
     };
-    use crate::cli::{build_command, APPKIT_COMMAND_NAME, ROOT_SUMMARY};
+    use crate::cli::{build_command, ROOT_SUMMARY};
     use crate::kgoose::{
         CallToolResponse, ExtensionInfo, KgooseClient, KgooseConfig, ListExtensionsResponse,
         ListToolsResponse, ToolConfig,
@@ -1211,16 +1179,10 @@ mod tests {
             "agent-tools",
         );
 
-        let mut expected = CommandDescription {
+        let expected = CommandDescription {
             name: "agent-tools".to_string(),
             summary: ROOT_SUMMARY.to_string(),
             commands: vec![
-                CommandDescription {
-                    name: "appkit".to_string(),
-                    summary: "Cloudflare-backed internal Block App Kit CLI (local exec)"
-                        .to_string(),
-                    commands: Vec::new(),
-                },
                 CommandDescription {
                     name: "slack".to_string(),
                     summary: "Slack tools for chat".to_string(),
@@ -1233,88 +1195,25 @@ mod tests {
                 },
             ],
         };
-        if !cfg!(feature = "internal-appkit") {
-            expected.commands.remove(0);
-        }
         assert_eq!(description, expected);
     }
 
     #[test]
-    fn appkit_command_description_is_static() {
-        assert_eq!(
-            appkit_command_description(),
-            CommandDescription {
-                name: APPKIT_COMMAND_NAME.to_string(),
-                summary: "Cloudflare-backed internal Block App Kit CLI (local exec)".to_string(),
-                commands: Vec::new(),
+    fn removed_local_extension_metadata_never_contacts_backend() {
+        for config in [agent_tools_config(), bl_tools_config()] {
+            for tokens in [
+                vec!["appkit".to_string()],
+                vec!["appkit".to_string(), "deploy".to_string()],
+            ] {
+                let error = load_command_description(
+                    &PanickingKgooseClient,
+                    &kgoose_config(),
+                    &tokens,
+                    config,
+                )
+                .expect_err("removed extension must fail locally");
+                assert_eq!(error.to_string(), "unknown extension `appkit`");
             }
-        );
-    }
-
-    #[test]
-    fn appkit_description_does_not_load_extension_metadata() {
-        let result = load_command_description(
-            &PanickingKgooseClient,
-            &kgoose_config(),
-            &["appkit".to_string()],
-            agent_tools_config(),
-        );
-        if cfg!(feature = "internal-appkit") {
-            assert_eq!(
-                result.expect("load appkit command description"),
-                appkit_command_description()
-            );
-        } else {
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("Internal Block App Kit is not available"));
-        }
-    }
-
-    #[test]
-    fn nested_appkit_describe_commands_uses_appkit_specific_error() {
-        let error = load_command_description(
-            &PanickingKgooseClient,
-            &kgoose_config(),
-            &[
-                "appkit".to_string(),
-                "deploy".to_string(),
-                "my-site".to_string(),
-            ],
-            agent_tools_config(),
-        )
-        .expect_err("nested appkit description should fail locally");
-
-        let message = error.to_string();
-        if cfg!(feature = "internal-appkit") {
-            assert!(message.contains("does not inspect nested appkit commands"));
-            assert!(message.contains("sq agent-tools appkit --help"));
-        } else {
-            assert!(message.contains("Internal Block App Kit is not available"));
-        }
-    }
-
-    #[test]
-    fn nested_appkit_describe_commands_uses_bl_tools_error_for_bl_tools() {
-        let error = load_command_description(
-            &PanickingKgooseClient,
-            &kgoose_config(),
-            &[
-                "appkit".to_string(),
-                "deploy".to_string(),
-                "my-site".to_string(),
-            ],
-            bl_tools_config(),
-        )
-        .expect_err("nested appkit description should fail locally");
-
-        let message = error.to_string();
-        if cfg!(feature = "internal-appkit") {
-            assert!(message.contains("does not inspect nested appkit commands"));
-            assert!(message.contains("bl tools appkit --help"));
-        } else {
-            assert!(message.contains("Internal Block App Kit is not available"));
         }
     }
 

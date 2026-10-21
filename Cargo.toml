@@ -10,11 +10,6 @@ rust-version = "1.88.0"
 license = "Apache-2.0"
 publish = false
 
-[features]
-# Employee builds retain App Kit; Public images build with --no-default-features.
-default = ["internal-appkit"]
-internal-appkit = []
-
 [[bin]]
 name = "agent-tools"
 path = "src/main.rs"
