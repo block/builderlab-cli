@@ -61,6 +61,8 @@ pub struct AuthMeResponse {
     pub name: Option<String>,
     pub expires_at: Option<String>,
     pub workspaces: AuthMeWorkspaces,
+    pub account_status: Option<String>,
+    pub enabled_products: Option<Vec<String>>,
 }
 
 impl AuthMeResponse {

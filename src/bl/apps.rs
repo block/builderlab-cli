@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use builderlab_auth::auth_login::auth_url;
 #[cfg(test)]
 use builderlab_auth::auth_login::build_auth_http_client;
+use builderlab_auth::auth_login::{auth_url, AuthMeResponse};
 use builderlab_auth::auth_storage::StoredSessionCredential;
 use clap::{Arg, ArgGroup, ArgMatches, Command};
 use reqwest::blocking::{multipart, Client, Request, RequestBuilder, Response};
@@ -1086,6 +1086,7 @@ enum ComposeSessionCredential {
     Session {
         authorization: HeaderValue,
         secret: String,
+        access_recovery: Option<AppsAccessRecovery>,
     },
     Proxy,
 }
@@ -1098,7 +1099,15 @@ impl ComposeSessionCredential {
         let storage = default_session_storage(config)?;
         let verified =
             verify_stored_session(config, storage.as_ref())?.ok_or_else(auth_required_error)?;
-        Self::from_stored(verified.credential)
+        let mut credential = Self::from_stored(verified.credential)?;
+        if let Self::Session {
+            access_recovery, ..
+        } = &mut credential
+        {
+            *access_recovery =
+                AppsAccessRecovery::from_auth_me(&verified.me, &config.kgoose_base_url);
+        }
+        Ok(credential)
     }
 
     fn from_stored(credential: StoredSessionCredential) -> Result<Self> {
@@ -1115,6 +1124,7 @@ impl ComposeSessionCredential {
         Ok(Self::Session {
             authorization,
             secret,
+            access_recovery: None,
         })
     }
 
@@ -1130,6 +1140,66 @@ impl ComposeSessionCredential {
             Self::Session { secret, .. } => value.replace(secret, "[REDACTED]"),
             Self::Proxy => value.to_string(),
         }
+    }
+
+    fn access_recovery(&self) -> Option<&AppsAccessRecovery> {
+        match self {
+            Self::Session {
+                access_recovery, ..
+            } => access_recovery.as_ref(),
+            Self::Proxy => None,
+        }
+    }
+}
+
+struct AppsAccessRecovery {
+    code: &'static str,
+    next_action: String,
+}
+
+impl AppsAccessRecovery {
+    fn from_auth_me(me: &AuthMeResponse, base_url: &str) -> Option<Self> {
+        // Use only the coarse, caller-visible status. Pending or unknown status
+        // must not be diagnosed from legacy screening fields or product absence.
+        if me.account_status.as_deref() == Some("ACCOUNT_STATUS_NEEDS_DETAILS") {
+            let destination = account_setup_url(base_url)
+                .unwrap_or_else(|| "the BuilderLab web app for this environment".to_string());
+            return Some(Self {
+                code: "account_setup_required",
+                next_action: format!(
+                    "Your CLI session is valid, but account setup is incomplete. Finish account setup at {destination} using the same account, then retry this command. Repeating `bl auth login` will not complete account setup."
+                ),
+            });
+        }
+        if matches!(
+            me.account_status.as_deref(),
+            None | Some("ACCOUNT_STATUS_OK")
+        ) && me.enabled_products.as_ref().is_some_and(|products| {
+            !products
+                .iter()
+                .any(|product| product == "BUILDERLAB_PRODUCT_BUILDERLAB")
+        }) {
+            return Some(Self {
+                code: "builderlab_access_required",
+                next_action: "Your CLI session is valid, but BuilderLab product access is not enabled for this account. Ask your administrator or the BuilderLab team to confirm Apps access for this account and environment, then retry this command.".to_string(),
+            });
+        }
+        None
+    }
+}
+
+fn account_setup_url(base_url: &str) -> Option<String> {
+    let url = url::Url::parse(base_url).ok()?;
+    // These app hosts serve the supported /account/setup web route. Do not
+    // invent a web route on direct API hosts, proxies, or custom deployments.
+    match url.origin().ascii_serialization().as_str() {
+        "https://app.builderlab.xyz" => {
+            Some("https://app.builderlab.xyz/account/setup".to_string())
+        }
+        "https://app.builderlabstaging.xyz" => {
+            Some("https://app.builderlabstaging.xyz/account/setup".to_string())
+        }
+        _ => None,
     }
 }
 
@@ -2021,12 +2091,20 @@ fn control_plane_http_failure(
     body: &str,
     credential: &ComposeSessionCredential,
 ) -> anyhow::Error {
+    // The ingress intentionally returns an empty denial. Enrich only that
+    // response using the already verified session; preserve explicit API errors
+    // (including workspace/publisher denials) and never retry a mutation.
+    let access_recovery = (status == StatusCode::FORBIDDEN && body.trim().is_empty())
+        .then(|| credential.access_recovery())
+        .flatten();
     let parsed = serde_json::from_str::<Value>(body).ok();
     let code = parsed
         .as_ref()
         .and_then(|value| value.pointer("/error/code"))
         .and_then(Value::as_str)
-        .unwrap_or("control_plane_request_failed");
+        .unwrap_or_else(|| {
+            access_recovery.map_or("control_plane_request_failed", |recovery| recovery.code)
+        });
     let validation = manifest_validation_diagnostic(status, code, parsed.as_ref());
     let code = terminal_safe_text(&credential.redact(code));
     let mut details = json!({"http_status": status.as_u16()});
@@ -2049,6 +2127,10 @@ fn control_plane_http_failure(
         Some(json!(
             "Run `bl auth logout`, then `bl auth login` to replace your session."
         ))
+    } else if let Some(recovery) = access_recovery {
+        Some(json!(terminal_safe_text(
+            &credential.redact(&recovery.next_action)
+        )))
     } else {
         parsed
             .as_ref()
@@ -2058,6 +2140,9 @@ fn control_plane_http_failure(
                     .or_else(|| value.pointer("/error/next_action"))
             })
             .and_then(|value| sanitize_recovery_field(value, credential))
+            .or_else(|| (status == StatusCode::FORBIDDEN).then(|| json!(
+                "Check Apps access for this account and environment, and your workspace and app permissions. Use `bl workspace list` and `bl workspace switch` to check the active workspace."
+            )))
     };
     let mut message = format!("{method} {path} failed with {status} ({code})");
     if let Some((diagnostic, guidance)) = validation {
@@ -2558,6 +2643,188 @@ mod tests {
             credential,
         );
         assert_eq!(requests[0].body, Value::Null);
+    }
+
+    #[test]
+    fn bl_apps_process_distinguishes_account_setup_from_other_denials() {
+        let credential = "apps-e2e-only.account-access.session";
+        let needs_details = json!({
+            "account_status": "ACCOUNT_STATUS_NEEDS_DETAILS", "enabled_products": []
+        });
+        let cases = [
+            (
+                needs_details.clone(),
+                403,
+                "",
+                "account_setup_required",
+                "Finish account setup",
+            ),
+            (
+                json!({"account_status": "ACCOUNT_STATUS_OK", "enabled_products": []}),
+                403,
+                "",
+                "builderlab_access_required",
+                "product access is not enabled",
+            ),
+            (
+                json!({"enabled_products": []}),
+                403,
+                "",
+                "builderlab_access_required",
+                "product access is not enabled",
+            ),
+            (
+                json!({"account_status": "ACCOUNT_STATUS_PENDING", "enabled_products": []}),
+                403,
+                "",
+                "control_plane_request_failed",
+                "workspace and app permissions",
+            ),
+            (
+                json!({"account_status": "ACCOUNT_STATUS_REJECTED", "enabled_products": []}),
+                403,
+                "",
+                "control_plane_request_failed",
+                "workspace and app permissions",
+            ),
+            (
+                json!({"account_status": "ACCOUNT_STATUS_FUTURE", "enabled_products": []}),
+                403,
+                "",
+                "control_plane_request_failed",
+                "workspace and app permissions",
+            ),
+            (
+                json!({}),
+                403,
+                "",
+                "control_plane_request_failed",
+                "workspace and app permissions",
+            ),
+            (
+                needs_details.clone(),
+                403,
+                r#"{"error":{"code":"owner_required"},"next_action":"Ask the app owner for access."}"#,
+                "owner_required",
+                "Ask the app owner",
+            ),
+            (
+                needs_details,
+                401,
+                r#"{"error":{"code":"session_expired"}}"#,
+                "session_expired",
+                "replace your session",
+            ),
+        ];
+        for (account_fields, status, body, code, guidance) in cases {
+            for json_output in [false, true] {
+                let mut auth_body: Value =
+                    serde_json::from_str(&process_auth_response().body).unwrap();
+                for (key, value) in account_fields.as_object().unwrap() {
+                    auth_body[key] = value.clone();
+                }
+                // Legacy detail/reason fields and identity must never be copied
+                // into recovery text, including for pending and unknown states.
+                auth_body["account_standing"] = json!({"restriction_reason": "private-diagnostic"});
+                let auth_server = ProcessServer::start(vec![ProcessResponse::json(auth_body)]);
+                let control_plane = ProcessServer::start(vec![
+                    ProcessResponse::raw(status, body).with_trace_id(REQUEST_TRACE_ID)
+                ]);
+                let mut args = vec!["apps", "list", "--base-url", APPROVED_TEST_BASE_URL];
+                if json_output {
+                    args.push("--json");
+                }
+                let output = process_command(&auth_server, &control_plane, &args, credential)
+                    .output()
+                    .expect("run account access denial");
+                let expected_exit = if status == 401 {
+                    exit_codes::AUTH_REQUIRED
+                } else {
+                    exit_codes::FORBIDDEN
+                };
+                assert_eq!(output.status.code(), Some(expected_exit));
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert!(stderr.contains(guidance), "{stderr}");
+                assert!(stderr.contains(REQUEST_TRACE_ID), "{stderr}");
+                assert!(!stderr.contains(credential));
+                assert!(!stderr.contains("private-diagnostic"));
+                assert!(!stderr.contains("apps@example.com"));
+                if code != "account_setup_required" {
+                    assert!(!stderr.contains("Finish account setup"));
+                }
+                if json_output {
+                    let payload = stderr
+                        .lines()
+                        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .unwrap();
+                    assert_eq!(payload["error"]["code"], code);
+                    assert_eq!(payload["error"]["details"], json!({"http_status": status}));
+                    assert_eq!(payload["error"]["trace_id"], REQUEST_TRACE_ID);
+                    assert!(payload["next_action"].as_str().unwrap().contains(guidance));
+                }
+                let auth_requests = auth_server.finish();
+                assert_eq!(auth_requests.len(), 1);
+                assert_process_auth(&auth_requests[0], credential);
+                let requests = control_plane.finish();
+                assert_eq!(requests.len(), 1);
+                assert_process_control_plane(&requests[0], "GET", "/v1/agent/apps", credential);
+            }
+        }
+    }
+
+    #[test]
+    fn account_setup_links_use_only_known_web_origins() {
+        for host in ["app.builderlab.xyz", "app.builderlabstaging.xyz"] {
+            assert_eq!(
+                account_setup_url(&format!("https://{host}/api/goose")),
+                Some(format!("https://{host}/account/setup"))
+            );
+        }
+        for base_url in [
+            "https://kgoose.example.com",
+            "http://app.builderlab.xyz",
+            "https://app.builderlab.xyz:8443",
+            "https://app.builderlab.xyz.example.com",
+            "http://127.0.0.1:1234",
+            "invalid",
+        ] {
+            assert!(account_setup_url(base_url).is_none());
+        }
+    }
+
+    #[test]
+    fn account_status_does_not_override_successful_apps_responses() {
+        let mut auth_body: Value = serde_json::from_str(&process_auth_response().body).unwrap();
+        auth_body["account_status"] = json!("ACCOUNT_STATUS_NEEDS_DETAILS");
+        auth_body["enabled_products"] = json!([]);
+        let auth_server = ProcessServer::start(vec![ProcessResponse::json(auth_body)]);
+        let inventory = json!({"apps": []});
+        let control_plane = ProcessServer::start(vec![ProcessResponse::json(inventory.clone())]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "list",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--json",
+            ],
+            "apps-e2e-only.advisory.session",
+        )
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&process_stdout(&output)).unwrap(),
+            inventory
+        );
+        assert_eq!(auth_server.finish().len(), 1);
+        assert_eq!(control_plane.finish().len(), 1);
     }
 
     #[test]
