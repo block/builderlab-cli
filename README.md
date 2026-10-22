@@ -72,6 +72,35 @@ Use `--json` for machine-readable output and `--verbose` for request
 diagnostics. Do not include credentials or other sensitive data when sharing
 verbose output.
 
+## Managed MySQL apps
+
+When the selected Apps Platform contract and server support managed MySQL,
+create a fetch-js app with:
+
+```bash
+bl apps create --app-id inventory --runtime-profile fetch-js --persistence mysql --json
+```
+
+The command plans, reserves the exact app ID, and initializes its database
+before returning success. MySQL supports `fetch-js` and `process` apps; pass
+the runtime explicitly. MySQL is unavailable for `static` apps.
+The client preserves server availability errors; it does not fall back to SQLite.
+
+For an existing app, inspect it first. To resume failed initialization or
+enable MySQL on a compatible stateless server app, use its existing runtime:
+
+```bash
+bl apps get inventory --json
+bl apps initialize inventory --runtime-profile fetch-js --persistence mysql --json
+```
+
+`initialize` checks that the app exists, plans the requested settings, and
+initializes the same ID without another reservation. It does not reclaim
+deleted apps or migrate an existing database to another engine. Use the same
+selected endpoint and environment throughout. Check the returned
+`initialize.persistence` is `mysql` before deploying the matching runtime artifact.
+Deleting a MySQL app revokes its database access, but the database data is retained.
+
 For inherited Apps Platform trace context and failure correlation, see
 [Apps operation correlation](docs/apps-operation-correlation.md).
 

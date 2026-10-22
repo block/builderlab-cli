@@ -188,9 +188,26 @@ pub fn command() -> Command {
                     Arg::new("persistence")
                         .long("persistence")
                         .value_name("MODE")
-                        .value_parser(["none", "sqlite"])
-                        .help("Requested persistence mode"),
+                        .value_parser(["none", "sqlite", "mysql"])
+                        .help("Requested persistence mode (mysql requires --runtime-profile process or fetch-js)"),
                 ),
+        ))
+        .subcommand(control_plane_args(
+            Command::new("initialize")
+                .about("Initialize or repair an existing app stack and persistence")
+                .long_about("Inspect an existing app, plan its requested settings, and initialize \
+                    that exact app without reserving another identity. Use for initialization \
+                    recovery or an explicitly requested persistence update. MySQL requires \
+                    --runtime-profile process or fetch-js. This does not migrate database engines or reclaim deleted apps.")
+                .arg(Arg::new("app-id").value_name("APP_ID").required(true)
+                    .help("Exact existing app identifier returned by list, get, or create"))
+                .arg(Arg::new("environment").long("environment").value_name("ENVIRONMENT")
+                    .help("Optional Compose environment override"))
+                .arg(Arg::new("runtime-profile").long("runtime-profile").value_name("PROFILE")
+                    .help("Requested runtime profile; existing apps retain their deployed profile"))
+                .arg(Arg::new("persistence").long("persistence").value_name("MODE")
+                    .value_parser(["none", "sqlite", "mysql"])
+                    .help("Requested persistence mode; database engine migration is unsupported")),
         ))
         .subcommand(control_plane_args(
             Command::new("deploy")
@@ -516,6 +533,7 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("get", get_matches)) => run_get(config, get_matches),
         Some(("versions", versions_matches)) => run_versions(config, versions_matches),
         Some(("create", create_matches)) => run_create(config, create_matches),
+        Some(("initialize", initialize_matches)) => run_initialize(config, initialize_matches),
         Some(("deploy", deploy_matches)) => run_deploy(config, deploy_matches),
         Some(("rollback", rollback_matches)) => run_rollback(config, rollback_matches),
         Some(("delete", delete_matches)) => run_delete(config, delete_matches),
@@ -569,7 +587,24 @@ fn run_versions(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     print_json(&response)
 }
 
+fn validate_mysql_runtime(matches: &ArgMatches) -> Result<bool> {
+    let mysql_requested =
+        matches.get_one::<String>("persistence").map(String::as_str) == Some("mysql");
+    if mysql_requested
+        && !matches!(
+            matches
+                .get_one::<String>("runtime-profile")
+                .map(String::as_str),
+            Some("process" | "fetch-js")
+        )
+    {
+        anyhow::bail!("managed MySQL requires --runtime-profile process or fetch-js");
+    }
+    Ok(mysql_requested)
+}
+
 fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let mysql_requested = validate_mysql_runtime(matches)?;
     let (client, credential) = control_plane_context(config, matches)?;
     let requested_app_id = matches.get_one::<String>("app-id").map(String::as_str);
     let request = PlanRequest {
@@ -603,6 +638,13 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         )
         .map_err(|error| correlate_response_error(error, &plan))?;
     let plan_requests_initialize = initialize_required || initialize_recommended;
+    if mysql_requested {
+        validate_mysql_plan(&plan, request.runtime_profile)
+            .map_err(|error| correlate_response_error(error, &plan))?;
+        if !plan_requests_initialize {
+            return Err(correlate_response_error(anyhow::anyhow!("Apps Platform mysql plan must request initialization before deployment; refusing to reserve the app"), &plan));
+        }
+    }
     let mutation_request = mutation_request_from_plan(&plan);
     let (reservation, reservation_reconciled) =
         reconcile_create_reservation(&client, &credential, &app_id, &plan, &mutation_request)?;
@@ -610,14 +652,18 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         let response = client
             .initialize(&credential, &app_id, &mutation_request)
             .with_context(|| {
-                format!(
-                    "Apps Platform reserved app_id {app_id:?}, but initialization did not complete. Retry the same `bl apps create` command to reconcile the reservation and continue initialization."
-                )
+                if mysql_requested {
+                    let profile = request.runtime_profile.expect("validated MySQL runtime");
+                    format!("Apps Platform reserved app_id {app_id:?}, but MySQL initialization did not complete. Inspect it with `bl apps get`, then resume the same app with `bl apps initialize` using the same endpoint, environment, --runtime-profile {profile} and --persistence mysql.")
+                } else {
+                    format!("Apps Platform reserved app_id {app_id:?}, but initialization did not complete. Retry the same `bl apps create` command to reconcile the reservation and continue initialization.")
+                }
             })?;
         let initialized_app_id =
             required_response_string(&response, "app_id", "Apps Platform initialize")?;
         require_exact_app_id("initialize", &app_id, initialized_app_id)
             .map_err(|error| correlate_response_error(error, &response))?;
+        confirm_mysql_initialization(&response, mysql_requested)?;
         Some(response)
     } else {
         None
@@ -643,6 +689,72 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         "reservation": reservation,
         "initialize": initialize,
     }))
+}
+
+fn validate_mysql_plan(plan: &Value, requested_profile: Option<&str>) -> Result<()> {
+    if plan.get("persistence").and_then(Value::as_str) != Some("mysql")
+        || plan.get("runtime_profile").and_then(Value::as_str) != requested_profile
+    {
+        anyhow::bail!("Apps Platform plan did not preserve mysql persistence and the requested runtime; refusing to reserve or initialize the app");
+    }
+    Ok(())
+}
+
+fn confirm_mysql_initialization(response: &Value, mysql_requested: bool) -> Result<()> {
+    if mysql_requested && response.get("persistence").and_then(Value::as_str) != Some("mysql") {
+        return Err(correlate_response_error(
+            anyhow::anyhow!("Apps Platform initialization did not confirm mysql persistence; inspect the app before deploying"), response,
+        ));
+    }
+    Ok(())
+}
+
+fn run_initialize(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let mysql_requested = validate_mysql_runtime(matches)?;
+    let app_id = matches
+        .get_one::<String>("app-id")
+        .context("expected app id")?;
+    let environment = matches.get_one::<String>("environment").map(String::as_str);
+    let (client, credential) = control_plane_context(config, matches)?;
+    let existing = client.get_app(&credential, app_id, environment)?;
+    let app = existing
+        .get("app")
+        .context("Apps Platform get response did not include app")?;
+    let observed_id = required_response_string(app, "app_id", "Apps Platform get")?;
+    require_exact_app_id("get", app_id, observed_id)
+        .map_err(|error| correlate_response_error(error, &existing))?;
+    if !value_is_absent_or_empty_text(app.get("deleted_at"))
+        || app.get("status").and_then(Value::as_str) == Some("deleted")
+    {
+        anyhow::bail!(
+            "Apps Platform initialize cannot reclaim a deleted app; select an active app"
+        );
+    }
+    let request = PlanRequest {
+        app_id: Some(app_id),
+        name: None,
+        environment,
+        runtime_profile: matches
+            .get_one::<String>("runtime-profile")
+            .map(String::as_str),
+        persistence: matches.get_one::<String>("persistence").map(String::as_str),
+        client_version: client.client_version_text(),
+    };
+    let plan = client.plan(&credential, &request)?;
+    let planned_id = required_response_string(&plan, "app_id", "Apps Platform plan")?;
+    require_exact_app_id("plan", app_id, planned_id)
+        .map_err(|error| correlate_response_error(error, &plan))?;
+    if mysql_requested {
+        validate_mysql_plan(&plan, request.runtime_profile)
+            .map_err(|error| correlate_response_error(error, &plan))?;
+    }
+    let response = client.initialize(&credential, app_id, &mutation_request_from_plan(&plan))?;
+    let initialized_id = required_response_string(&response, "app_id", "Apps Platform initialize")?;
+    require_exact_app_id("initialize", app_id, initialized_id)
+        .map_err(|error| correlate_response_error(error, &response))?;
+    confirm_mysql_initialization(&response, mysql_requested)?;
+    print_json(&json!({"ok":true, "app_id":app_id, "initialized":true,
+        "external_url":response.get("external_url"), "plan":plan, "initialize":response}))
 }
 
 fn reconcile_create_reservation(
@@ -738,6 +850,7 @@ fn is_matching_incomplete_reservation(
         ("environment", "environment"),
         ("persistence", "persistence"),
         ("runtime_class", "runtime_class"),
+        ("runtime_profile", "runtime_profile"),
         ("name", "name"),
     ]
     .into_iter()
@@ -1042,7 +1155,12 @@ struct DeployOptions {
 
 fn mutation_request_from_plan(plan: &Value) -> Value {
     let mut request = Map::new();
-    for field in ["environment", "persistence", "runtime_class"] {
+    for field in [
+        "environment",
+        "persistence",
+        "runtime_class",
+        "runtime_profile",
+    ] {
         if let Some(value) = plan.get(field).and_then(Value::as_str) {
             if !value.is_empty() {
                 request.insert(field.to_string(), Value::String(value.to_string()));
@@ -2971,107 +3089,477 @@ mod tests {
     }
 
     #[test]
-    fn bl_apps_create_process_runs_plan_reserve_and_initialize() {
-        let credential = "apps-e2e-only.create.session+credential";
-        let plan = json!({
-            "app_id": "merchant-lookup",
-            "display_name": "Merchant Lookup",
-            "environment": "staging",
-            "persistence": "sqlite",
-            "runtime_class": "default",
-            "initialize": {"required": true, "recommended": false}
-        });
-        let initialized = json!({
-            "app_id": "merchant-lookup",
-            "external_url": "https://merchant-lookup--bpsites.example/"
-        });
-        let reservation = json!({
-            "app_id": "merchant-lookup",
-            "external_url": "https://merchant-lookup--bpsites.example/"
-        });
-        let auth_server = ProcessServer::start(vec![process_auth_response()]);
-        let control_plane = ProcessServer::start(vec![
-            ProcessResponse::json(plan.clone()),
-            ProcessResponse::json(reservation.clone()),
-            ProcessResponse::json(initialized.clone()),
-        ]);
-        let mut command = process_command(
-            &auth_server,
-            &control_plane,
-            &[
-                "apps",
-                "create",
-                "--app-id",
-                "merchant-lookup",
-                "--name",
-                "Merchant Lookup",
-                "--environment",
-                "staging",
-                "--runtime-profile",
-                "fetch-js",
-                "--persistence",
-                "sqlite",
-                "--base-url",
-                APPROVED_TEST_BASE_URL,
-                "--client-version",
-                "0.2.0",
-                "--json",
-            ],
-            credential,
-        );
-
-        let output = command.output().expect("run Apps create process command");
-        assert!(
-            output.status.success(),
-            "stderr was: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let value = serde_json::from_str::<Value>(&process_stdout(&output))
-            .expect("parse create process output");
-        assert_eq!(value["app_id"], "merchant-lookup");
-        assert_eq!(value["reserved"], true);
-        assert_eq!(value["initialized"], true);
-        assert_eq!(value["plan"], plan);
-        assert_eq!(value["reservation"], reservation);
-        assert_eq!(value["initialize"], initialized);
-        let auth_requests = auth_server.finish();
-        let requests = control_plane.finish();
-        assert_process_auth(&auth_requests[0], credential);
-        assert_eq!(requests.len(), 3);
-        assert_process_control_plane(&requests[0], "POST", APPS_PLAN_PATH, credential);
-        assert_eq!(
-            requests[0].body,
-            json!({
+    fn bl_apps_create_server_runs_plan_reserve_and_initialize() {
+        for (persistence, profile) in [
+            ("sqlite", "fetch-js"),
+            ("mysql", "process"),
+            ("mysql", "fetch-js"),
+        ] {
+            let credential = "apps-e2e-only.create.session+credential";
+            let plan = json!({
                 "app_id": "merchant-lookup",
-                "name": "Merchant Lookup",
+                "display_name": "Merchant Lookup",
                 "environment": "staging",
-                "runtime_profile": "fetch-js",
-                "persistence": "sqlite",
-                "client_version": "0.2.0"
-            })
-        );
-        assert_process_control_plane(
-            &requests[1],
-            "POST",
-            "/v1/agent/apps/merchant-lookup/reserve",
-            credential,
-        );
-        assert_eq!(
-            requests[1].body,
-            json!({
-                "environment": "staging",
-                "persistence": "sqlite",
+                "persistence": persistence,
+                "runtime_profile": profile,
                 "runtime_class": "default",
-                "name": "Merchant Lookup"
-            })
-        );
-        assert_process_control_plane(
-            &requests[2],
-            "POST",
-            "/v1/agent/apps/merchant-lookup/initialize",
-            credential,
-        );
-        assert_eq!(requests[2].body, requests[1].body);
+                "initialize": {"required": true, "recommended": false}
+            });
+            let initialized = json!({
+                "app_id": "merchant-lookup",
+                "external_url": "https://merchant-lookup--bpsites.example/",
+                "persistence": persistence
+            });
+            let reservation = json!({
+                "app_id": "merchant-lookup",
+                "external_url": "https://merchant-lookup--bpsites.example/"
+            });
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![
+                ProcessResponse::json(plan.clone()),
+                ProcessResponse::json(reservation.clone()),
+                ProcessResponse::json(initialized.clone()),
+            ]);
+            let mut command = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "create",
+                    "--app-id",
+                    "merchant-lookup",
+                    "--name",
+                    "Merchant Lookup",
+                    "--environment",
+                    "staging",
+                    "--runtime-profile",
+                    profile,
+                    "--persistence",
+                    persistence,
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--client-version",
+                    "0.2.0",
+                    "--json",
+                ],
+                credential,
+            );
+
+            let output = command.output().expect("run Apps create process command");
+            assert!(
+                output.status.success(),
+                "stderr was: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value = serde_json::from_str::<Value>(&process_stdout(&output))
+                .expect("parse create process output");
+            assert_eq!(value["app_id"], "merchant-lookup");
+            assert_eq!(value["reserved"], true);
+            assert_eq!(value["initialized"], true);
+            assert_eq!(value["plan"], plan);
+            assert_eq!(value["reservation"], reservation);
+            assert_eq!(value["initialize"], initialized);
+            let auth_requests = auth_server.finish();
+            let requests = control_plane.finish();
+            assert_process_auth(&auth_requests[0], credential);
+            assert_eq!(requests.len(), 3);
+            assert_process_control_plane(&requests[0], "POST", APPS_PLAN_PATH, credential);
+            assert_eq!(
+                requests[0].body,
+                json!({
+                    "app_id": "merchant-lookup",
+                    "name": "Merchant Lookup",
+                    "environment": "staging",
+                    "runtime_profile": profile,
+                    "persistence": persistence,
+                    "client_version": "0.2.0"
+                })
+            );
+            assert_process_control_plane(
+                &requests[1],
+                "POST",
+                "/v1/agent/apps/merchant-lookup/reserve",
+                credential,
+            );
+            assert_eq!(
+                requests[1].body,
+                json!({
+                    "environment": "staging",
+                    "persistence": persistence,
+                "runtime_profile": profile,
+                    "runtime_class": "default",
+                    "name": "Merchant Lookup"
+                })
+            );
+            assert_process_control_plane(
+                &requests[2],
+                "POST",
+                "/v1/agent/apps/merchant-lookup/initialize",
+                credential,
+            );
+            assert_eq!(requests[2].body, requests[1].body);
+        }
+    }
+
+    #[test]
+    fn bl_apps_mysql_requires_explicit_server_runtime_before_authentication() {
+        for subcommand in ["create", "initialize"] {
+            for profile in [None, Some("static"), Some("unknown")] {
+                let mut args = vec!["apps", subcommand];
+                if subcommand == "create" {
+                    args.push("--app-id");
+                }
+                args.extend([
+                    "mysql-app",
+                    "--persistence",
+                    "mysql",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                ]);
+                if let Some(profile) = profile {
+                    args.extend(["--runtime-profile", profile]);
+                }
+                let matches = command()
+                    .try_get_matches_from(args)
+                    .expect("parse mysql command");
+                let (_, args) = matches.subcommand().unwrap();
+                let error = validate_mysql_runtime(args).unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("requires --runtime-profile process or fetch-js"));
+            }
+        }
+    }
+
+    #[test]
+    fn bl_apps_create_mysql_rejects_unsafe_plan_before_reservation() {
+        for requested_profile in ["process", "fetch-js"] {
+            for (persistence, profile, initialize) in [
+                (Some("sqlite"), Some("process"), true),
+                (None, Some("process"), true),
+                (
+                    Some("mysql"),
+                    Some(if requested_profile == "process" {
+                        "fetch-js"
+                    } else {
+                        "process"
+                    }),
+                    true,
+                ),
+                (Some("mysql"), Some("static"), true),
+                (Some("mysql"), None, true),
+                (Some("mysql"), Some(requested_profile), false),
+            ] {
+                let auth_server = ProcessServer::start(vec![process_auth_response()]);
+                let control_plane = ProcessServer::start(vec![ProcessResponse::json(json!({
+                    "app_id": "mysql-app", "persistence": persistence, "runtime_profile": profile,
+                    "initialize": {"required": initialize, "recommended": false}
+                }))]);
+                let output = process_command(
+                    &auth_server,
+                    &control_plane,
+                    &[
+                        "apps",
+                        "create",
+                        "--app-id",
+                        "mysql-app",
+                        "--persistence",
+                        "mysql",
+                        "--runtime-profile",
+                        requested_profile,
+                        "--base-url",
+                        APPROVED_TEST_BASE_URL,
+                        "--json",
+                    ],
+                    "apps-e2e-only.mysql-plan",
+                )
+                .output()
+                .unwrap();
+                assert!(!output.status.success());
+                assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to reserve"));
+                auth_server.finish();
+                let requests = control_plane.finish();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].path, APPS_PLAN_PATH);
+            }
+        }
+    }
+
+    #[test]
+    fn bl_apps_create_mysql_preserves_server_rejections_without_fallback() {
+        for requested_profile in ["process", "fetch-js"] {
+            for (failed_stage, code) in [(0, "mysql_unavailable"), (2, "mysql_not_ready")] {
+                let plan = ProcessResponse::json(json!({
+                    "app_id": "mysql-app", "persistence": "mysql", "runtime_profile": requested_profile,
+                    "environment": "staging", "initialize": {"required": true, "recommended": true}
+                }));
+                let failure = ProcessResponse::json_status(
+                    409,
+                    json!({
+                        "ok": false, "error": {"code": code, "message": "private provider diagnostic"},
+                        "next_action": "Inspect this app on the selected control plane."
+                    }),
+                );
+                let responses = if failed_stage == 0 {
+                    vec![failure]
+                } else {
+                    vec![
+                        plan,
+                        ProcessResponse::json(json!({"app_id":"mysql-app"})),
+                        failure,
+                    ]
+                };
+                let auth_server = ProcessServer::start(vec![process_auth_response()]);
+                let control_plane = ProcessServer::start(responses);
+                let credential = "apps-e2e-only.mysql-failure";
+                let output = process_command(
+                    &auth_server,
+                    &control_plane,
+                    &[
+                        "apps",
+                        "create",
+                        "--app-id",
+                        "mysql-app",
+                        "--persistence",
+                        "mysql",
+                        "--runtime-profile",
+                        requested_profile,
+                        "--base-url",
+                        APPROVED_TEST_BASE_URL,
+                        "--json",
+                    ],
+                    credential,
+                )
+                .output()
+                .unwrap();
+                assert!(!output.status.success());
+                let error = process_error(&output);
+                assert_eq!(error["error"]["code"], code);
+                assert!(error["next_action"]
+                    .as_str()
+                    .unwrap()
+                    .contains("selected control plane"));
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("private provider diagnostic"));
+                assert!(!stderr.contains(credential));
+                if failed_stage == 2 {
+                    assert!(stderr.contains(&format!("--runtime-profile {requested_profile}")));
+                }
+                auth_server.finish();
+                let requests = control_plane.finish();
+                assert_eq!(
+                    requests.len(),
+                    failed_stage + 1,
+                    "no retries or sqlite fallback"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bl_apps_create_mysql_requires_initialization_to_confirm_persistence() {
+        for requested_profile in ["process", "fetch-js"] {
+            for persistence in [None, Some("sqlite")] {
+                let auth_server = ProcessServer::start(vec![process_auth_response()]);
+                let control_plane = ProcessServer::start(vec![
+                    ProcessResponse::json(json!({"app_id":"mysql-app", "persistence":"mysql",
+                    "runtime_profile":requested_profile, "initialize":{"required":true,"recommended":false}})),
+                    ProcessResponse::json(json!({"app_id":"mysql-app"})),
+                    ProcessResponse::json(json!({"app_id":"mysql-app", "persistence":persistence,
+                    "external_url":"https://mysql-app.example/"})),
+                ]);
+                let output = process_command(
+                    &auth_server,
+                    &control_plane,
+                    &[
+                        "apps",
+                        "create",
+                        "--app-id",
+                        "mysql-app",
+                        "--persistence",
+                        "mysql",
+                        "--runtime-profile",
+                        requested_profile,
+                        "--base-url",
+                        APPROVED_TEST_BASE_URL,
+                        "--json",
+                    ],
+                    "apps-e2e-only.mysql-confirm",
+                )
+                .output()
+                .unwrap();
+                assert!(!output.status.success());
+                assert!(String::from_utf8_lossy(&output.stderr)
+                    .contains("did not confirm mysql persistence"));
+                auth_server.finish();
+                assert_eq!(control_plane.finish().len(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn bl_apps_initialize_mysql_plans_and_repairs_existing_app_without_reserve() {
+        for requested_profile in ["process", "fetch-js"] {
+            for recommended in [false, true] {
+                let auth_server = ProcessServer::start(vec![process_auth_response()]);
+                let control_plane = ProcessServer::start(vec![
+                    ProcessResponse::json(
+                        json!({"ok":true,"app":{"app_id":"mysql-app","persistence":"mysql","status":"active"}}),
+                    ),
+                    ProcessResponse::json(json!({"app_id":"mysql-app","environment":"staging",
+                    "persistence":"mysql","runtime_profile":requested_profile,
+                    "initialize":{"required":false,"recommended":recommended}})),
+                    ProcessResponse::json(json!({"app_id":"mysql-app","persistence":"mysql",
+                    "external_url":"https://mysql-app.example/"})),
+                ]);
+                let output = process_command(
+                    &auth_server,
+                    &control_plane,
+                    &[
+                        "apps",
+                        "initialize",
+                        "mysql-app",
+                        "--environment",
+                        "staging",
+                        "--persistence",
+                        "mysql",
+                        "--runtime-profile",
+                        requested_profile,
+                        "--base-url",
+                        APPROVED_TEST_BASE_URL,
+                        "--json",
+                    ],
+                    "apps-e2e-only.mysql-initialize",
+                )
+                .output()
+                .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let response: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
+                assert_eq!(response["initialized"], true);
+                assert_eq!(response["initialize"]["persistence"], "mysql");
+                auth_server.finish();
+                let requests = control_plane.finish();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(requests[0].method, "GET");
+                assert_eq!(
+                    requests[0].path,
+                    "/v1/agent/apps/mysql-app?environment=staging"
+                );
+                assert_eq!(requests[1].path, APPS_PLAN_PATH);
+                assert_eq!(requests[1].body["persistence"], "mysql");
+                assert_eq!(requests[1].body["runtime_profile"], requested_profile);
+                assert_eq!(requests[2].path, "/v1/agent/apps/mysql-app/initialize");
+                assert_eq!(
+                    requests[2].body,
+                    json!({"environment":"staging",
+                "runtime_profile":requested_profile,"persistence":"mysql"})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bl_apps_initialize_rejects_missing_deleted_or_substituted_app_before_plan() {
+        for existing in [
+            ProcessResponse::json_status(404, json!({"error":{"code":"app_not_found"}})),
+            ProcessResponse::json(json!({"app":{"app_id":"mysql-app","status":"deleted"}})),
+            ProcessResponse::json(
+                json!({"app":{"app_id":"mysql-app","deleted_at":"2026-01-01T00:00:00Z"}}),
+            ),
+            ProcessResponse::json(json!({"app":{"app_id":"another-app"}})),
+        ] {
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![existing]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "initialize",
+                    "mysql-app",
+                    "--persistence",
+                    "mysql",
+                    "--runtime-profile",
+                    "process",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--json",
+                ],
+                "apps-e2e-only.mysql-initialize-stop",
+            )
+            .output()
+            .unwrap();
+            assert!(!output.status.success());
+            auth_server.finish();
+            let requests = control_plane.finish();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, "GET");
+        }
+    }
+
+    #[test]
+    fn bl_apps_initialize_mysql_rejects_changed_plan_before_mutation() {
+        for requested_profile in ["process", "fetch-js"] {
+            let other_profile = if requested_profile == "process" {
+                "fetch-js"
+            } else {
+                "process"
+            };
+            for (persistence, profile) in [
+                (Some("sqlite"), Some(requested_profile)),
+                (None, Some(requested_profile)),
+                (Some("mysql"), Some(other_profile)),
+                (Some("mysql"), Some("static")),
+                (Some("mysql"), None),
+            ] {
+                let auth_server = ProcessServer::start(vec![process_auth_response()]);
+                let control_plane = ProcessServer::start(vec![
+                    ProcessResponse::json(json!({"app":{"app_id":"mysql-app"}})),
+                    ProcessResponse::json(
+                        json!({"app_id":"mysql-app", "persistence":persistence,"runtime_profile":profile}),
+                    ),
+                ]);
+                let output = process_command(
+                    &auth_server,
+                    &control_plane,
+                    &[
+                        "apps",
+                        "initialize",
+                        "mysql-app",
+                        "--persistence",
+                        "mysql",
+                        "--runtime-profile",
+                        requested_profile,
+                        "--base-url",
+                        APPROVED_TEST_BASE_URL,
+                        "--json",
+                    ],
+                    "apps-e2e-only.mysql-initialize-changed-plan",
+                )
+                .output()
+                .unwrap();
+                assert!(!output.status.success());
+                assert!(String::from_utf8_lossy(&output.stderr)
+                    .contains("refusing to reserve or initialize"));
+                auth_server.finish();
+                assert_eq!(control_plane.finish().len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_reservation_with_another_runtime_cannot_be_adopted() {
+        let existing = json!({"ok":true,"app":{"app_id":"mysql-app","role":"owner",
+            "route_status":"idle","route_revision":1,"runtime_profile":"static"},"versions":[]});
+        assert!(!is_matching_incomplete_reservation(
+            &existing,
+            "mysql-app",
+            &json!({"runtime_profile":"process"})
+        ));
     }
 
     #[test]
@@ -3477,6 +3965,7 @@ mod tests {
                 "persistence": "none",
                 "runtime_class": "default",
                 "role": "owner",
+                "runtime_profile": "process",
                 "status": "idle",
                 "route_status": "idle",
                 "route_revision": 1
@@ -3586,6 +4075,7 @@ mod tests {
                 "persistence": "none",
                 "runtime_class": "default",
                 "role": "owner",
+                "runtime_profile": "process",
                 "status": "idle",
                 "route_status": "idle",
                 "route_revision": 1
@@ -3679,6 +4169,7 @@ mod tests {
                 "persistence": "none",
                 "runtime_class": "default",
                 "role": "owner",
+                "runtime_profile": "fetch-js",
                 "status": "idle",
                 "route_status": "idle",
                 "route_revision": 1
