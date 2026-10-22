@@ -111,6 +111,19 @@ from KGoose for the workstation owner and injects it on the wire. Any other
 URL, including an explicit `--base-url` outside that origin, must be an
 approved HTTPS ingress and requires `bl auth login`.
 
+## Apps access errors
+
+A valid CLI session does not guarantee Apps access. For an empty HTTP 403,
+the CLI uses the account information already verified by `/auth/me` to provide
+`account_setup_required` when setup is incomplete, or `builderlab_access_required`
+when BuilderLab product access is absent. Follow `next_action` using the same
+account and environment. Repeating login does not finish account setup.
+
+Other permission denials retain their server code and recovery guidance. A 403
+uses exit code 4; an expired session (HTTP 401) uses exit code 3 and login guidance.
+Account information only adds recovery guidance after a denial; the server
+continues to decide access.
+
 ## Apps validation errors
 
 Apps HTTP failures include `error.details.http_status` in JSON output and retain

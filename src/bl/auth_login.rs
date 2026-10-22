@@ -585,6 +585,8 @@ mod tests {
             email: None,
             name: None,
             expires_at: None,
+            account_status: None,
+            enabled_products: None,
             workspaces: AuthMeWorkspaces {
                 active: vec![AuthMeWorkspace {
                     name: "Test Workspace".to_string(),
@@ -641,6 +643,8 @@ mod tests {
                 email: None,
                 name: None,
                 expires_at: None,
+                account_status: None,
+                enabled_products: None,
                 workspaces: AuthMeWorkspaces { active: vec![] },
             },
         };
