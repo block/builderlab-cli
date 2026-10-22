@@ -3640,7 +3640,7 @@ fn bl_shipped_artifact_contains_no_apps_test_transport() {
 }
 
 #[test]
-fn bl_apps_help_distinguishes_external_and_internal_paths() {
+fn bl_apps_help_lists_platform_commands_without_internal_appkit() {
     let output = bl_command()
         .args(["apps", "--help"])
         .output()
@@ -3650,8 +3650,6 @@ fn bl_apps_help_distinguishes_external_and_internal_paths() {
     assert!(output.status.success(), "stderr was: {stderr}");
     for expected in [
         "Apps Platform",
-        "bb-block",
-        "bb-public",
         "list",
         "get",
         "versions",
