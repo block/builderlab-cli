@@ -2202,6 +2202,9 @@ fn sanitize_recovery_field(value: &Value, credential: &ComposeSessionCredential)
     Some(value)
 }
 
+const WORKSTATION_WORKSPACE_MISMATCH_NEXT_ACTION: &str = "This workstation acts in the BuilderLab workspace its owner most recently signed into or switched to. Run `bl workspace list` to see it, then ask the owner to switch to the app's workspace in BuilderLab and retry. Do not create a replacement app.";
+const WORKSTATION_FORBIDDEN_NEXT_ACTION: &str = "Check Apps access for this account and environment, and your workspace and app permissions. Use `bl workspace list` to check the active workspace; only the workstation owner can switch it in BuilderLab.";
+
 fn control_plane_http_failure(
     method: &str,
     path: &str,
@@ -2241,6 +2244,10 @@ fn control_plane_http_failure(
             }
         }
     }
+    // A delegated workstation credential follows the owner's current BuilderLab
+    // workspace selection, and `bl workspace switch` needs a local session.
+    let delegated_denial =
+        status == StatusCode::FORBIDDEN && matches!(credential, ComposeSessionCredential::Proxy);
     let next_action = if status == StatusCode::UNAUTHORIZED {
         Some(json!(
             "Run `bl auth logout`, then `bl auth login` to replace your session."
@@ -2249,6 +2256,8 @@ fn control_plane_http_failure(
         Some(json!(terminal_safe_text(
             &credential.redact(&recovery.next_action)
         )))
+    } else if delegated_denial && code == "workspace_mismatch" {
+        Some(json!(WORKSTATION_WORKSPACE_MISMATCH_NEXT_ACTION))
     } else {
         parsed
             .as_ref()
@@ -2258,9 +2267,15 @@ fn control_plane_http_failure(
                     .or_else(|| value.pointer("/error/next_action"))
             })
             .and_then(|value| sanitize_recovery_field(value, credential))
-            .or_else(|| (status == StatusCode::FORBIDDEN).then(|| json!(
-                "Check Apps access for this account and environment, and your workspace and app permissions. Use `bl workspace list` and `bl workspace switch` to check the active workspace."
-            )))
+            .or_else(|| {
+                (status == StatusCode::FORBIDDEN).then(|| {
+                    json!(if delegated_denial {
+                        WORKSTATION_FORBIDDEN_NEXT_ACTION
+                    } else {
+                        "Check Apps access for this account and environment, and your workspace and app permissions. Use `bl workspace list` and `bl workspace switch` to check the active workspace."
+                    })
+                })
+            })
     };
     let mut message = format!("{method} {path} failed with {status} ({code})");
     if let Some((diagnostic, guidance)) = validation {
@@ -6013,6 +6028,60 @@ mod tests {
         assert_eq!(requests[0].path, "/v1/agent/apps");
         for header in ["authorization", "cookie", "x-bb-session-credential"] {
             assert!(!requests[0].headers.contains_key(header));
+        }
+    }
+
+    #[test]
+    fn bl_apps_blox_process_explains_workstation_workspace_denials() {
+        let session_switch = "bl workspace switch";
+        let cases = [
+            (
+                json!({
+                    "error": {"code": "workspace_mismatch"},
+                    "next_action": "Use a credential for the workspace that owns this app."
+                }),
+                "workspace_mismatch",
+                "ask the owner to switch to the app's workspace in BuilderLab",
+            ),
+            (
+                json!({"error": {"code": "forbidden"}}),
+                "forbidden",
+                "only the workstation owner can switch it in BuilderLab",
+            ),
+            (
+                json!({
+                    "error": {"code": "owner_required"},
+                    "next_action": "Ask the app owner for access."
+                }),
+                "owner_required",
+                "Ask the app owner for access.",
+            ),
+        ];
+        for (body, code, guidance) in cases {
+            let auth_server = ProcessServer::start(vec![]);
+            let control_plane = ProcessServer::start(vec![ProcessResponse::json_status(403, body)]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &["apps", "get", "event-agenda-demo", "--json"],
+                "apps-e2e-only.unused",
+            )
+            .env("BL_APPS_E2E_PROXY", "true")
+            .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+            .output()
+            .expect("run Blox Apps workspace denial");
+            assert_eq!(output.status.code(), Some(exit_codes::FORBIDDEN));
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let payload = stderr
+                .lines()
+                .find_map(|line| serde_json::from_str::<Value>(line).ok())
+                .unwrap();
+            assert_eq!(payload["error"]["code"], code);
+            let next_action = payload["next_action"].as_str().unwrap();
+            assert!(next_action.contains(guidance), "{next_action}");
+            assert!(!stderr.contains(session_switch), "{stderr}");
+            assert!(auth_server.finish().is_empty());
+            assert_eq!(control_plane.finish().len(), 1);
         }
     }
 
