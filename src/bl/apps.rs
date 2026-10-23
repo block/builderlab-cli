@@ -2202,7 +2202,7 @@ fn sanitize_recovery_field(value: &Value, credential: &ComposeSessionCredential)
     Some(value)
 }
 
-const WORKSTATION_WORKSPACE_MISMATCH_NEXT_ACTION: &str = "This workstation acts in the BuilderLab workspace its owner most recently selected. Run `bl workspace list` to see it, then ask the owner to switch to the app's workspace in BuilderLab and retry. Do not create a replacement app.";
+const WORKSTATION_WORKSPACE_MISMATCH_NEXT_ACTION: &str = "This workstation acts in the BuilderLab workspace its owner most recently signed into or switched to. Run `bl workspace list` to see it, then ask the owner to switch to the app's workspace in BuilderLab and retry. Do not create a replacement app.";
 const WORKSTATION_FORBIDDEN_NEXT_ACTION: &str = "Check Apps access for this account and environment, and your workspace and app permissions. Use `bl workspace list` to check the active workspace; only the workstation owner can switch it in BuilderLab.";
 
 fn control_plane_http_failure(
