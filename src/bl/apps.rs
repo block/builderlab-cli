@@ -193,6 +193,14 @@ pub fn command() -> Command {
                 ),
         ))
         .subcommand(control_plane_args(
+            Command::new("handoff")
+                .about("Read the app audience and build its Share & manage link")
+                .long_about("Read an existing app and its access policy without changing either. Requires the portal origin for the same environment through --management-base-url or BL_APPS_MANAGEMENT_BASE_URL. Readiness and recipient browser access must be verified separately.")
+                .arg(Arg::new("app-id").value_name("APP_ID").required(true))
+                .arg(Arg::new("environment").long("environment").value_name("ENVIRONMENT"))
+                .arg(Arg::new("management-base-url").long("management-base-url").value_name("HTTPS_PORTAL_ORIGIN")),
+        ))
+        .subcommand(control_plane_args(
             Command::new("initialize")
                 .about("Initialize or repair an existing app stack and persistence")
                 .long_about("Inspect an existing app, plan its requested settings, and initialize \
@@ -531,6 +539,7 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("contract", contract_matches)) => run_contract(config, contract_matches),
         Some(("list", list_matches)) => run_list(config, list_matches),
         Some(("get", get_matches)) => run_get(config, get_matches),
+        Some(("handoff", handoff_matches)) => run_handoff(config, handoff_matches),
         Some(("versions", versions_matches)) => run_versions(config, versions_matches),
         Some(("create", create_matches)) => run_create(config, create_matches),
         Some(("initialize", initialize_matches)) => run_initialize(config, initialize_matches),
@@ -575,6 +584,99 @@ fn run_get(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let (client, credential) = control_plane_context(config, matches)?;
     let response = client.get_app(&credential, app_id, environment)?;
     print_json(&response)
+}
+
+fn management_portal_url(value: &str) -> Result<url::Url> {
+    let portal =
+        url::Url::parse(value).context("management base URL must be an HTTPS portal origin")?;
+    if portal.scheme() != "https"
+        || portal.host_str().is_none()
+        || !portal.username().is_empty()
+        || portal.password().is_some()
+        || portal.path() != "/"
+        || portal.query().is_some()
+        || portal.fragment().is_some()
+    {
+        anyhow::bail!("management base URL must be an HTTPS portal origin without credentials, a path, query, or fragment");
+    }
+    Ok(portal)
+}
+
+fn build_app_handoff(
+    app_id: &str,
+    portal: &url::Url,
+    inspection: &Value,
+    access: Option<&Value>,
+) -> Result<Value> {
+    let app = inspection
+        .get("app")
+        .context("app inspection did not return app metadata")?;
+    require_exact_app_id(
+        "handoff",
+        app_id,
+        required_response_string(app, "app_id", "Apps handoff")?,
+    )?;
+    let workspace = required_response_string(app, "workspace_id", "Apps handoff")?;
+    let mut management = portal.join("/hosted-apps")?;
+    management
+        .query_pairs_mut()
+        .append_pair("app", app_id)
+        .append_pair("workspace", workspace);
+    let host = app.get("host").and_then(Value::as_str);
+    let app_url = host.and_then(|host| {
+        let candidate = url::Url::parse(&format!("https://{host}/")).ok()?;
+        (candidate.host_str() == Some(host)
+            && candidate.username().is_empty()
+            && candidate.password().is_none()
+            && candidate.port().is_none()
+            && candidate.path() == "/"
+            && candidate.query().is_none()
+            && candidate.fragment().is_none())
+        .then(|| candidate.to_string())
+    });
+    let verified = access.filter(|policy| {
+        policy.get("ok") == Some(&Value::Bool(true))
+            && policy.get("app_id").and_then(Value::as_str) == Some(app_id)
+            && matches!(
+                policy.get("visibility").and_then(Value::as_str),
+                Some("organization" | "restricted")
+            )
+            && policy.get("viewers").and_then(Value::as_array).is_some()
+            && (policy.get("visibility").and_then(Value::as_str) != Some("restricted")
+                || policy
+                    .get("effective_viewers")
+                    .and_then(Value::as_array)
+                    .is_some())
+    });
+    Ok(json!({
+        "ok": true, "app_id": app_id, "app_url": app_url, "management_url": management.as_str(),
+        "workspace_id": workspace,
+        "audience": {"status": if verified.is_some() {"verified"} else {"unknown"}, "policy": verified},
+        "next_action": if verified.is_some() {"Report the current audience beside Open app and Share & manage. Copying the link does not change access."}
+            else {"App access could not be confirmed. Report the audience as unknown and provide Share & manage; do not claim it is private or shared."},
+        "recipient_browser_access_verified": false
+    }))
+}
+
+fn run_handoff(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let configured = matches.get_one::<String>("management-base-url").cloned()
+        .or_else(|| std::env::var("BL_APPS_MANAGEMENT_BASE_URL").ok())
+        .context("Set --management-base-url or BL_APPS_MANAGEMENT_BASE_URL to the portal origin for this environment; do not infer it from a workstation or app hostname")?;
+    let portal = management_portal_url(&configured)?;
+    let app_id = matches
+        .get_one::<String>("app-id")
+        .context("expected app id")?;
+    let environment = matches.get_one::<String>("environment").map(String::as_str);
+    let (client, credential) = control_plane_context(config, matches)?;
+    let inspection = client.get_app(&credential, app_id, environment)?;
+    // A policy-read failure must not turn a successful deployment into a false private/shared claim.
+    let access = client.get_access(&credential, app_id, environment).ok();
+    print_json(&build_app_handoff(
+        app_id,
+        &portal,
+        &inspection,
+        access.as_ref(),
+    )?)
 }
 
 fn run_versions(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
@@ -2475,6 +2577,49 @@ mod tests {
     }
 
     #[test]
+    fn handoff_reports_verified_audience_and_exact_management_destination() {
+        let portal = management_portal_url("https://app.builderlabstaging.xyz").unwrap();
+        let inspected = json!({"app":{"app_id":"reading-list","workspace_id":"workspace-personal-owner","host":"reading-list.apps.example"}});
+        let access = json!({"ok":true,"app_id":"reading-list","visibility":"restricted","viewers":["viewer"],"effective_viewers":["owner","viewer"],"shared_workspace_ids":["team"]});
+        let result = build_app_handoff("reading-list", &portal, &inspected, Some(&access)).unwrap();
+        assert_eq!(result["management_url"], "https://app.builderlabstaging.xyz/hosted-apps?app=reading-list&workspace=workspace-personal-owner");
+        assert_eq!(result["app_url"], "https://reading-list.apps.example/");
+        assert_eq!(result["audience"]["status"], "verified");
+        assert_eq!(result["audience"]["policy"], access);
+        assert_eq!(result["recipient_browser_access_verified"], false);
+    }
+
+    #[test]
+    fn handoff_never_infers_private_access_from_missing_or_wrong_app_policy() {
+        let portal = management_portal_url("https://app.builderlab.xyz").unwrap();
+        let app = json!({"app":{"app_id":"demo","workspace_id":"team","host":"evil.example/path"}});
+        for policy in [
+            None,
+            Some(json!({"ok":true,"app_id":"other","visibility":"restricted"})),
+            Some(json!({"ok":true,"app_id":"demo"})),
+        ] {
+            let result = build_app_handoff("demo", &portal, &app, policy.as_ref()).unwrap();
+            assert_eq!(result["audience"]["status"], "unknown");
+            assert!(result["audience"]["policy"].is_null());
+            assert!(result["app_url"].is_null());
+        }
+        assert!(build_app_handoff("other", &portal, &app, None).is_err());
+    }
+
+    #[test]
+    fn handoff_rejects_non_origin_management_urls() {
+        for value in [
+            "http://app.example",
+            "https://user@app.example",
+            "https://app.example/path",
+            "https://app.example/?token=secret",
+            "https://app.example/#fragment",
+        ] {
+            assert!(management_portal_url(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
     fn bl_apps_e2e_process_helper() {
         let Some(args) = std::env::var_os("BL_APPS_E2E_ARGS") else {
             return;
@@ -3000,6 +3145,61 @@ mod tests {
             let requests = control_plane.finish();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].path, "/v1/agent/apps?scope=owned");
+        }
+    }
+
+    #[test]
+    fn bl_apps_handoff_process_is_read_only_without_workstation_login() {
+        for policy in [
+            ProcessResponse::json(
+                json!({"ok":true,"app_id":"demo","visibility":"restricted","viewers":[],"effective_viewers":["owner"],"shared_workspace_ids":["team"]}),
+            ),
+            ProcessResponse::json_status(503, json!({"error":{"code":"unavailable"}})),
+        ] {
+            let auth = ProcessServer::start(vec![]);
+            let control = ProcessServer::start(vec![
+                ProcessResponse::json(
+                    json!({"ok":true,"app":{"app_id":"demo","workspace_id":"owner-personal","host":"demo.apps.example"}}),
+                ),
+                policy,
+            ]);
+            let output = process_command(
+                &auth,
+                &control,
+                &[
+                    "apps",
+                    "handoff",
+                    "demo",
+                    "--management-base-url",
+                    "https://app.builderlabstaging.xyz",
+                    "--json",
+                ],
+                "apps-e2e-only.unused",
+            )
+            .env("BL_APPS_E2E_PROXY", "true")
+            .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+            .output()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let handoff: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
+            assert_eq!(
+                handoff["management_url"],
+                "https://app.builderlabstaging.xyz/hosted-apps?app=demo&workspace=owner-personal"
+            );
+            assert_eq!(handoff["recipient_browser_access_verified"], false);
+            assert!(auth.finish().is_empty());
+            let requests = control.finish();
+            assert_eq!(requests.len(), 2);
+            for request in requests {
+                assert_eq!(request.method, "GET");
+                for name in ["authorization", "cookie", "x-bb-session-credential"] {
+                    assert!(!request.headers.contains_key(name));
+                }
+            }
         }
     }
 
