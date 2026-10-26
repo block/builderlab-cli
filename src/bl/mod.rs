@@ -5,6 +5,7 @@ pub mod apps;
 pub mod auth;
 pub mod auth_login;
 pub mod auth_storage;
+pub mod curl;
 pub mod description;
 pub mod display;
 pub mod org_routing;

@@ -19,3 +19,13 @@ pub fn session_storage_key_from_config(config: &SkillsConfig) -> SessionStorageK
         &config.kgoose_service_path,
     )
 }
+
+/// Storage key for the `cli_hosted` session of one hosted-app domain.
+pub fn hosted_session_storage_key(config: &SkillsConfig, hosted_domain: &str) -> SessionStorageKey {
+    SessionStorageKey::cli_hosted(
+        config.profile.clone(),
+        &config.kgoose_base_url,
+        &config.kgoose_service_path,
+        hosted_domain,
+    )
+}
