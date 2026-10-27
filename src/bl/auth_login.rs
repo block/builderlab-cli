@@ -7,8 +7,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use builderlab_auth::auth_login::{
     build_auth_http_client, exchange_hosted_login_code, exchange_login_code_and_verify,
-    login_url_for_type, logout_session_credential, verify_session_credential, AuthMeResponse,
-    HostedLoginExchangeResponse, LoginAttempt, LoginType, VerifiedLoginSession,
+    login_url_for_type, logout_hosted_session_credential, logout_session_credential,
+    verify_session_credential, AuthMeResponse, HostedLoginExchangeResponse, LoginAttempt,
+    LoginType, VerifiedLoginSession,
 };
 use builderlab_auth::auth_storage::StoredSessionCredential;
 use serde::Serialize;
@@ -342,6 +343,17 @@ pub fn logout_stored_session(
     };
 
     logout_session_credential(&client, config.playpen.as_deref(), &service_url, &stored)
+}
+
+/// Revoke a stored `cli_hosted` session on the server. The caller deletes the
+/// local copy whatever the result.
+pub fn logout_hosted_session(
+    config: &SkillsConfig,
+    credential: &StoredSessionCredential,
+) -> Result<bool> {
+    let service_url = kgoose_service_url(&config.kgoose_base_url, &config.kgoose_service_path);
+    let client = build_auth_http_client(Duration::from_secs(30))?;
+    logout_hosted_session_credential(&client, config.playpen.as_deref(), &service_url, credential)
 }
 
 fn wait_for_exchange_code(

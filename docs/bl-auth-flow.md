@@ -75,12 +75,34 @@ The login is the CLI flow above with `type=cli_hosted`:
 Responses:
 
 - `401` with `X-BB-Consent-Url`: the app needs the user's approval. `bl curl`
-  prints the approval URL and exits with code 3.
+  prints the approval URL and exits with code 3. A `401` whose body is
+  `{"error":"consent_required","approval_url":"<url>"}` is treated the same
+  way even without the header or a JSON `Content-Type`, since ingress may
+  drop them. The body is read from stdout output or the `-o` file.
 - `401` with `WWW-Authenticate: BBIdentity` for a stored session: `bl curl`
-  forgets the session, logs in again once, and retries. The rejected
-  response's output is withheld so the retry does not duplicate it.
+  forgets the session and logs in again once. The app itself can return this
+  after acting on a request, so only `GET`, `HEAD`, and `OPTIONS` requests
+  are resent, with the rejected response's output withheld so the retry does
+  not duplicate it. For any other method `bl curl` does not resend the
+  request: it shows the response and exits with code 3, asking the user to
+  rerun the command with the new session. The method is derived as curl
+  would: from `-X`, `-I`, `-G`, `-T`, and the `-d`/`--data*`/`--json`/`-F`
+  body options.
 - Server actions (`POST /_compose/server/*`) need a same-origin `Origin`
   header. `bl curl` sends `Origin: https://<app host>` unless the caller set
   one.
 
-`bl auth logout` deletes the stored hosted-app sessions for the configured org.
+`bl curl` keeps `-q` (no `.curlrc`) and `--globoff` (one URL is one request)
+in force: `-K`, `--disable`, `--no-disable`, and `--no-globoff` are refused,
+and so are `--no-get` and `--no-head`, which would change the method `bl curl`
+derived. Other `--no-<flag>` forms are accepted only for flags that do not
+affect the request.
+
+`bl auth logout` revokes each stored hosted-app session for the configured org
+by sending it to `POST /v1/auth/logout` as the hosted-site cookie
+(`Cookie: <cookie_name>=<credential>`), then deletes the local copy whatever
+the result. Revocation is best effort, as for the CLI session. The JSON
+output reports each session under `hosted_sessions` (`hosted_domain`,
+`server_revoked`, `removed`) and the totals in
+`hosted_sessions_server_revoked` and `hosted_sessions_removed`, alongside
+`server_revoked` for the CLI session.

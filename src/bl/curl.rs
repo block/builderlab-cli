@@ -33,6 +33,12 @@ use super::skills_config::SkillsConfig;
 const HOSTED_APP_ROOT_DOMAINS: &[&str] = &["builderlab.xyz", "builderlabstaging.xyz"];
 const COMPOSE_SERVER_ACTION_PREFIX: &str = "/_compose/server/";
 const CONSENT_URL_HEADER: &str = "x-bb-consent-url";
+/// Methods `bl curl` resends after logging in again. Others may have side
+/// effects, and the app itself can answer 401 after acting on a request.
+const SAFE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
+/// How much of a response body `bl curl` keeps to look for a consent error.
+const BODY_CAPTURE_LIMIT: usize = 64 * 1024;
+const FILE_TIME_SLACK: std::time::Duration = std::time::Duration::from_secs(1);
 // Treat a session this close to expiry as expired instead of racing it.
 const EXPIRY_SKEW_SECS: i64 = 60;
 
@@ -52,10 +58,15 @@ on the command line. POST requests to /_compose/server/* get
 
 Options that could print or leak the session cookie or read the request from
 stdin are refused: for example -v, --trace, -L, -b, -c, -K, -k, -u, and
--d @-. bl curl reads response headers itself, so use -i instead of -D.
+-d @-. So are --no-globoff, --no-disable, --no-get, and --no-head. bl curl
+reads response headers itself, so use -i instead of -D.
 
 If an app needs your approval first, bl curl prints the approval URL and
 exits with code 3.
+
+If the app rejects the stored session, bl curl logs in again once. It resends
+only GET, HEAD, and OPTIONS requests; for other methods it exits with code 3
+so you can rerun the command with the new session.
 
 Examples:
   bl curl https://myapp.apps.block.builderlab.xyz/api/items
@@ -236,6 +247,8 @@ enum Role {
     Get,
     Head,
     Upload,
+    Output,
+    OutputDir,
 }
 
 struct CurlOption {
@@ -298,8 +311,8 @@ const ALLOWED_OPTIONS: &[CurlOption] = &[
     value("form-string", None, Role::FormString),
     value("upload-file", Some('T'), Role::Upload),
     value("url-query", None, Role::Plain),
-    value("output", Some('o'), Role::Plain),
-    value("output-dir", None, Role::Plain),
+    value("output", Some('o'), Role::Output),
+    value("output-dir", None, Role::OutputDir),
     value("user-agent", Some('A'), Role::Plain),
     value("referer", Some('e'), Role::Plain),
     value("range", Some('r'), Role::Plain),
@@ -334,7 +347,15 @@ const REFUSED_OPTIONS: &[(&str, Option<char>, &str)] = &[
         "bl curl passes its own config on stdin",
     ),
     ("disable", Some('q'), "bl curl already ignores .curlrc"),
+    ("no-disable", None, "bl curl must keep ignoring .curlrc"),
     ("next", Some(':'), "bl curl sends exactly one request"),
+    (
+        "no-globoff",
+        None,
+        "bl curl keeps URL globbing off so one URL cannot become several requests",
+    ),
+    ("no-get", None, "bl curl must know the request method"),
+    ("no-head", None, "bl curl must know the request method"),
     ("url", None, "pass the URL as the first argument"),
     (
         "location",
@@ -417,12 +438,15 @@ pub struct CurlRequest {
     pub user_args: Vec<String>,
     pub method: String,
     pub user_sets_origin: bool,
+    /// File curl writes the response body to, if `-o` names one.
+    pub output_file: Option<PathBuf>,
 }
 
 impl CurlRequest {
     pub fn new(target: HostedTarget, args: &[String]) -> Result<Self> {
         let mut method = None;
         let mut user_sets_origin = false;
+        let (mut output, mut output_dir) = (None, None);
         let (mut get, mut head, mut upload, mut body) = (false, false, false, false);
 
         let mut handle = |role: Role, option: &str, value: Option<&str>| -> Result<()> {
@@ -472,6 +496,8 @@ impl CurlRequest {
                     }
                     body = true;
                 }
+                Role::Output => output = Some(value.to_string()),
+                Role::OutputDir => output_dir = Some(value.to_string()),
                 Role::Get => get = true,
                 Role::Head => head = true,
                 Role::Upload => {
@@ -498,11 +524,16 @@ impl CurlRequest {
                     .iter()
                     .find(|option| option.long == name)
                     .or_else(|| {
-                        // curl accepts --no-<flag> to turn a boolean off.
+                        // curl accepts --no-<flag> to turn a boolean off. Allow
+                        // it only for flags that do not change the request or
+                        // undo an option bl curl enforces.
                         name.strip_prefix("no-").and_then(|name| {
-                            ALLOWED_OPTIONS
-                                .iter()
-                                .find(|option| option.long == name && !option.takes_value)
+                            ALLOWED_OPTIONS.iter().find(|option| {
+                                option.long == name
+                                    && !option.takes_value
+                                    && option.role == Role::Plain
+                                    && option.long != "globoff"
+                            })
                         })
                     })
                     .ok_or_else(|| unsupported(arg))?;
@@ -565,12 +596,26 @@ impl CurlRequest {
             }
             .to_string()
         });
+        let output_file = output
+            .filter(|output| output != "-")
+            .map(|output| match output_dir {
+                Some(directory) if Path::new(&output).is_relative() => {
+                    Path::new(&directory).join(output)
+                }
+                _ => PathBuf::from(output),
+            });
         Ok(Self {
             target,
             user_args: args.to_vec(),
             method,
             user_sets_origin,
+            output_file,
         })
+    }
+
+    /// Whether the request can be resent without repeating a side effect.
+    pub fn is_safe_method(&self) -> bool {
+        SAFE_METHODS.contains(&self.method.as_str())
     }
 
     /// Origin header to add for a Compose server action, if any.
@@ -810,12 +855,14 @@ impl ResponseHead {
 pub struct CurlOutcome {
     pub exit_code: i32,
     pub response: Option<ResponseHead>,
+    /// Start of what curl wrote to stdout, up to `BODY_CAPTURE_LIMIT` bytes.
+    pub output_prefix: Vec<u8>,
 }
 
 pub trait CurlRunner {
     /// Run curl with `argv` and `stdin_config`. With `hold_rejected_output`,
     /// output of a response that rejects the session is discarded so the
-    /// request can be retried without duplicate output.
+    /// request can be resent without duplicate output.
     fn run(
         &self,
         argv: &[String],
@@ -825,8 +872,8 @@ pub trait CurlRunner {
 }
 
 /// Run the request, logging in first when no usable session is stored and
-/// once more if the hosted app rejects a stored session. Returns curl's exit
-/// code.
+/// once more if the hosted app rejects a stored session. Only safe methods
+/// are resent after that login. Returns curl's exit code.
 pub fn run_request(
     sessions: &dyn HostedSessions,
     curl: &dyn CurlRunner,
@@ -840,8 +887,9 @@ pub fn run_request(
         Some(session) => session,
         None => sessions.login()?,
     };
+    let resend = request.is_safe_method();
 
-    let mut outcome = run_once(curl, request, &session, from_storage)?;
+    let mut outcome = run_once(curl, request, &session, from_storage && resend)?;
     if from_storage
         && outcome
             .response
@@ -851,6 +899,16 @@ pub fn run_request(
         eprintln!("info: The stored BuilderLab hosted-app session was rejected; logging in again");
         sessions.forget()?;
         let session = sessions.login()?;
+        if !resend {
+            return Err(failure(
+                exit_codes::AUTH_REQUIRED,
+                "hosted_session_refreshed",
+                format!(
+                    "{} rejected the stored BuilderLab hosted-app session. bl curl logged in again but did not resend the {} request, because repeating it could repeat its effect. Rerun the command to send it with the new session.",
+                    request.target.host, request.method
+                ),
+            ));
+        }
         outcome = run_once(curl, request, &session, false)?;
     }
 
@@ -886,11 +944,58 @@ fn run_once(
             request.target.host
         ));
     }
-    curl.run(
+    let started = SystemTime::now();
+    let mut outcome = curl.run(
         &request.argv(),
         &|header_file| request.stdin_config(session, header_file),
         hold_rejected_output,
-    )
+    )?;
+    // Ingress may drop X-BB-Consent-Url; the JSON error body still says so.
+    if let Some(response) = outcome
+        .response
+        .as_mut()
+        .filter(|response| response.status == 401 && response.consent_url.is_none())
+    {
+        response.consent_url = consent_url_from_body(&outcome.output_prefix).or_else(|| {
+            let output_file = request.output_file.as_deref()?;
+            consent_url_from_body(&read_fresh_prefix(output_file, started)?)
+        });
+    }
+    Ok(outcome)
+}
+
+/// `approval_url` from a `{"error":"consent_required",...}` body. With `-i`
+/// the response headers come first, so also try what follows them.
+fn consent_url_from_body(output: &[u8]) -> Option<String> {
+    let parse = |body: &[u8]| -> Option<String> {
+        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        if value.get("error")?.as_str()? != "consent_required" {
+            return None;
+        }
+        value.get("approval_url")?.as_str().map(str::to_string)
+    };
+    parse(output).or_else(|| {
+        let body_start = output
+            .windows(4)
+            .rposition(|window| window == b"\r\n\r\n")?
+            + 4;
+        parse(&output[body_start..])
+    })
+}
+
+/// The start of `path`, if curl wrote it during this run.
+fn read_fresh_prefix(path: &Path, started: SystemTime) -> Option<Vec<u8>> {
+    let file = File::open(path).ok()?;
+    let modified = file.metadata().ok()?.modified().ok()?;
+    // File timestamps come from a coarse clock and can trail `started`.
+    if modified < started.checked_sub(FILE_TIME_SLACK)? {
+        return None;
+    }
+    let mut prefix = Vec::new();
+    file.take(BODY_CAPTURE_LIMIT as u64)
+        .read_to_end(&mut prefix)
+        .ok()?;
+    Some(prefix)
 }
 
 fn consent_required(host: &str, approval_url: &str) -> anyhow::Error {
@@ -929,11 +1034,7 @@ impl CurlRunner for SystemCurl {
         let mut child = ProcessCommand::new("curl")
             .args(argv)
             .stdin(Stdio::piped())
-            .stdout(if hold_rejected_output {
-                Stdio::piped()
-            } else {
-                Stdio::inherit()
-            })
+            .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             // Never let curl log TLS secrets for this request.
             .env_remove("SSLKEYLOGFILE")
@@ -948,59 +1049,94 @@ impl CurlRunner for SystemCurl {
                 .write_all(config.as_bytes())
                 .context("pass config to curl")?;
         }
-        if let Some(stdout) = child.stdout.take() {
-            forward_unless_rejected(stdout, &mut io::stdout().lock(), header_file.path())?;
-        }
+        let stdout = child.stdout.take().context("open curl stdout")?;
+        let output_prefix = forward_output(
+            stdout,
+            &mut io::stdout().lock(),
+            header_file.path(),
+            hold_rejected_output,
+        )?;
         let status = child.wait().context("wait for curl")?;
         let response = read_response_head(header_file.path());
         Ok(CurlOutcome {
             exit_code: status.code().unwrap_or(exit_codes::GENERAL),
             response,
+            output_prefix,
         })
     }
 }
 
-/// Copy curl's output to `sink` unless the response rejects the session.
+/// Copy curl's output to `sink` and return its first `BODY_CAPTURE_LIMIT`
+/// bytes.
 ///
-/// curl flushes each response header to the `--dump-header` file as it
-/// arrives, so once body bytes reach stdout the final status is known. Output
-/// is buffered only until then.
-fn forward_unless_rejected(
+/// With `hold_rejected`, the output of a response that rejects the session is
+/// withheld so the request can be resent without duplicate output. curl
+/// flushes each response header to the `--dump-header` file as it arrives,
+/// so once body bytes reach stdout the final status is known; output is held
+/// only until then. A rejection whose body is a consent error is still shown.
+fn forward_output(
     mut source: impl Read,
     sink: &mut impl Write,
     header_file: &Path,
-) -> Result<()> {
+    hold_rejected: bool,
+) -> Result<Vec<u8>> {
+    #[derive(PartialEq)]
+    enum State {
+        Undecided,
+        Forward,
+        Withhold,
+        Discard,
+    }
+    let rejected = |held: &[u8]| {
+        read_response_head(header_file).is_some_and(|head| head.session_rejected())
+            && consent_url_from_body(held).is_none()
+    };
+
+    let mut state = if hold_rejected {
+        State::Undecided
+    } else {
+        State::Forward
+    };
+    let mut captured = Vec::new();
     let mut held = Vec::new();
     let mut chunk = [0u8; 8192];
-    let mut forward = None;
     loop {
         let read = source.read(&mut chunk).context("read curl output")?;
         if read == 0 {
             break;
         }
-        match forward {
-            Some(true) => sink.write_all(&chunk[..read]).context("write output")?,
-            Some(false) => {}
-            None => {
-                held.extend_from_slice(&chunk[..read]);
-                if let Some(head) = read_response_head(header_file) {
-                    let keep = !head.session_rejected();
-                    if keep {
-                        sink.write_all(&held).context("write output")?;
+        let chunk = &chunk[..read];
+        let room = BODY_CAPTURE_LIMIT.saturating_sub(captured.len());
+        captured.extend_from_slice(&chunk[..room.min(read)]);
+        match state {
+            State::Forward => sink.write_all(chunk).context("write output")?,
+            State::Discard => {}
+            State::Undecided | State::Withhold => {
+                held.extend_from_slice(chunk);
+                if state == State::Undecided {
+                    if let Some(head) = read_response_head(header_file) {
+                        if head.session_rejected() {
+                            state = State::Withhold;
+                        } else {
+                            sink.write_all(&held).context("write output")?;
+                            held.clear();
+                            state = State::Forward;
+                        }
                     }
+                }
+                // Too long to be a consent error: drop the rejected output.
+                if state == State::Withhold && held.len() > BODY_CAPTURE_LIMIT {
                     held.clear();
-                    forward = Some(keep);
+                    state = State::Discard;
                 }
             }
         }
     }
-    if forward.is_none() {
-        let rejected = read_response_head(header_file).is_some_and(|head| head.session_rejected());
-        if !rejected {
-            sink.write_all(&held).context("write output")?;
-        }
+    if matches!(state, State::Undecided | State::Withhold) && !rejected(&held) {
+        sink.write_all(&held).context("write output")?;
     }
-    sink.flush().context("flush output")
+    sink.flush().context("flush output")?;
+    Ok(captured)
 }
 
 fn read_response_head(header_file: &Path) -> Option<ResponseHead> {
@@ -1306,6 +1442,16 @@ mod tests {
             &["--made-up"],
             &["-Z"],
             &["-H"],
+            &["--no-globoff"],
+            &["-s", "--no-globoff", "-g"],
+            &["--no-disable"],
+            &["--no-get"],
+            &["-G", "-d", "a=1", "--no-get"],
+            &["--no-head"],
+            &["--no-location"],
+            &["--no-insecure"],
+            &["--no-config"],
+            &["--no-request", "GET"],
         ] {
             let error = request(APP_URL, curl_args).expect_err(&format!("{curl_args:?}"));
             assert_eq!(
@@ -1351,6 +1497,8 @@ mod tests {
                 "Accept: application/json",
                 "-HX-Trace: 1",
                 "--compressed",
+                "--no-compressed",
+                "--no-silent",
                 "--no-progress-meter",
                 "--no-buffer",
                 "-o",
@@ -1526,27 +1674,74 @@ mod tests {
     fn rejected_session_output_is_withheld_for_retry() {
         let rejected = header_file("HTTP/1.1 401 x\r\nWWW-Authenticate: BBIdentity\r\n\r\n");
         let mut sink = Vec::new();
-        forward_unless_rejected(&b"unauthorized"[..], &mut sink, rejected.path()).unwrap();
+        let captured =
+            forward_output(&b"unauthorized"[..], &mut sink, rejected.path(), true).unwrap();
         assert!(sink.is_empty());
+        assert_eq!(captured, b"unauthorized");
+
+        // Without holding, everything is forwarded as it arrives.
+        let mut sink = Vec::new();
+        forward_output(&b"unauthorized"[..], &mut sink, rejected.path(), false).unwrap();
+        assert_eq!(sink, b"unauthorized");
 
         let ok = header_file("HTTP/1.1 200 OK\r\n\r\n");
         let mut sink = Vec::new();
-        forward_unless_rejected(&b"body"[..], &mut sink, ok.path()).unwrap();
+        forward_output(&b"body"[..], &mut sink, ok.path(), true).unwrap();
         assert_eq!(sink, b"body");
 
         let consent = header_file(
             "HTTP/1.1 401 x\r\nWWW-Authenticate: BBIdentity\r\nX-BB-Consent-Url: https://x\r\n\r\n",
         );
         let mut sink = Vec::new();
-        forward_unless_rejected(
+        forward_output(
             &b"{\"error\":\"consent_required\"}"[..],
             &mut sink,
             consent.path(),
+            true,
         )
         .unwrap();
         assert_eq!(sink, b"{\"error\":\"consent_required\"}");
     }
 
+    #[test]
+    fn consent_body_is_shown_even_without_the_consent_header() {
+        let rejected = header_file("HTTP/1.1 401 x\r\nWWW-Authenticate: BBIdentity\r\n\r\n");
+        let body = br#"{"error":"consent_required","approval_url":"https://app.builderlab.xyz/approve/1"}"#;
+        let mut sink = Vec::new();
+        let captured = forward_output(&body[..], &mut sink, rejected.path(), true).unwrap();
+        assert_eq!(sink, body);
+        assert_eq!(captured, body);
+    }
+
+    #[test]
+    fn finds_consent_errors_in_the_response_body() {
+        let approval = "https://app.builderlab.xyz/approve/1";
+        let body = format!(r#"{{"error":"consent_required","approval_url":"{approval}"}}"#);
+        assert_eq!(
+            consent_url_from_body(body.as_bytes()).as_deref(),
+            Some(approval)
+        );
+        assert_eq!(
+            consent_url_from_body(format!(" \n{body}\n").as_bytes()).as_deref(),
+            Some(approval)
+        );
+        // With -i, the headers come first.
+        let included =
+            format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: BBIdentity\r\n\r\n{body}");
+        assert_eq!(
+            consent_url_from_body(included.as_bytes()).as_deref(),
+            Some(approval)
+        );
+        for other in [
+            r#"{"error":"unauthorized","approval_url":"https://x"}"#,
+            r#"{"error":"consent_required"}"#,
+            r#"{"error":"consent_required","approval_url":7}"#,
+            "unauthorized",
+            "",
+        ] {
+            assert_eq!(consent_url_from_body(other.as_bytes()), None, "{other}");
+        }
+    }
     struct FakeSessions {
         stored: RefCell<Option<StoredSessionCredential>>,
         logins: Cell<usize>,
@@ -1590,12 +1785,18 @@ mod tests {
     }
 
     struct FakeCurl {
-        responses: RefCell<VecDeque<Option<ResponseHead>>>,
+        responses: RefCell<VecDeque<(Option<ResponseHead>, Vec<u8>)>>,
         runs: RefCell<Vec<RecordedRun>>,
     }
 
     impl FakeCurl {
         fn new(responses: impl IntoIterator<Item = Option<ResponseHead>>) -> Self {
+            Self::with_output(responses.into_iter().map(|response| (response, Vec::new())))
+        }
+
+        fn with_output(
+            responses: impl IntoIterator<Item = (Option<ResponseHead>, Vec<u8>)>,
+        ) -> Self {
             Self {
                 responses: RefCell::new(responses.into_iter().collect()),
                 runs: RefCell::new(Vec::new()),
@@ -1615,7 +1816,7 @@ mod tests {
                 config: stdin_config(Path::new("/tmp/headers"))?,
                 hold_rejected_output,
             });
-            let response = self
+            let (response, output_prefix) = self
                 .responses
                 .borrow_mut()
                 .pop_front()
@@ -1623,6 +1824,7 @@ mod tests {
             Ok(CurlOutcome {
                 exit_code: 0,
                 response,
+                output_prefix,
             })
         }
     }
@@ -1699,7 +1901,7 @@ mod tests {
     fn drops_a_rejected_stored_session_and_logs_in_once() {
         let sessions = FakeSessions::new(Some(valid_session()));
         let curl = FakeCurl::new([bbidentity_401(), status(200)]);
-        let request = request(ACTION_URL, &["-d", "{}"]).unwrap();
+        let request = request(APP_URL, &["-s"]).unwrap();
 
         assert_eq!(run_request(&sessions, &curl, &request).unwrap(), 0);
         assert_eq!(sessions.forgets.get(), 1);
@@ -1710,11 +1912,75 @@ mod tests {
         assert!(runs[0].config.contains(SECRET));
         assert!(!runs[1].hold_rejected_output);
         assert!(runs[1].config.contains("bb_hosted_session=fresh-1"));
-        assert!(runs[1]
-            .config
-            .contains("header = \"Origin: https://myapp.apps.block.builderlab.xyz\""));
     }
 
+    #[test]
+    fn resends_only_safe_methods_after_logging_in_again() {
+        for (curl_args, resent) in [
+            (&[][..], true),
+            (&["-G", "-d", "q=1"], true),
+            (&["-I"], true),
+            (&["-X", "OPTIONS"], true),
+            (&["-X", "get"], true),
+            (&["-d", "{}"], false),
+            (&["--data-raw", "{}"], false),
+            (&["--json", "{}"], false),
+            (&["-F", "a=1"], false),
+            (&["-T", "file.txt"], false),
+            (&["-X", "DELETE"], false),
+            (&["-XPATCH"], false),
+            (&["-I", "-X", "POST"], false),
+        ] {
+            let sessions = FakeSessions::new(Some(valid_session()));
+            let curl = FakeCurl::new(
+                [bbidentity_401()]
+                    .into_iter()
+                    .chain(resent.then(|| status(200))),
+            );
+            let result = run_request(&sessions, &curl, &request(APP_URL, curl_args).unwrap());
+
+            // The session is refreshed either way.
+            assert_eq!(sessions.forgets.get(), 1, "{curl_args:?}");
+            assert_eq!(sessions.logins.get(), 1, "{curl_args:?}");
+            let runs = curl.runs.borrow();
+            assert_eq!(runs.len(), if resent { 2 } else { 1 }, "{curl_args:?}");
+            // Output is held back only when the request will be resent.
+            assert_eq!(runs[0].hold_rejected_output, resent, "{curl_args:?}");
+            if resent {
+                assert_eq!(result.unwrap(), 0, "{curl_args:?}");
+            } else {
+                let error = result.expect_err("not resent");
+                assert_eq!(
+                    error_code(&error),
+                    (
+                        exit_codes::AUTH_REQUIRED,
+                        "hosted_session_refreshed".to_string()
+                    ),
+                    "{curl_args:?}"
+                );
+                assert!(error.to_string().contains("Rerun the command"));
+            }
+        }
+    }
+
+    #[test]
+    fn consent_error_body_without_the_header_is_consent_required() {
+        let approval = "https://app.builderlab.xyz/apps/myapp/consent?request=abc";
+        let body = format!(r#"{{"error":"consent_required","approval_url":"{approval}"}}"#);
+        let sessions = FakeSessions::new(Some(valid_session()));
+        let curl = FakeCurl::with_output([(bbidentity_401(), body.into_bytes())]);
+        let error = run_request(&sessions, &curl, &request(APP_URL, &[]).unwrap())
+            .expect_err("consent required");
+
+        assert_eq!(
+            error_code(&error),
+            (exit_codes::AUTH_REQUIRED, "consent_required".to_string())
+        );
+        assert!(error.to_string().contains(approval));
+        assert_eq!(sessions.logins.get(), 0);
+        assert_eq!(sessions.forgets.get(), 0);
+        assert_eq!(curl.runs.borrow().len(), 1);
+    }
     #[test]
     fn does_not_loop_when_a_fresh_session_is_rejected() {
         let sessions = FakeSessions::new(Some(valid_session()));
@@ -1854,5 +2120,279 @@ mod tests {
         assert!(received.starts_with("POST /_compose/server/save "));
         assert!(received.ends_with("{}"));
         assert!(!argv.iter().any(|arg| arg.contains(SECRET)));
+    }
+
+    /// One request as seen by [`TestApp`].
+    #[derive(Clone, Debug)]
+    struct SeenRequest {
+        method: String,
+        path: String,
+        cookie: Option<String>,
+        body: String,
+    }
+
+    /// A local HTTP server that answers every request with `respond`.
+    struct TestApp {
+        base_url: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+    }
+
+    impl TestApp {
+        fn start(respond: impl Fn(&SeenRequest) -> String + Send + 'static) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = seen.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let path = parts.next().unwrap_or_default().to_string();
+                    let (mut cookie, mut content_length) = (None, 0);
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap();
+                            }
+                            if name.eq_ignore_ascii_case("cookie") {
+                                cookie = Some(value.trim().to_string());
+                            }
+                        }
+                    }
+                    let mut body = vec![0; content_length];
+                    reader.read_exact(&mut body).unwrap();
+                    let request = SeenRequest {
+                        method,
+                        path,
+                        cookie,
+                        body: String::from_utf8_lossy(&body).into_owned(),
+                    };
+                    let response = respond(&request);
+                    log.lock().unwrap().push(request);
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            Self { base_url, seen }
+        }
+
+        fn seen(&self) -> Vec<SeenRequest> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    fn http_response(status: &str, headers: &[&str], body: &str) -> String {
+        let mut response = format!("HTTP/1.1 {status}\r\n");
+        for header in headers {
+            response.push_str(header);
+            response.push_str("\r\n");
+        }
+        response.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        response
+    }
+
+    /// The system curl, with each hosted-app URL pointed at a local server.
+    struct LocalCurl {
+        base_url: String,
+    }
+
+    impl CurlRunner for LocalCurl {
+        fn run(
+            &self,
+            argv: &[String],
+            stdin_config: &dyn Fn(&Path) -> Result<String>,
+            hold_rejected_output: bool,
+        ) -> Result<CurlOutcome> {
+            let mut argv = argv.to_vec();
+            let url = Url::parse(&argv[4]).expect("hosted-app URL");
+            argv[4] = format!("{}{}", self.base_url, url.path());
+            SystemCurl.run(&argv, stdin_config, hold_rejected_output)
+        }
+    }
+
+    #[test]
+    fn rejected_post_is_not_resent_and_its_effect_happens_once() {
+        if !curl_available() {
+            eprintln!("skipping: curl is not installed");
+            return;
+        }
+        let saves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = saves.clone();
+        // The app acts on the request and then answers 401 BBIdentity.
+        let app = TestApp::start(move |request| {
+            if request.method == "POST" && request.path == "/_compose/server/save" {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            http_response(
+                "401 Unauthorized",
+                &["WWW-Authenticate: BBIdentity"],
+                "unauthorized",
+            )
+        });
+        let output = TempFile::create().expect("output file");
+        let output_path = output.path().to_str().unwrap().to_string();
+        let request = request(ACTION_URL, &["-s", "-o", &output_path, "-d", "{\"n\":1}"]).unwrap();
+        let sessions = FakeSessions::new(Some(valid_session()));
+
+        let error = run_request(
+            &sessions,
+            &LocalCurl {
+                base_url: app.base_url.clone(),
+            },
+            &request,
+        )
+        .expect_err("POST is not resent");
+
+        assert_eq!(error_code(&error).1, "hosted_session_refreshed");
+        assert_eq!(saves.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let seen = app.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].body, "{\"n\":1}");
+        assert_eq!(
+            seen[0].cookie.as_deref(),
+            Some(format!("bb_hosted_session={SECRET}").as_str())
+        );
+        // The session was still refreshed for the rerun.
+        assert_eq!(sessions.forgets.get(), 1);
+        assert_eq!(sessions.logins.get(), 1);
+    }
+
+    #[test]
+    fn revoked_hosted_session_is_rejected_by_a_later_request() {
+        if !curl_available() {
+            eprintln!("skipping: curl is not installed");
+            return;
+        }
+        let revoked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let revocations = revoked.clone();
+        let app = TestApp::start(move |request| {
+            let cookie = request.cookie.clone().unwrap_or_default();
+            if request.method == "POST" && request.path == "/v1/auth/logout" {
+                revocations.lock().unwrap().push(cookie);
+                return http_response("200 OK", &[], "{}");
+            }
+            if cookie.is_empty() || revocations.lock().unwrap().contains(&cookie) {
+                return http_response(
+                    "401 Unauthorized",
+                    &["WWW-Authenticate: BBIdentity"],
+                    "unauthorized",
+                );
+            }
+            http_response("200 OK", &[], "ok")
+        });
+        let client =
+            builderlab_auth::auth_login::build_auth_http_client(std::time::Duration::from_secs(5))
+                .expect("client");
+
+        // `bl auth logout` revokes the stored session with its hosted cookie.
+        assert!(
+            builderlab_auth::auth_login::logout_hosted_session_credential(
+                &client,
+                None,
+                &app.base_url,
+                &valid_session(),
+            )
+            .expect("revoke hosted session")
+        );
+
+        // A later `bl curl` with that session is rejected; it logs in again.
+        let output = TempFile::create().expect("output file");
+        let output_path = output.path().to_str().unwrap().to_string();
+        let sessions = FakeSessions::new(Some(valid_session()));
+        let exit_code = run_request(
+            &sessions,
+            &LocalCurl {
+                base_url: app.base_url.clone(),
+            },
+            &request(APP_URL, &["-s", "-o", &output_path]).unwrap(),
+        )
+        .expect("resent with a new session");
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(fs::read_to_string(output.path()).unwrap(), "ok");
+        let seen = app.seen();
+        let cookies = seen
+            .iter()
+            .map(|request| {
+                (
+                    request.path.as_str(),
+                    request.cookie.clone().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let old_cookie = format!("bb_hosted_session={SECRET}");
+        assert_eq!(
+            cookies,
+            [
+                ("/v1/auth/logout", old_cookie.clone()),
+                ("/api/items", old_cookie),
+                ("/api/items", "bb_hosted_session=fresh-1".to_string()),
+            ]
+        );
+        assert_eq!(sessions.forgets.get(), 1);
+        assert_eq!(sessions.logins.get(), 1);
+    }
+
+    #[test]
+    fn consent_body_written_to_an_output_file_is_consent_required() {
+        if !curl_available() {
+            eprintln!("skipping: curl is not installed");
+            return;
+        }
+        let approval = "https://app.builderlab.xyz/apps/myapp/consent?request=abc";
+        let body = format!(r#"{{"error":"consent_required","approval_url":"{approval}"}}"#);
+        // No X-BB-Consent-Url and no Content-Type, as after a lossy ingress.
+        let app = TestApp::start(move |_| {
+            http_response("401 Unauthorized", &["WWW-Authenticate: BBIdentity"], &body)
+        });
+        let output = TempFile::create().expect("output file");
+        let output_path = output.path().to_str().unwrap().to_string();
+        let sessions = FakeSessions::new(Some(valid_session()));
+
+        let error = run_request(
+            &sessions,
+            &LocalCurl {
+                base_url: app.base_url.clone(),
+            },
+            &request(APP_URL, &["-s", "-o", &output_path]).unwrap(),
+        )
+        .expect_err("consent required");
+
+        assert_eq!(
+            error_code(&error),
+            (exit_codes::AUTH_REQUIRED, "consent_required".to_string())
+        );
+        assert!(error.to_string().contains(approval));
+        assert_eq!(sessions.logins.get(), 0);
+        assert_eq!(sessions.forgets.get(), 0);
+        assert_eq!(app.seen().len(), 1);
+    }
+
+    #[test]
+    fn output_file_honours_output_dir() {
+        let request = request(APP_URL, &["--output-dir", "out", "-o", "body.json"]).unwrap();
+        assert_eq!(
+            request.output_file,
+            Some(Path::new("out").join("body.json"))
+        );
+        let request = request_with_stdout();
+        assert_eq!(request.output_file, None);
+    }
+
+    fn request_with_stdout() -> CurlRequest {
+        request(APP_URL, &["-o", "-"]).unwrap()
     }
 }

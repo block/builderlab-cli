@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use reqwest::blocking::{Client, ClientBuilder};
-use reqwest::header::{ACCEPT, USER_AGENT};
+use reqwest::header::{ACCEPT, COOKIE, USER_AGENT};
 use reqwest::redirect::Policy;
 use reqwest::StatusCode as HttpStatusCode;
 use serde::{Deserialize, Serialize};
@@ -255,18 +255,58 @@ pub fn logout_session_credential(
     let Some(session_credential) = credential.session_credential_header_value() else {
         return Ok(false);
     };
+    post_logout(
+        client,
+        playpen,
+        server_url,
+        SESSION_CREDENTIAL_HEADER,
+        &session_credential,
+        "destroy stored BuilderLab CLI auth session",
+    )
+}
+
+/// Revoke a `cli_hosted` session. The backend accepts it only the way hosted
+/// apps do: as the hosted-site cookie.
+pub fn logout_hosted_session_credential(
+    client: &Client,
+    playpen: Option<&str>,
+    server_url: &str,
+    credential: &StoredSessionCredential,
+) -> Result<bool> {
+    let (Some(cookie_name), Some(session_credential)) = (
+        credential.cookie_name.as_deref(),
+        credential.session_credential_header_value(),
+    ) else {
+        return Ok(false);
+    };
+    post_logout(
+        client,
+        playpen,
+        server_url,
+        COOKIE.as_str(),
+        &format!("{cookie_name}={session_credential}"),
+        "destroy stored BuilderLab hosted-app session",
+    )
+}
+
+fn post_logout(
+    client: &Client,
+    playpen: Option<&str>,
+    server_url: &str,
+    credential_header: &str,
+    credential_value: &str,
+    context: &'static str,
+) -> Result<bool> {
     let url = auth_url(server_url, "/v1/auth/logout")?;
     let mut request = client
         .post(url)
         .header(USER_AGENT, CLI_USER_AGENT)
         .header(ACCEPT, "application/json")
-        .header(SESSION_CREDENTIAL_HEADER, session_credential);
+        .header(credential_header, credential_value);
     if let Some(baggage) = playpen_baggage(playpen) {
         request = request.header("Baggage", baggage);
     }
-    let response = request
-        .send()
-        .context("destroy stored BuilderLab CLI auth session")?;
+    let response = request.send().context(context)?;
     let status = response.status();
     if status == HttpStatusCode::UNAUTHORIZED || status == HttpStatusCode::FORBIDDEN {
         return Ok(false);
@@ -425,6 +465,47 @@ mod tests {
         assert_eq!(
             request.bl_session_credential.as_deref(),
             Some("expired-session")
+        );
+    }
+
+    #[test]
+    fn logout_hosted_session_credential_sends_only_the_hosted_cookie() {
+        let server = TestServer::single(200, r#"{}"#);
+        let client = build_auth_http_client(Duration::from_secs(5)).expect("client");
+        let credential = StoredSessionCredential {
+            session_credential: "hosted-session".to_string(),
+            cookie_name: Some("bb_hosted_session".to_string()),
+            cookie_domain: Some("apps.example.test".to_string()),
+            ..Default::default()
+        };
+
+        let revoked =
+            logout_hosted_session_credential(&client, None, &server.base_url, &credential)
+                .expect("logout hosted session");
+        let request = server.finish_one();
+
+        assert!(revoked);
+        assert_eq!(request.path, "/v1/auth/logout");
+        assert_eq!(
+            request.cookie.as_deref(),
+            Some("bb_hosted_session=hosted-session")
+        );
+        assert_eq!(request.bl_session_credential, None);
+    }
+
+    #[test]
+    fn logout_hosted_session_credential_skips_sessions_without_a_cookie_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let client = build_auth_http_client(Duration::from_secs(1)).expect("client");
+        let credential = StoredSessionCredential {
+            session_credential: "hosted-session".to_string(),
+            ..Default::default()
+        };
+
+        assert!(
+            !logout_hosted_session_credential(&client, None, &base_url, &credential)
+                .expect("skip logout")
         );
     }
 
@@ -660,6 +741,7 @@ mod tests {
     struct RecordedRequest {
         path: String,
         bl_session_credential: Option<String>,
+        cookie: Option<String>,
         body: String,
     }
 
@@ -709,6 +791,7 @@ mod tests {
             .to_string();
 
         let mut bl_session_credential = None;
+        let mut cookie = None;
         let mut content_length = 0;
         loop {
             let mut line = String::new();
@@ -722,6 +805,9 @@ mod tests {
                 }
                 if name.eq_ignore_ascii_case(SESSION_CREDENTIAL_HEADER) {
                     bl_session_credential = Some(value.trim().to_string());
+                }
+                if name.eq_ignore_ascii_case("cookie") {
+                    cookie = Some(value.trim().to_string());
                 }
             }
         }
@@ -737,6 +823,7 @@ mod tests {
         RecordedRequest {
             path,
             bl_session_credential,
+            cookie,
             body: String::from_utf8(body_bytes).expect("UTF-8 body"),
         }
     }

@@ -127,20 +127,24 @@ bl curl https://myapp.apps.block.builderlab.xyz/_compose/server/save \
 The URL comes first; the remaining arguments go to the system `curl`. On first
 use, or after the hosted session expires, `bl curl` opens a browser login and
 stores a hosted-app session for the configured org, separately from the CLI
-session. `bl auth logout` removes it.
+session. `bl auth logout` revokes it on the server and removes it.
 
 - Only `https` hosts inside the configured org's hosted-app domain receive the
   session. Configure the org with `bl config set org <org>`.
 - The cookie reaches `curl` on stdin (`curl --config -`), never on the command
   line. Options that could print or forward it (`-v`, `--trace`, `-L`, `-b`,
   `-c`, `-K`, `-k`, `--resolve`, and similar) are refused, as are request
-  bodies read from stdin (`-d @-`). Use `-i` instead of `-D` to see response
-  headers.
+  bodies read from stdin (`-d @-`) and negations that undo what `bl curl`
+  enforces (`--no-globoff`, `--no-disable`, `--no-get`, `--no-head`). Use
+  `-i` instead of `-D` to see response headers.
 - POST requests to `/_compose/server/*` get `Origin: https://<host>` unless
   you set `Origin` yourself.
 - If the app needs your approval, `bl curl` prints the approval URL and exits
-  with code 3. If the app rejects a stored session, `bl curl` logs in again
-  once and retries.
+  with code 3.
+- If the app rejects a stored session, `bl curl` logs in again once. It
+  resends only `GET`, `HEAD`, and `OPTIONS` requests. Other requests could
+  already have taken effect, so `bl curl` exits with code 3 and asks you to
+  rerun the command with the new session.
 
 See [BuilderLab Auth Flow](docs/bl-auth-flow.md#hosted-app-sessions-for-bl-curl)
 for the login details.
