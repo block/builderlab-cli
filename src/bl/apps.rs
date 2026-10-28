@@ -57,6 +57,7 @@ const CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const CONTROL_PLANE_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
     "compose-ctrl.test.blockstaging.build",
+    "compose-ctrl.block.builderlabstaging.xyz",
     "compose-ctrl.block.builderlab.xyz",
     "compose-ctrl.apps.builderlab.xyz",
     "compose-ctrl.apps.builderlabstaging.xyz",
@@ -6555,6 +6556,8 @@ mod tests {
 
         for trusted in [
             "https://compose-ctrl.test.blockstaging.build",
+            "https://compose-ctrl.block.builderlabstaging.xyz",
+            "https://compose-ctrl.block.builderlabstaging.xyz:443",
             "https://compose-ctrl.block.builderlab.xyz",
             "https://compose-ctrl.block.builderlab.xyz:443",
             "https://compose-ctrl.apps.builderlab.xyz",
@@ -6588,6 +6591,9 @@ mod tests {
             "https://user@compose-ctrl.apps.builderlab.xyz",
             "https://compose-ctrl.test.blockstaging.build.attacker.example",
             "https://compose-ctrl.test.blockstaging.build:444",
+            "http://compose-ctrl.block.builderlabstaging.xyz",
+            "https://compose-ctrl.block.builderlabstaging.xyz.attacker.example",
+            "https://compose-ctrl.block.builderlabstaging.xyz:444",
             "http://compose-ctrl.block.builderlab.xyz",
             "https://user@compose-ctrl.block.builderlab.xyz",
             "https://compose-ctrl.block.builderlab.xyz.attacker.example",
