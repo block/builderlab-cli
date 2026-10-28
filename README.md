@@ -288,3 +288,16 @@ shared workspace-list endpoint to accept workstation authentication, with the
 matching Roxy policy deployed.
 `bl workspace switch` continues to require a local CLI login; listing does not
 change the workstation's active workspace or rotate a session.
+
+### App completion handoff
+
+After readiness, `bl apps handoff APP_ID --json` reads the current app and audience
+and returns an exact `management_url` into its Share & manage panel. Configure
+`BL_APPS_MANAGEMENT_BASE_URL` (or `--management-base-url`) with the HTTPS portal
+origin for the same environment. The CLI does not derive a portal from a mesh
+hostname. Keep the configured control-plane origin for delegated authentication.
+
+The result separates verified policy from unknown access and does not claim
+recipient browser acceptance. It performs no sharing, session switch, or deployment.
+If policy inspection is unavailable, agents must report the audience as unknown.
+Portal deep links require the matching portal and Kgoose workspace-selection changes.

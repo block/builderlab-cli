@@ -193,6 +193,14 @@ pub fn command() -> Command {
                 ),
         ))
         .subcommand(control_plane_args(
+            Command::new("handoff")
+                .about("Read the app audience and build its Share & manage link")
+                .long_about("Read an existing app and its access policy without changing either. Requires the portal origin for the same environment through --management-base-url or BL_APPS_MANAGEMENT_BASE_URL. Readiness and recipient browser access must be verified separately.")
+                .arg(Arg::new("app-id").value_name("APP_ID").required(true))
+                .arg(Arg::new("environment").long("environment").value_name("ENVIRONMENT"))
+                .arg(Arg::new("management-base-url").long("management-base-url").value_name("HTTPS_PORTAL_ORIGIN")),
+        ))
+        .subcommand(control_plane_args(
             Command::new("initialize")
                 .about("Initialize or repair an existing app stack and persistence")
                 .long_about("Inspect an existing app, plan its requested settings, and initialize \
@@ -531,6 +539,7 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("contract", contract_matches)) => run_contract(config, contract_matches),
         Some(("list", list_matches)) => run_list(config, list_matches),
         Some(("get", get_matches)) => run_get(config, get_matches),
+        Some(("handoff", handoff_matches)) => run_handoff(config, handoff_matches),
         Some(("versions", versions_matches)) => run_versions(config, versions_matches),
         Some(("create", create_matches)) => run_create(config, create_matches),
         Some(("initialize", initialize_matches)) => run_initialize(config, initialize_matches),
@@ -575,6 +584,133 @@ fn run_get(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let (client, credential) = control_plane_context(config, matches)?;
     let response = client.get_app(&credential, app_id, environment)?;
     print_json(&response)
+}
+
+fn management_portal_url(value: &str) -> Result<url::Url> {
+    let portal =
+        url::Url::parse(value).context("management base URL must be an HTTPS portal origin")?;
+    if portal.scheme() != "https"
+        || portal.host_str().is_none()
+        || !portal.username().is_empty()
+        || portal.password().is_some()
+        || portal.path() != "/"
+        || portal.query().is_some()
+        || portal.fragment().is_some()
+    {
+        anyhow::bail!("management base URL must be an HTTPS portal origin without credentials, a path, query, or fragment");
+    }
+    Ok(portal)
+}
+
+fn build_app_handoff(
+    app_id: &str,
+    portal: &url::Url,
+    inspection: &Value,
+    access: Result<&Value, &anyhow::Error>,
+) -> Result<Value> {
+    let app = inspection
+        .get("app")
+        .context("app inspection did not return app metadata")?;
+    require_exact_app_id(
+        "handoff",
+        app_id,
+        required_response_string(app, "app_id", "Apps handoff")?,
+    )?;
+    let workspace = required_response_string(app, "workspace_id", "Apps handoff")?;
+    let mut management = portal.join("/hosted-apps")?;
+    management
+        .query_pairs_mut()
+        .append_pair("app", app_id)
+        .append_pair("workspace", workspace);
+    let host = app.get("host").and_then(Value::as_str);
+    let app_url = host.and_then(|host| {
+        let candidate = url::Url::parse(&format!("https://{host}/")).ok()?;
+        (candidate.host_str() == Some(host)
+            && candidate.username().is_empty()
+            && candidate.password().is_none()
+            && candidate.port().is_none()
+            && candidate.path() == "/"
+            && candidate.query().is_none()
+            && candidate.fragment().is_none())
+        .then(|| candidate.to_string())
+    });
+    let read_failure_reason = access
+        .as_ref()
+        .err()
+        .map(|error| handoff_read_failure_reason(error));
+    let verified = access.ok().filter(|policy| {
+        let string_array = |field| {
+            policy.get(field).and_then(Value::as_array)
+                .is_some_and(|values| values.iter().all(Value::is_string))
+        };
+        policy.get("ok") == Some(&Value::Bool(true))
+            && policy.get("app_id").and_then(Value::as_str) == Some(app_id)
+            && matches!(
+                policy.get("visibility").and_then(Value::as_str),
+                Some("organization" | "restricted")
+            )
+            // Compose omits empty grant arrays. Both non-optional revisions
+            // establish that this response reports workspace AND community grants.
+            && ["workspace_grant_revision", "community_grant_revision"].iter()
+                .all(|field| policy.get(field).and_then(Value::as_u64).is_some())
+            && string_array("viewers")
+            && (policy.get("visibility").and_then(Value::as_str) != Some("restricted")
+                || string_array("effective_viewers"))
+            && ["shared_workspace_ids", "shared_community_ids", "effective_viewers", "publishers"].iter()
+                .all(|field| policy.get(field).is_none() || string_array(field))
+    });
+    let reason = verified
+        .is_none()
+        .then(|| read_failure_reason.unwrap_or("incomplete_policy"));
+    Ok(json!({
+        "ok": true, "app_id": app_id, "app_url": app_url, "management_url": management.as_str(),
+        "workspace_id": workspace,
+        "audience": {"status": if verified.is_some() {"verified"} else {"unknown"}, "policy": verified, "reason": reason},
+        "next_action": if verified.is_some() {"Report the current audience beside Open app and Share & manage. Copying the link does not change access."}
+            else {"App access could not be confirmed. Report the audience as unknown and provide Share & manage; do not claim it is private or shared. Copying the link does not change access."},
+        "recipient_browser_access_verified": false
+    }))
+}
+
+fn handoff_read_failure_reason(error: &anyhow::Error) -> &'static str {
+    let failure = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CliFailure>());
+    let status = failure
+        .and_then(|failure| failure.details.as_ref())
+        .and_then(|details| details.get("http_status"))
+        .and_then(Value::as_u64);
+    // Stable, bounded reasons only. Do not expose upstream error bodies or
+    // authentication recovery instructions in a successful handoff.
+    match status {
+        Some(401) => "unauthenticated",
+        Some(403) => "forbidden",
+        Some(404) => "not_found",
+        Some(500..=599) => "unavailable",
+        _ if failure.is_some_and(|failure| failure.code == "network_error") => "unavailable",
+        _ => "request_failed",
+    }
+}
+
+fn run_handoff(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let configured = matches.get_one::<String>("management-base-url").cloned()
+        .or_else(|| std::env::var("BL_APPS_MANAGEMENT_BASE_URL").ok())
+        .context("Set --management-base-url or BL_APPS_MANAGEMENT_BASE_URL to the portal origin for this environment; do not infer it from a workstation or app hostname")?;
+    let portal = management_portal_url(&configured)?;
+    let app_id = matches
+        .get_one::<String>("app-id")
+        .context("expected app id")?;
+    let environment = matches.get_one::<String>("environment").map(String::as_str);
+    let (client, credential) = control_plane_context(config, matches)?;
+    let inspection = client.get_app(&credential, app_id, environment)?;
+    // A policy-read failure must not turn a successful deployment into a false private/shared claim.
+    let access = client.get_access(&credential, app_id, environment);
+    print_json(&build_app_handoff(
+        app_id,
+        &portal,
+        &inspection,
+        access.as_ref(),
+    )?)
 }
 
 fn run_versions(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
@@ -2468,6 +2604,128 @@ mod tests {
     }
 
     #[test]
+    fn handoff_reports_verified_audience_and_exact_management_destination() {
+        let portal = management_portal_url("https://app.builderlabstaging.xyz").unwrap();
+        let inspected = json!({"app":{"app_id":"reading-list","workspace_id":"workspace-personal-owner","host":"reading-list.apps.example"}});
+        let access = json!({"ok":true,"app_id":"reading-list","visibility":"restricted","viewers":["viewer"],"effective_viewers":["owner","publisher","viewer"],"publishers":["publisher"],"shared_workspace_ids":["team"],"workspace_grant_revision":2,"shared_community_ids":["community"],"community_grant_revision":3});
+        let result = build_app_handoff("reading-list", &portal, &inspected, Ok(&access)).unwrap();
+        assert_eq!(result["management_url"], "https://app.builderlabstaging.xyz/hosted-apps?app=reading-list&workspace=workspace-personal-owner");
+        assert_eq!(result["app_url"], "https://reading-list.apps.example/");
+        assert_eq!(result["audience"]["status"], "verified");
+        assert_eq!(result["audience"]["policy"], access);
+        assert!(result["audience"]["reason"].is_null());
+        assert_eq!(result["recipient_browser_access_verified"], false);
+    }
+
+    #[test]
+    fn handoff_requires_complete_workspace_and_community_grant_reporting() {
+        let portal = management_portal_url("https://app.builderlab.xyz").unwrap();
+        let app = json!({"app":{"app_id":"demo","workspace_id":"team"}});
+        for visibility in ["restricted", "organization"] {
+            // Compose omits empty grant arrays, but always reports both revisions.
+            let complete = json!({"ok":true,"app_id":"demo","visibility":visibility,
+                "viewers":[],"effective_viewers":["owner"],
+                "workspace_grant_revision":0,"community_grant_revision":0});
+            let result = build_app_handoff("demo", &portal, &app, Ok(&complete)).unwrap();
+            assert_eq!(result["audience"]["status"], "verified");
+            assert_eq!(result["audience"]["policy"], complete);
+
+            for field in ["workspace_grant_revision", "community_grant_revision"] {
+                for invalid in [
+                    None,
+                    Some(Value::Null),
+                    Some(json!("0")),
+                    Some(json!(-1)),
+                    Some(json!(0.5)),
+                    Some(json!(false)),
+                ] {
+                    let mut policy = complete.clone();
+                    if let Some(value) = invalid {
+                        policy[field] = value;
+                    } else {
+                        policy.as_object_mut().unwrap().remove(field);
+                    }
+                    let result = build_app_handoff("demo", &portal, &app, Ok(&policy)).unwrap();
+                    assert_eq!(result["audience"]["status"], "unknown", "{policy}");
+                    assert!(result["audience"]["policy"].is_null());
+                    assert_eq!(result["audience"]["reason"], "incomplete_policy");
+                }
+            }
+            for field in [
+                "shared_workspace_ids",
+                "shared_community_ids",
+                "viewers",
+                "effective_viewers",
+                "publishers",
+            ] {
+                for value in [
+                    Value::Null,
+                    json!("team"),
+                    json!({"id":"team"}),
+                    json!(["team", 7]),
+                ] {
+                    let mut policy = complete.clone();
+                    policy[field] = value;
+                    let result = build_app_handoff("demo", &portal, &app, Ok(&policy)).unwrap();
+                    assert_eq!(result["audience"]["status"], "unknown", "{policy}");
+                    assert!(result["audience"]["policy"].is_null());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn handoff_never_infers_private_access_from_missing_or_wrong_app_policy() {
+        let portal = management_portal_url("https://app.builderlab.xyz").unwrap();
+        let app = json!({"app":{"app_id":"demo","workspace_id":"team","host":"evil.example/path"}});
+        for policy in [
+            None,
+            Some(json!({"ok":true,"app_id":"other","visibility":"restricted"})),
+            Some(json!({"ok":true,"app_id":"demo"})),
+            Some(
+                json!({"ok":true,"app_id":"demo","visibility":"restricted","viewers":[],"effective_viewers":["owner"]}),
+            ),
+        ] {
+            let access = policy.context("policy unavailable");
+            let result = build_app_handoff("demo", &portal, &app, access.as_ref()).unwrap();
+            assert_eq!(result["audience"]["status"], "unknown");
+            assert!(result["audience"]["policy"].is_null());
+            assert!(result["app_url"].is_null());
+        }
+        let unavailable = anyhow::anyhow!("policy unavailable");
+        assert!(build_app_handoff("other", &portal, &app, Err(&unavailable)).is_err());
+    }
+
+    #[test]
+    fn handoff_rejects_non_origin_management_urls() {
+        for value in [
+            "http://app.example",
+            "https://user@app.example",
+            "https://app.example/path",
+            "https://app.example/?token=secret",
+            "https://app.example/#fragment",
+        ] {
+            assert!(management_portal_url(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn handoff_reports_transport_failures_without_exposing_error_text() {
+        let portal = management_portal_url("https://app.builderlab.xyz").unwrap();
+        let app = json!({"app":{"app_id":"demo","workspace_id":"team"}});
+        let error = failure(
+            exit_codes::NETWORK,
+            "network_error",
+            "sensitive transport detail",
+        )
+        .context("policy read");
+        let handoff = build_app_handoff("demo", &portal, &app, Err(&error)).unwrap();
+        assert_eq!(handoff["audience"]["status"], "unknown");
+        assert_eq!(handoff["audience"]["reason"], "unavailable");
+        assert!(!handoff.to_string().contains("sensitive transport detail"));
+    }
+
+    #[test]
     fn bl_apps_e2e_process_helper() {
         let Some(args) = std::env::var_os("BL_APPS_E2E_ARGS") else {
             return;
@@ -2993,6 +3251,126 @@ mod tests {
             let requests = control_plane.finish();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].path, "/v1/agent/apps?scope=owned");
+        }
+    }
+
+    #[test]
+    fn bl_apps_handoff_process_is_read_only_without_workstation_login() {
+        for (policy, expected_status, expected_reason) in [
+            (
+                ProcessResponse::json(
+                    json!({"ok":true,"app_id":"demo","visibility":"restricted","viewers":[],"effective_viewers":["owner"],"shared_workspace_ids":["team"],"workspace_grant_revision":1,"shared_community_ids":["community"],"community_grant_revision":2}),
+                ),
+                "verified",
+                Value::Null,
+            ),
+            (
+                ProcessResponse::json(
+                    json!({"ok":true,"app_id":"demo","visibility":"restricted","viewers":[],"effective_viewers":["owner"]}),
+                ),
+                "unknown",
+                json!("incomplete_policy"),
+            ),
+            (
+                ProcessResponse::json_status(
+                    503,
+                    json!({"error":{"code":"unavailable","message":"sensitive upstream detail"}}),
+                ),
+                "unknown",
+                json!("unavailable"),
+            ),
+            (
+                ProcessResponse::json_status(
+                    401,
+                    json!({"error":{"code":"identity_required","message":"sensitive upstream detail"}}),
+                ),
+                "unknown",
+                json!("unauthenticated"),
+            ),
+            (
+                ProcessResponse::json_status(
+                    403,
+                    json!({"error":{"code":"not_owner","message":"sensitive upstream detail"}}),
+                ),
+                "unknown",
+                json!("forbidden"),
+            ),
+            (
+                ProcessResponse::json_status(404, json!({"error":{"code":"app_not_found"}})),
+                "unknown",
+                json!("not_found"),
+            ),
+            (
+                ProcessResponse::raw(200, "invalid JSON sensitive upstream detail"),
+                "unknown",
+                json!("request_failed"),
+            ),
+        ] {
+            let auth = ProcessServer::start(vec![]);
+            let control = ProcessServer::start(vec![
+                ProcessResponse::json(
+                    json!({"ok":true,"app":{"app_id":"demo","workspace_id":"owner-personal","host":"demo.apps.example"}}),
+                ),
+                policy,
+            ]);
+            let output = process_command(
+                &auth,
+                &control,
+                &[
+                    "apps",
+                    "handoff",
+                    "demo",
+                    "--management-base-url",
+                    "https://app.builderlabstaging.xyz",
+                    "--json",
+                ],
+                "apps-e2e-only.unused",
+            )
+            .env("BL_APPS_E2E_PROXY", "true")
+            .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+            .output()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let handoff: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
+            assert_eq!(
+                handoff["management_url"],
+                "https://app.builderlabstaging.xyz/hosted-apps?app=demo&workspace=owner-personal"
+            );
+            assert_eq!(handoff["recipient_browser_access_verified"], false);
+            assert_eq!(handoff["audience"]["status"], expected_status);
+            assert_eq!(handoff["audience"]["reason"], expected_reason);
+            assert!(handoff["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("Copying the link does not change access."));
+            if expected_status == "unknown" {
+                assert!(handoff["audience"]["policy"].is_null());
+            } else {
+                assert_eq!(
+                    handoff["audience"]["policy"]["shared_workspace_ids"],
+                    json!(["team"])
+                );
+                assert_eq!(
+                    handoff["audience"]["policy"]["shared_community_ids"],
+                    json!(["community"])
+                );
+            }
+            assert!(!handoff.to_string().contains("sensitive upstream detail"));
+            assert!(auth.finish().is_empty());
+            let requests = control.finish();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].path, "/v1/agent/apps/demo");
+            assert_eq!(requests[1].path, "/v1/agent/apps/demo/access");
+            for request in requests {
+                assert_eq!(request.method, "GET");
+                for name in ["authorization", "cookie", "x-bb-session-credential"] {
+                    assert!(!request.headers.contains_key(name));
+                }
+            }
         }
     }
 
