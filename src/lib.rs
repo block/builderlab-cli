@@ -159,7 +159,9 @@ fn run_bl_with_argv(argv: Vec<String>) -> Result<()> {
                 .get_one::<clap_complete::Shell>("shell")
                 .copied()
                 .context("expected a shell")?;
-            let mut command = build_bl_command();
+            // clap_complete includes hidden commands, so omit retired Apps stubs from its tree.
+            let mut command =
+                build_bl_command().mut_subcommand("apps", |_| bl::apps::completion_command());
             clap_complete::generate(shell, &mut command, BL_COMMAND_NAME, &mut std::io::stdout());
             Ok(())
         }

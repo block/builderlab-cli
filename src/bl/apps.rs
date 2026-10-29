@@ -69,8 +69,16 @@ const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
 ];
 
 pub fn command() -> Command {
+    build_command(true)
+}
+
+pub(crate) fn completion_command() -> Command {
+    build_command(false)
+}
+
+fn build_command(include_retired_sharing: bool) -> Command {
     let about = "Manage apps through the BuilderLab Apps Platform. Cross-workspace sharing is no longer supported. Use `bl apps handoff` to inspect the audience and open Share & manage for community sharing.";
-    Command::new("apps")
+    let command = Command::new("apps")
         .about("Manage apps through Apps Platform")
         .long_about(about)
         .subcommand_required(true)
@@ -467,8 +475,9 @@ pub fn command() -> Command {
                                 .help("Optional Compose environment override"),
                         ),
                 )),
-        )
-        .subcommand(
+        );
+    if include_retired_sharing {
+        command.subcommand(
             Command::new("share")
                 .hide(true)
                 .about(WORKSPACE_SHARING_RETIRED)
@@ -476,6 +485,9 @@ pub fn command() -> Command {
                 .subcommand(retired_workspace_share_command("grant"))
                 .subcommand(retired_workspace_share_command("revoke")),
         )
+    } else {
+        command
+    }
 }
 
 fn retired_workspace_share_command(action: &'static str) -> Command {
@@ -7168,6 +7180,17 @@ mod tests {
             .unwrap()
             .iter()
             .all(|command| command["name"] != "share"));
+        let mut completion = completion_command();
+        let mut script = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut completion,
+            "bl-apps",
+            &mut script,
+        );
+        assert!(!String::from_utf8(script)
+            .unwrap()
+            .contains("__subcmd__share"));
     }
 
     #[test]
