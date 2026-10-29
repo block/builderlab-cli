@@ -831,7 +831,7 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
             .set_visibility(&credential, &app_id, PRIVATE_VISIBILITY, environment)
             .and_then(|response| require_visibility(&app_id, PRIVATE_VISIBILITY, response))
             .with_context(|| {
-                format!("Apps Platform reserved app_id {app_id:?}, but did not make it private. Do not deploy it. Retry the same `bl apps create --private` command to reconcile the reservation and finish making it private.")
+                format!("Apps Platform reserved app_id {app_id:?}, but did not make it private. Do not deploy it. After fixing the error, run `bl apps visibility {app_id} private` or retry the same `bl apps create --private` command.")
             })?;
         Some(response)
     } else {
@@ -7880,6 +7880,10 @@ mod tests {
                 stderr.contains("did not make it private. Do not deploy it."),
                 "{stderr}"
             );
+            assert!(
+                stderr.contains("run `bl apps visibility merchant-lookup private`"),
+                "{stderr}"
+            );
             assert!(stderr.contains(expected), "{stderr}");
             auth_server.finish();
             let requests = control_plane.finish();
@@ -7894,6 +7898,85 @@ mod tests {
                 "/v1/agent/apps/merchant-lookup/visibility"
             );
         }
+    }
+
+    #[test]
+    fn bl_apps_create_private_retry_reconciles_the_reservation_then_makes_it_private() {
+        let credential = "apps-e2e-only.private-retry.session";
+        let collision = ProcessResponse::json_status(
+            409,
+            json!({"ok": false, "error": {"code": "app_id_collision"}}),
+        );
+        // Setting visibility leaves route_revision at 1, so the earlier
+        // reservation still matches on retry.
+        let existing_reservation = json!({
+            "ok": true,
+            "app": {
+                "app_id": "merchant-lookup",
+                "environment": "staging",
+                "persistence": "sqlite",
+                "runtime_class": "default",
+                "runtime_profile": "fetch-js",
+                "role": "owner",
+                "status": "idle",
+                "route_status": "idle",
+                "route_revision": 1
+            },
+            "versions": []
+        });
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(private_create_plan()),
+            collision,
+            ProcessResponse::json(existing_reservation),
+            ProcessResponse::json(json!({
+                "ok": true,
+                "app_id": "merchant-lookup",
+                "visibility": "restricted",
+                "viewers": [],
+            })),
+            ProcessResponse::json(json!({
+                "app_id": "merchant-lookup",
+                "external_url": "https://merchant-lookup--bpsites.example/"
+            })),
+        ]);
+        let output = private_create_command(&auth_server, &control_plane, credential)
+            .output()
+            .expect("run private create retry process");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = serde_json::from_str::<Value>(&process_stdout(&output)).unwrap();
+        assert_eq!(value["reservation_reconciled"], true);
+        assert_eq!(value["visibility"]["visibility"], "restricted");
+        auth_server.finish();
+        let order: Vec<_> = control_plane
+            .finish()
+            .into_iter()
+            .map(|request| (request.method, request.path))
+            .collect();
+        let path = |path: &str| path.to_string();
+        assert_eq!(
+            order,
+            [
+                (path("POST"), path(APPS_PLAN_PATH)),
+                (path("POST"), path("/v1/agent/apps/merchant-lookup/reserve")),
+                (
+                    path("GET"),
+                    path("/v1/agent/apps/merchant-lookup?environment=staging")
+                ),
+                (
+                    path("PUT"),
+                    path("/v1/agent/apps/merchant-lookup/visibility")
+                ),
+                (
+                    path("POST"),
+                    path("/v1/agent/apps/merchant-lookup/initialize")
+                ),
+            ]
+        );
     }
 
     #[test]
