@@ -68,7 +68,7 @@ const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
 ];
 
 pub fn command() -> Command {
-    let about = "Manage apps through the BuilderLab Apps Platform. Use `bl apps handoff` to inspect the audience and open Share & manage for community sharing.";
+    let about = "Manage apps through the BuilderLab Apps Platform. Use `bl apps handoff` to inspect the audience, and `bl apps community` or Share & manage for community sharing.";
     Command::new("apps")
         .about("Manage apps through Apps Platform")
         .long_about(about)
@@ -467,6 +467,39 @@ pub fn command() -> Command {
                         ),
                 )),
         )
+        .subcommand(
+            Command::new("community")
+                .about("Share an app with a Buzz community")
+                .long_about(
+                    "Grant or revoke viewing access for current members of a Buzz community. \
+                     The app owner must be a current member of the community to grant access, but can revoke after leaving it. \
+                     A grant adds viewers and never changes the app's visibility. Community viewers can view the app \
+                     but cannot use its hosted tools. Use `bl apps handoff` to confirm the resulting audience.",
+                )
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .disable_help_subcommand(true)
+                .subcommand(community_action_command("grant"))
+                .subcommand(community_action_command("revoke")),
+        )
+}
+
+fn community_action_command(action: &'static str) -> Command {
+    control_plane_args(
+        Command::new(action)
+            .about(if action == "grant" {
+                "Let current members of a Buzz community view an app"
+            } else {
+                "Remove a Buzz community's viewing access to an app"
+            })
+            .arg(Arg::new("app-id").value_name("APP_ID").required(true))
+            .arg(
+                Arg::new("community-id")
+                    .value_name("COMMUNITY_ID")
+                    .required(true)
+                    .help("Buzz community identifier"),
+            ),
+    )
 }
 
 fn control_plane_args(command: Command) -> Command {
@@ -518,6 +551,7 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("ready", ready_matches)) => run_ready(config, ready_matches),
         Some(("debug", debug_matches)) => run_debug(config, debug_matches),
         Some(("access", access_matches)) => run_access(config, access_matches),
+        Some(("community", community_matches)) => run_community(config, community_matches),
         _ => anyhow::bail!("expected an apps subcommand"),
     }
 }
@@ -1105,6 +1139,44 @@ fn run_debug(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let tail_lines = matches.get_one::<u16>("tail-lines").copied();
     let (client, credential) = control_plane_context(config, matches)?;
     let response = client.debug(&credential, app_id, environment, version_id, tail_lines)?;
+    print_json(&response)
+}
+
+fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let (action, action_matches) = matches
+        .subcommand()
+        .context("expected community grant or revoke")?;
+    let app_id = action_matches
+        .get_one::<String>("app-id")
+        .context("expected app id")?;
+    let community_id = action_matches
+        .get_one::<String>("community-id")
+        .context("expected community id")?;
+    let (client, credential) = control_plane_context(config, action_matches)?;
+    // Kgoose replaces the session with a credential bound to the owner, app and
+    // community, and checks current community membership before a grant. Read
+    // only the CAS inputs on that same route; Compose rechecks ownership and the
+    // revision when applying the change.
+    let current = client.get_community_grant_revision(&credential, app_id, community_id)?;
+    let lifecycle_id = current
+        .get("lifecycle_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("app has no active sharing lifecycle")
+        .map_err(|error| correlate_response_error(error, &current))?;
+    let expected_revision = current
+        .get("community_grant_revision")
+        .and_then(Value::as_u64)
+        .context("app sharing response has no community grant revision")
+        .map_err(|error| correlate_response_error(error, &current))?;
+    let response = client.update_community_grant(
+        &credential,
+        app_id,
+        community_id,
+        lifecycle_id,
+        action,
+        expected_revision,
+    )?;
     print_json(&response)
 }
 
@@ -1753,6 +1825,58 @@ impl ControlPlaneClient {
                 .build()
                 .context("build Apps Platform access update request")
         })
+    }
+
+    fn update_community_grant(
+        &self,
+        credential: &ComposeSessionCredential,
+        app_id: &str,
+        community_id: &str,
+        lifecycle_id: &str,
+        action: &str,
+        expected_revision: u64,
+    ) -> Result<Value> {
+        let url = self.community_grant_url(app_id, community_id)?;
+        let path = request_path(&url);
+        let method = match action {
+            "grant" => "POST",
+            "revoke" => "DELETE",
+            _ => anyhow::bail!("unsupported community sharing action"),
+        };
+        let body = json!({
+            "lifecycle_id": lifecycle_id,
+            "expected_revision": expected_revision,
+        });
+        self.authorized_json_request(credential, method, &path, |authorization| {
+            let request = if method == "POST" {
+                self.client.post(url.clone())
+            } else {
+                self.client.delete(url.clone())
+            };
+            self.standard_request(request, authorization)
+                .json(&body)
+                .build()
+                .context("build Apps Platform community sharing request")
+        })
+    }
+
+    fn get_community_grant_revision(
+        &self,
+        credential: &ComposeSessionCredential,
+        app_id: &str,
+        community_id: &str,
+    ) -> Result<Value> {
+        self.get_url(credential, self.community_grant_url(app_id, community_id)?)
+    }
+
+    fn community_grant_url(&self, app_id: &str, community_id: &str) -> Result<url::Url> {
+        let mut url = self.app_url(app_id, &[])?;
+        url.path_segments_mut()
+            .map_err(|_| {
+                anyhow::anyhow!("Apps Platform control-plane URL cannot contain path segments")
+            })?
+            .extend(["sharing", "communities", community_id]);
+        Ok(url)
     }
 
     fn get_app_resource(
@@ -7181,6 +7305,264 @@ mod tests {
         assert!(!help.contains("Share a restricted app with a BuilderLab workspace"));
         let described = describe_commands();
         assert!(!described.to_string().contains("WORKSPACE_ID"));
+    }
+
+    #[test]
+    fn community_sharing_is_listed_in_help_and_command_metadata() {
+        let mut apps = command();
+        let community = apps.find_subcommand("community").unwrap();
+        assert!(!community.is_hide_set());
+        for action in ["grant", "revoke"] {
+            let names: Vec<_> = community
+                .find_subcommand(action)
+                .unwrap()
+                .get_positionals()
+                .map(|arg| arg.get_id().as_str())
+                .collect();
+            assert_eq!(names, ["app-id", "community-id"]);
+        }
+        assert!(apps
+            .render_long_help()
+            .to_string()
+            .contains("\n  community"));
+        let described = describe_commands();
+        let community = described["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "community")
+            .expect("community command is described");
+        let actions: Vec<_> = community["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, ["grant", "revoke"]);
+    }
+
+    #[test]
+    fn bl_apps_community_grant_reads_only_the_target_grant_before_post() {
+        for proxy in [false, true] {
+            let credential = "apps-e2e-only.community.session";
+            let auth_server = ProcessServer::start(if proxy {
+                vec![]
+            } else {
+                vec![process_auth_response()]
+            });
+            // The sharing read returns only CAS inputs, not the app's access policy.
+            let control_plane = ProcessServer::start(vec![
+                ProcessResponse::json(json!({
+                    "ok": true,
+                    "app_id": "my-app",
+                    "lifecycle_id": "life-123",
+                    "community_grant_revision": 7,
+                })),
+                ProcessResponse::json(json!({"ok": true, "community_grant_revision": 8})),
+            ]);
+            let mut command = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "community",
+                    "grant",
+                    "my-app",
+                    "buzz-alpha",
+                    "--json",
+                ],
+                credential,
+            );
+            command.env(
+                APPS_BASE_URL_ENV_VAR,
+                if proxy {
+                    "http://compose.mesh.example"
+                } else {
+                    APPROVED_TEST_BASE_URL
+                },
+            );
+            if proxy {
+                command.env("BL_APPS_E2E_PROXY", "true");
+            }
+            let output = command.output().expect("run community grant process");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let auth_requests = auth_server.finish();
+            assert_eq!(auth_requests.len(), usize::from(!proxy));
+            let requests = control_plane.finish();
+            assert_eq!(requests.len(), 2);
+            let path = "/v1/agent/apps/my-app/sharing/communities/buzz-alpha";
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(requests[0].path, path);
+            assert_eq!(requests[1].method, "POST");
+            assert_eq!(requests[1].path, path);
+            assert_eq!(
+                requests[1].body,
+                json!({"lifecycle_id": "life-123", "expected_revision": 7})
+            );
+            if proxy {
+                for request in &requests {
+                    for header in ["authorization", "cookie", "x-bb-session-credential"] {
+                        assert!(!request.headers.contains_key(header));
+                    }
+                }
+            } else {
+                assert_process_auth(&auth_requests[0], credential);
+                assert_process_control_plane(&requests[0], "GET", path, credential);
+                assert_process_control_plane(&requests[1], "POST", path, credential);
+            }
+        }
+    }
+
+    #[test]
+    fn bl_apps_community_grant_preserves_server_denials_and_does_not_retry() {
+        for (read_denied, status, code) in [
+            (true, 403, "community_grant_denied"),
+            (false, 403, "community_grant_denied"),
+            (false, 409, "community_grant_conflict"),
+        ] {
+            let auth_server = ProcessServer::start(vec![]);
+            let denied = ProcessResponse::raw(status, json!({"error": {"code": code}}).to_string())
+                .with_trace_id(REQUEST_TRACE_ID);
+            let mut responses = vec![];
+            if !read_denied {
+                responses.push(ProcessResponse::json(json!({
+                    "ok": true,
+                    "lifecycle_id": "life-123",
+                    "community_grant_revision": 7,
+                })));
+            }
+            responses.push(denied);
+            let control_plane = ProcessServer::start(responses);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "community",
+                    "grant",
+                    "my-app",
+                    "buzz-alpha",
+                    "--json",
+                ],
+                "apps-e2e-only.unused",
+            )
+            .env("BL_APPS_E2E_PROXY", "true")
+            .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+            .output()
+            .expect("run denied community grant process");
+            assert!(!output.status.success());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains(code), "{stderr}");
+            assert!(stderr.contains(REQUEST_TRACE_ID), "{stderr}");
+            assert!(auth_server.finish().is_empty());
+            let requests = control_plane.finish();
+            assert_eq!(requests.len(), if read_denied { 1 } else { 2 });
+            let path = "/v1/agent/apps/my-app/sharing/communities/buzz-alpha";
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(requests[0].path, path);
+            if !read_denied {
+                assert_eq!(requests[1].method, "POST");
+                assert_eq!(requests[1].path, path);
+            }
+        }
+    }
+
+    #[test]
+    fn bl_apps_community_revoke_reads_only_the_target_grant_before_delete() {
+        let credential = "apps-e2e-only.revoke.session+credential";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(json!({
+                "ok": true,
+                "app_id": "my-app",
+                "lifecycle_id": "life-123",
+                "community_grant_revision": 7,
+            })),
+            ProcessResponse::json(json!({"ok": true, "community_grant_revision": 8})),
+        ]);
+        let mut command = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "community",
+                "revoke",
+                "my-app",
+                "buzz-former",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--client-version",
+                "0.2.0",
+            ],
+            credential,
+        );
+        let output = command
+            .output()
+            .expect("run community revoke process command");
+        assert!(
+            output.status.success(),
+            "stderr was: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let auth_requests = auth_server.finish();
+        assert_eq!(auth_requests.len(), 1);
+        assert_process_auth(&auth_requests[0], credential);
+        let requests = control_plane.finish();
+        assert_eq!(requests.len(), 2);
+        let path = "/v1/agent/apps/my-app/sharing/communities/buzz-former";
+        assert_process_control_plane(&requests[0], "GET", path, credential);
+        assert_process_control_plane(&requests[1], "DELETE", path, credential);
+        assert_eq!(
+            requests[1].body,
+            json!({"lifecycle_id":"life-123","expected_revision":7})
+        );
+    }
+
+    #[test]
+    fn bl_apps_community_process_retains_trace_on_validation_failures() {
+        for body in [
+            json!({}),
+            json!({"lifecycle_id":"life-123"}),
+            json!({"lifecycle_id":"life-123", "community_grant_revision":-1}),
+        ] {
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![
+                ProcessResponse::json(body).with_trace_id(REQUEST_TRACE_ID)
+            ]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "community",
+                    "grant",
+                    "app",
+                    "buzz-test",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--client-version",
+                    "0.2.0",
+                    "--json",
+                ],
+                "apps-e2e-only.trace-community.session",
+            )
+            .output()
+            .expect("run invalid community command");
+            assert_eq!(
+                process_error(&output)["error"]["trace_id"],
+                REQUEST_TRACE_ID
+            );
+            auth_server.finish();
+            assert_eq!(
+                control_plane.finish().len(),
+                1,
+                "never mutate invalid sharing state"
+            );
+        }
     }
 
     #[test]
