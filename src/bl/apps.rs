@@ -68,7 +68,7 @@ const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
 ];
 
 pub fn command() -> Command {
-    let about = "Manage apps through the BuilderLab Apps Platform.";
+    let about = "Manage apps through the BuilderLab Apps Platform. Cross-workspace sharing is no longer supported. Use `bl apps handoff` to inspect the audience and open Share & manage for community sharing.";
     Command::new("apps")
         .about("Manage apps through Apps Platform")
         .long_about(about)
@@ -467,38 +467,6 @@ pub fn command() -> Command {
                         ),
                 )),
         )
-        .subcommand(
-            Command::new("share")
-                .about("Share a restricted app with a BuilderLab workspace")
-                .long_about(
-                    "Grant or revoke viewing access for current members of a non-personal BuilderLab workspace. \
-                     The app owner must belong to the target workspace to grant access, but can revoke after leaving it. \
-                     Use `bl apps access get` to see current grants.",
-                )
-                .subcommand_required(true)
-                .arg_required_else_help(true)
-                .disable_help_subcommand(true)
-                .subcommand(share_action_command("grant"))
-                .subcommand(share_action_command("revoke")),
-        )
-}
-
-fn share_action_command(action: &'static str) -> Command {
-    control_plane_args(
-        Command::new(action)
-            .about(if action == "grant" {
-                "Let current members of a workspace view an app"
-            } else {
-                "Remove a workspace's viewing access to an app"
-            })
-            .arg(Arg::new("app-id").value_name("APP_ID").required(true))
-            .arg(
-                Arg::new("workspace-id")
-                    .value_name("WORKSPACE_ID")
-                    .required(true)
-                    .help("BuilderLab workspace identifier"),
-            ),
-    )
 }
 
 fn control_plane_args(command: Command) -> Command {
@@ -550,7 +518,6 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("ready", ready_matches)) => run_ready(config, ready_matches),
         Some(("debug", debug_matches)) => run_debug(config, debug_matches),
         Some(("access", access_matches)) => run_access(config, access_matches),
-        Some(("share", share_matches)) => run_share(config, share_matches),
         _ => anyhow::bail!("expected an apps subcommand"),
     }
 }
@@ -1147,44 +1114,6 @@ fn run_access(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("set", set_matches)) => run_access_set(config, set_matches),
         _ => anyhow::bail!("expected an access subcommand"),
     }
-}
-
-fn run_share(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
-    let (action, action_matches) = matches
-        .subcommand()
-        .context("expected share grant or revoke")?;
-    let app_id = action_matches
-        .get_one::<String>("app-id")
-        .context("expected app id")?;
-    let workspace_id = action_matches
-        .get_one::<String>("workspace-id")
-        .context("expected workspace id")?;
-    let (client, credential) = control_plane_context(config, action_matches)?;
-    // Sharing credentials bind the owner, app and target independently of the
-    // ordinary credential's selected workspace. Read only the CAS inputs on
-    // that same route. Kgoose checks target eligibility, and Compose rechecks
-    // ownership, restricted visibility and revision when applying the grant.
-    let current = client.get_workspace_grant_revision(&credential, app_id, workspace_id)?;
-    let lifecycle_id = current
-        .get("lifecycle_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .context("app has no active sharing lifecycle")
-        .map_err(|error| correlate_response_error(error, &current))?;
-    let expected_revision = current
-        .get("workspace_grant_revision")
-        .and_then(Value::as_u64)
-        .context("app sharing response has no workspace grant revision")
-        .map_err(|error| correlate_response_error(error, &current))?;
-    let response = client.update_workspace_grant(
-        &credential,
-        app_id,
-        workspace_id,
-        lifecycle_id,
-        action,
-        expected_revision,
-    )?;
-    print_json(&response)
 }
 
 fn run_access_get(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
@@ -1824,58 +1753,6 @@ impl ControlPlaneClient {
                 .build()
                 .context("build Apps Platform access update request")
         })
-    }
-
-    fn update_workspace_grant(
-        &self,
-        credential: &ComposeSessionCredential,
-        app_id: &str,
-        workspace_id: &str,
-        lifecycle_id: &str,
-        action: &str,
-        expected_revision: u64,
-    ) -> Result<Value> {
-        let url = self.workspace_grant_url(app_id, workspace_id)?;
-        let path = request_path(&url);
-        let method = match action {
-            "grant" => "POST",
-            "revoke" => "DELETE",
-            _ => anyhow::bail!("unsupported workspace sharing action"),
-        };
-        let body = json!({
-            "lifecycle_id": lifecycle_id,
-            "expected_revision": expected_revision,
-        });
-        self.authorized_json_request(credential, method, &path, |authorization| {
-            let request = if method == "POST" {
-                self.client.post(url.clone())
-            } else {
-                self.client.delete(url.clone())
-            };
-            self.standard_request(request, authorization)
-                .json(&body)
-                .build()
-                .context("build Apps Platform workspace sharing request")
-        })
-    }
-
-    fn get_workspace_grant_revision(
-        &self,
-        credential: &ComposeSessionCredential,
-        app_id: &str,
-        workspace_id: &str,
-    ) -> Result<Value> {
-        self.get_url(credential, self.workspace_grant_url(app_id, workspace_id)?)
-    }
-
-    fn workspace_grant_url(&self, app_id: &str, workspace_id: &str) -> Result<url::Url> {
-        let mut url = self.app_url(app_id, &[])?;
-        url.path_segments_mut()
-            .map_err(|_| {
-                anyhow::anyhow!("Apps Platform control-plane URL cannot contain path segments")
-            })?
-            .extend(["sharing", "workspaces", workspace_id]);
-        Ok(url)
     }
 
     fn get_app_resource(
@@ -3556,174 +3433,6 @@ mod tests {
                 "viewers": ["auth0|bob", "auth0|carol"],
                 "environment": "staging/west"
             })
-        );
-    }
-
-    #[test]
-    fn bl_apps_share_grant_uses_owner_scoped_read_without_source_workspace() {
-        for proxy in [false, true] {
-            let credential = "apps-e2e-only.share.session";
-            let auth_server = ProcessServer::start(if proxy {
-                vec![]
-            } else {
-                vec![process_auth_response()]
-            });
-            // The sharing read deliberately returns only CAS inputs, not the
-            // ordinary access policy from the owner's source workspace.
-            let control_plane = ProcessServer::start(vec![
-                ProcessResponse::json(json!({
-                    "ok": true,
-                    "app_id": "my-app",
-                    "lifecycle_id": "life-123",
-                    "workspace_grant_revision": 7,
-                })),
-                ProcessResponse::json(json!({"ok": true, "workspace_grant_revision": 8})),
-            ]);
-            let mut command = process_command(
-                &auth_server,
-                &control_plane,
-                &["apps", "share", "grant", "my-app", "target-team", "--json"],
-                credential,
-            );
-            command.env(
-                APPS_BASE_URL_ENV_VAR,
-                if proxy {
-                    "http://compose.mesh.example"
-                } else {
-                    APPROVED_TEST_BASE_URL
-                },
-            );
-            if proxy {
-                command.env("BL_APPS_E2E_PROXY", "true");
-            }
-            let output = command.output().expect("run workspace grant process");
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let auth_requests = auth_server.finish();
-            assert_eq!(auth_requests.len(), usize::from(!proxy));
-            let requests = control_plane.finish();
-            assert_eq!(requests.len(), 2);
-            let path = "/v1/agent/apps/my-app/sharing/workspaces/target-team";
-            assert_eq!(requests[0].method, "GET");
-            assert_eq!(requests[0].path, path);
-            assert_eq!(requests[1].method, "POST");
-            assert_eq!(requests[1].path, path);
-            assert_eq!(
-                requests[1].body,
-                json!({"lifecycle_id": "life-123", "expected_revision": 7})
-            );
-            if proxy {
-                for request in &requests {
-                    for header in ["authorization", "cookie", "x-bb-session-credential"] {
-                        assert!(!request.headers.contains_key(header));
-                    }
-                }
-            } else {
-                assert_process_auth(&auth_requests[0], credential);
-                assert_process_control_plane(&requests[0], "GET", path, credential);
-                assert_process_control_plane(&requests[1], "POST", path, credential);
-            }
-        }
-    }
-
-    #[test]
-    fn bl_apps_share_grant_preserves_server_denials_and_does_not_retry() {
-        for (read_denied, status, code) in [
-            (true, 403, "workspace_grant_denied"),
-            (false, 403, "workspace_grant_denied"),
-            (false, 409, "workspace_grant_conflict"),
-        ] {
-            let auth_server = ProcessServer::start(vec![]);
-            let denied = ProcessResponse::raw(status, json!({"error": {"code": code}}).to_string())
-                .with_trace_id(REQUEST_TRACE_ID);
-            let mut responses = vec![];
-            if !read_denied {
-                responses.push(ProcessResponse::json(json!({
-                    "ok": true,
-                    "lifecycle_id": "life-123",
-                    "workspace_grant_revision": 7,
-                })));
-            }
-            responses.push(denied);
-            let control_plane = ProcessServer::start(responses);
-            let output = process_command(
-                &auth_server,
-                &control_plane,
-                &["apps", "share", "grant", "my-app", "target-team", "--json"],
-                "apps-e2e-only.unused",
-            )
-            .env("BL_APPS_E2E_PROXY", "true")
-            .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
-            .output()
-            .expect("run denied workspace grant process");
-            assert!(!output.status.success());
-            let stderr = String::from_utf8(output.stderr).unwrap();
-            assert!(stderr.contains(code), "{stderr}");
-            assert!(stderr.contains(REQUEST_TRACE_ID), "{stderr}");
-            assert!(auth_server.finish().is_empty());
-            let requests = control_plane.finish();
-            assert_eq!(requests.len(), if read_denied { 1 } else { 2 });
-            let path = "/v1/agent/apps/my-app/sharing/workspaces/target-team";
-            assert_eq!(requests[0].method, "GET");
-            assert_eq!(requests[0].path, path);
-            if !read_denied {
-                assert_eq!(requests[1].method, "POST");
-                assert_eq!(requests[1].path, path);
-            }
-        }
-    }
-
-    #[test]
-    fn bl_apps_share_revoke_reads_only_the_target_grant_before_delete() {
-        let credential = "apps-e2e-only.revoke.session+credential";
-        let auth_server = ProcessServer::start(vec![process_auth_response()]);
-        let control_plane = ProcessServer::start(vec![
-            ProcessResponse::json(json!({
-                "ok": true,
-                "app_id": "my-app",
-                "lifecycle_id": "life-123",
-                "workspace_grant_revision": 7,
-            })),
-            ProcessResponse::json(json!({"ok": true, "workspace_grant_revision": 8})),
-        ]);
-        let mut command = process_command(
-            &auth_server,
-            &control_plane,
-            &[
-                "apps",
-                "share",
-                "revoke",
-                "my-app",
-                "former-team",
-                "--base-url",
-                APPROVED_TEST_BASE_URL,
-                "--client-version",
-                "0.2.0",
-            ],
-            credential,
-        );
-        let output = command
-            .output()
-            .expect("run workspace revoke process command");
-        assert!(
-            output.status.success(),
-            "stderr was: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let auth_requests = auth_server.finish();
-        assert_eq!(auth_requests.len(), 1);
-        assert_process_auth(&auth_requests[0], credential);
-        let requests = control_plane.finish();
-        assert_eq!(requests.len(), 2);
-        let path = "/v1/agent/apps/my-app/sharing/workspaces/former-team";
-        assert_process_control_plane(&requests[0], "GET", path, credential);
-        assert_process_control_plane(&requests[1], "DELETE", path, credential);
-        assert_eq!(
-            requests[1].body,
-            json!({"lifecycle_id":"life-123","expected_revision":7})
         );
     }
 
@@ -6163,49 +5872,6 @@ mod tests {
     }
 
     #[test]
-    fn bl_apps_share_process_retains_trace_on_validation_failures() {
-        for body in [
-            json!({}),
-            json!({"lifecycle_id":"life-123"}),
-            json!({"lifecycle_id":"life-123", "workspace_grant_revision":-1}),
-        ] {
-            let auth_server = ProcessServer::start(vec![process_auth_response()]);
-            let control_plane = ProcessServer::start(vec![
-                ProcessResponse::json(body).with_trace_id(REQUEST_TRACE_ID)
-            ]);
-            let output = process_command(
-                &auth_server,
-                &control_plane,
-                &[
-                    "apps",
-                    "share",
-                    "grant",
-                    "app",
-                    "test-workspace",
-                    "--base-url",
-                    APPROVED_TEST_BASE_URL,
-                    "--client-version",
-                    "0.2.0",
-                    "--json",
-                ],
-                "apps-e2e-only.trace-share.session",
-            )
-            .output()
-            .expect("run invalid share command");
-            assert_eq!(
-                process_error(&output)["error"]["trace_id"],
-                REQUEST_TRACE_ID
-            );
-            auth_server.finish();
-            assert_eq!(
-                control_plane.finish().len(),
-                1,
-                "never mutate invalid sharing state"
-            );
-        }
-    }
-
-    #[test]
     fn delete_retains_response_id_through_http_and_unknown_outcome_failures() {
         for (status, body, expected_code, expected_exit) in [
             (
@@ -7451,75 +7117,41 @@ mod tests {
     }
 
     #[test]
-    fn workspace_grant_uses_target_path_and_lifecycle_revision() {
-        let server = Server::http("127.0.0.1:0").expect("bind control-plane server");
-        let base_url = format!("http://{}", server.server_addr());
-        let server_thread = thread::spawn(move || {
-            for method in ["GET", "POST", "DELETE"] {
-                let mut request = server.recv().expect("receive sharing request");
-                assert_eq!(request.method().as_str(), method);
-                assert_eq!(
-                    request.url(),
-                    "/v1/agent/apps/my-app/sharing/workspaces/team-workspace"
-                );
-                let mut body = String::new();
-                request
-                    .as_reader()
-                    .read_to_string(&mut body)
-                    .expect("read body");
-                if method == "GET" {
-                    assert!(body.is_empty());
-                } else {
-                    assert_eq!(
-                        serde_json::from_str::<Value>(&body).expect("parse body"),
-                        json!({"lifecycle_id":"life-123","expected_revision":if method == "POST" { 4 } else { 5 }})
-                    );
-                }
-                request
-                    .respond(
-                        Response::from_string(if method == "GET" {
-                            r#"{"ok":true,"lifecycle_id":"life-123","workspace_grant_revision":5}"#
-                        } else {
-                            r#"{"ok":true}"#
-                        })
-                        .with_header(
-                            Header::from_bytes("Content-Type", "application/json")
-                                .expect("build content type"),
-                        ),
-                    )
-                    .expect("respond to sharing request");
-            }
-        });
-        let client = test_control_plane_client(&base_url, Duration::from_secs(2));
-        let credential = test_credential("sharing_session_credential_123456789012345");
-        let current = client
-            .get_workspace_grant_revision(&credential, "my-app", "team-workspace")
-            .expect("read sharing revision without deployment workspace access");
-        assert_eq!(current["lifecycle_id"], "life-123");
-        assert_eq!(current["workspace_grant_revision"], 5);
-        let response = client
-            .update_workspace_grant(
-                &credential,
-                "my-app",
-                "team-workspace",
-                "life-123",
-                "grant",
-                4,
+    fn workspace_sharing_is_absent_from_help_and_command_metadata() {
+        let mut apps = command();
+        assert!(apps.find_subcommand("share").is_none());
+        let help = apps.render_long_help().to_string();
+        assert!(!help.contains("Share a restricted app with a BuilderLab workspace"));
+        let described = describe_commands();
+        assert!(!described.to_string().contains("WORKSPACE_ID"));
+    }
+
+    #[test]
+    fn retired_workspace_sharing_never_authenticates_or_reaches_compose() {
+        for action in ["grant", "revoke"] {
+            let auth_server = ProcessServer::start(vec![]);
+            let control_plane = ProcessServer::start(vec![]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "share",
+                    action,
+                    "my-app",
+                    "target-workspace",
+                    "--json",
+                ],
+                "apps-e2e-only.retired-share.session",
             )
-            .expect("update workspace grant");
-        assert_eq!(response["ok"], true);
-        let response = client
-            .update_workspace_grant(
-                &credential,
-                "my-app",
-                "team-workspace",
-                "life-123",
-                "revoke",
-                5,
-            )
-            .expect("revoke workspace grant");
-        assert_eq!(response["ok"], true);
-        server_thread.join().expect("join control-plane server");
+            .output()
+            .expect("run retired sharing command");
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("share"), "{stderr}");
+            assert!(auth_server.finish().is_empty());
+            assert!(control_plane.finish().is_empty());
+        }
     }
 
     #[test]
