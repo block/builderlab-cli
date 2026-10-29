@@ -6521,6 +6521,7 @@ mod tests {
         let credential = ComposeSessionCredential::from_stored(StoredSessionCredential {
             session_credential: secret.to_string(),
             expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
         })
         .expect("use returned login credential");
 

@@ -33,6 +33,24 @@ impl SessionStorageKey {
         }
     }
 
+    /// Key for a `cli_hosted` session. It is scoped to the hosted-app cookie
+    /// domain and stored apart from the CLI session for the same server.
+    pub fn cli_hosted(
+        profile: impl Into<String>,
+        kgoose_base_url: &str,
+        kgoose_service_path: &str,
+        hosted_domain: &str,
+    ) -> Self {
+        Self::new(
+            profile,
+            format!(
+                "{}#cli_hosted={}",
+                kgoose_service_url(kgoose_base_url, kgoose_service_path),
+                hosted_domain.to_ascii_lowercase()
+            ),
+        )
+    }
+
     pub fn from_profile_and_kgoose_base_url(
         profile: impl Into<String>,
         kgoose_base_url: &str,
@@ -67,12 +85,18 @@ fn legacy_compose_token_account(session: &SessionStorageKey) -> String {
     format!("compose@{}", session.account())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredSessionCredential {
     pub session_credential: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// Hosted-site cookie name; set only for `cli_hosted` sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie_name: Option<String>,
+    /// Hosted-site cookie domain; set only for `cli_hosted` sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie_domain: Option<String>,
 }
 
 impl StoredSessionCredential {
@@ -410,6 +434,7 @@ fn parse_stored_session(value: &str) -> Result<StoredSessionCredential> {
         Err(_) => Ok(StoredSessionCredential {
             session_credential: value.to_string(),
             expires_at: None,
+            ..Default::default()
         }),
     }
 }
@@ -450,6 +475,7 @@ mod tests {
         let credential = StoredSessionCredential {
             session_credential: "local-session".to_string(),
             expires_at: Some("2026-06-15T00:00:00Z".to_string()),
+            ..Default::default()
         };
 
         storage.set(&local, &credential).expect("store credential");
@@ -491,6 +517,7 @@ mod tests {
         let credential = StoredSessionCredential {
             session_credential: "session".to_string(),
             expires_at: None,
+            ..Default::default()
         };
         storage.set(&local, &credential).expect("store local");
         storage.set(&staging, &credential).expect("store staging");
@@ -499,6 +526,75 @@ mod tests {
         assert!(!storage.delete(&local).expect("delete local again"));
         assert!(storage.get(&local).expect("read local").is_none());
         assert!(storage.get(&staging).expect("read staging").is_some());
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cli_hosted_sessions_are_stored_apart_from_the_cli_session() {
+        let directory = std::env::temp_dir().join(format!(
+            "bl-auth-storage-cli-hosted-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let storage = FileSessionCredentialStorage::new(directory.join("sessions.json"));
+        let base_url = "https://kgoose.example";
+        let service_path = "/cash-app/goose";
+        let cli =
+            SessionStorageKey::from_profile_and_kgoose_base_url("default", base_url, service_path);
+        let hosted = SessionStorageKey::cli_hosted(
+            "default",
+            base_url,
+            service_path,
+            "apps.block.builderlab.xyz",
+        );
+        let other_tenant = SessionStorageKey::cli_hosted(
+            "default",
+            base_url,
+            service_path,
+            "apps.other.builderlab.xyz",
+        );
+        storage
+            .set(
+                &cli,
+                &StoredSessionCredential {
+                    session_credential: "cli-session".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("store CLI session");
+        storage
+            .set(
+                &hosted,
+                &StoredSessionCredential {
+                    session_credential: "hosted-session".to_string(),
+                    expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+                    cookie_name: Some("bb_hosted_session".to_string()),
+                    cookie_domain: Some("apps.block.builderlab.xyz".to_string()),
+                },
+            )
+            .expect("store hosted session");
+
+        let stored_hosted = storage.get(&hosted).expect("read hosted").expect("hosted");
+        assert_eq!(stored_hosted.session_credential, "hosted-session");
+        assert_eq!(
+            stored_hosted.cookie_domain.as_deref(),
+            Some("apps.block.builderlab.xyz")
+        );
+        assert_eq!(
+            storage
+                .get(&cli)
+                .expect("read CLI")
+                .expect("CLI")
+                .session_credential,
+            "cli-session"
+        );
+        assert!(storage.get(&other_tenant).expect("read other").is_none());
+
+        assert!(storage.delete(&hosted).expect("delete hosted"));
+        assert!(storage.get(&cli).expect("read CLI").is_some());
 
         let _ = fs::remove_dir_all(directory);
     }

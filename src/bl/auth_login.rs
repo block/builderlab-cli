@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use builderlab_auth::auth_login::{
-    build_auth_http_client, exchange_login_code_and_verify, login_url, logout_session_credential,
-    verify_session_credential, AuthMeResponse, LoginAttempt, VerifiedLoginSession,
+    build_auth_http_client, exchange_hosted_login_code, exchange_login_code_and_verify,
+    login_url_for_type, logout_hosted_session_credential, logout_session_credential,
+    verify_session_credential, AuthMeResponse, HostedLoginExchangeResponse, LoginAttempt,
+    LoginType, VerifiedLoginSession,
 };
 use builderlab_auth::auth_storage::StoredSessionCredential;
 use serde::Serialize;
@@ -15,7 +17,10 @@ use sha2::{Digest, Sha256};
 use tiny_http::{Header, Response, Server, StatusCode};
 use url::Url;
 
-use super::auth_storage::{session_storage_key_from_config, SessionCredentialStorage};
+use super::auth_storage::{
+    hosted_session_storage_key, session_storage_key_from_config, SessionCredentialStorage,
+};
+use super::display::terminal_safe_text;
 use super::skills_config::{kgoose_service_url, SkillsConfig};
 
 const CALLBACK_PATH: &str = "/callback";
@@ -120,33 +125,7 @@ fn run_browser_login_inner(
         }
     }
 
-    let server = Server::http("127.0.0.1:0")
-        .map_err(|error| anyhow!("listen on loopback callback port: {error}"))?;
-    let callback_url = format!("http://{}{}", server.server_addr(), CALLBACK_PATH);
-    let attempt = LoginAttempt::new()?;
-    let login_url = login_url(&service_url, &callback_url, &attempt)?;
-    let expected_state = attempt.state().to_string();
-
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = receive_exchange_code(server, &expected_state);
-        let _ = tx.send(result);
-    });
-
-    if !config.json {
-        println!("Opening BuilderLab auth login in your browser:");
-        println!("{login_url}");
-    }
-    if let Err(error) = webbrowser::open(login_url.as_str()) {
-        if config.json {
-            return Err(anyhow!(
-                "failed to open browser for BuilderLab auth login: {error}"
-            ));
-        }
-        println!("Could not open a browser automatically. Open the URL above manually.");
-    }
-
-    let code = wait_for_exchange_code(&rx, LOGIN_CALLBACK_TIMEOUT)?;
+    let (code, attempt) = obtain_login_code(config, &service_url, LoginType::Cli)?;
     let verified = exchange_login_code_and_verify(
         &client,
         config.playpen.as_deref(),
@@ -176,6 +155,132 @@ fn run_browser_login_inner(
             credential_sha256_prefix: Some(sha256_prefix(&stored.session_credential)),
         },
     })
+}
+
+/// Run the `type=cli_hosted` browser login and store the hosted-app session.
+///
+/// All progress goes to stderr so stdout stays free for the response of the
+/// command that needed the session. The exchanged credential is stored only
+/// when the backend's cookie domain is exactly `hosted_domain`.
+pub fn run_hosted_browser_login(
+    config: &SkillsConfig,
+    storage: &dyn SessionCredentialStorage,
+    hosted_domain: &str,
+) -> Result<StoredSessionCredential> {
+    let service_url = kgoose_service_url(&config.kgoose_base_url, &config.kgoose_service_path);
+    let client = build_auth_http_client(Duration::from_secs(30))?;
+    let (code, attempt) = obtain_login_code(config, &service_url, LoginType::CliHosted)?;
+    let exchange = exchange_hosted_login_code(
+        &client,
+        config.playpen.as_deref(),
+        &service_url,
+        &code,
+        attempt.code_verifier(),
+    )?;
+    let credential = hosted_credential_from_exchange(exchange, hosted_domain)?;
+    storage.set(
+        &hosted_session_storage_key(config, hosted_domain),
+        &credential,
+    )?;
+    eprintln!(
+        "info: Stored BuilderLab hosted-app session for {hosted_domain} in {} storage",
+        storage.kind()
+    );
+    Ok(credential)
+}
+
+fn hosted_credential_from_exchange(
+    exchange: HostedLoginExchangeResponse,
+    hosted_domain: &str,
+) -> Result<StoredSessionCredential> {
+    let cookie_domain = exchange
+        .cookie_domain
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if cookie_domain != hosted_domain {
+        return Err(anyhow!(
+            "login returned a hosted-app session for `{}`, not `{hosted_domain}`; check that `bl` points at the backend for this tenant",
+            terminal_safe_text(&cookie_domain)
+        ));
+    }
+    if !is_cookie_name(&exchange.cookie_name) {
+        return Err(anyhow!("login returned an invalid hosted-app cookie name"));
+    }
+    if !is_cookie_value(&exchange.session_credential) {
+        return Err(anyhow!("login returned an invalid hosted-app session"));
+    }
+    Ok(StoredSessionCredential {
+        session_credential: exchange.session_credential,
+        expires_at: Some(exchange.expires_at),
+        cookie_name: Some(exchange.cookie_name),
+        cookie_domain: Some(cookie_domain),
+    })
+}
+
+/// RFC 6265 cookie-name (an RFC 7230 token).
+pub fn is_cookie_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+}
+
+/// RFC 6265 cookie-octets, without quotes.
+pub fn is_cookie_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(
+            |byte| matches!(byte, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E),
+        )
+}
+
+// Start the loopback callback server, open the browser, and wait for the
+// one-time code. Interactive `bl auth login` prints to stdout; other callers
+// keep stdout clean and print to stderr.
+fn obtain_login_code(
+    config: &SkillsConfig,
+    service_url: &str,
+    login_type: LoginType,
+) -> Result<(String, LoginAttempt)> {
+    let server = Server::http("127.0.0.1:0")
+        .map_err(|error| anyhow!("listen on loopback callback port: {error}"))?;
+    let callback_url = format!("http://{}{}", server.server_addr(), CALLBACK_PATH);
+    let attempt = LoginAttempt::new()?;
+    let login_url = login_url_for_type(service_url, &callback_url, &attempt, login_type)?;
+    let expected_state = attempt.state().to_string();
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = receive_exchange_code(server, &expected_state);
+        let _ = tx.send(result);
+    });
+
+    match login_type {
+        LoginType::Cli => {
+            if !config.json {
+                println!("Opening BuilderLab auth login in your browser:");
+                println!("{login_url}");
+            }
+            if let Err(error) = webbrowser::open(login_url.as_str()) {
+                if config.json {
+                    return Err(anyhow!(
+                        "failed to open browser for BuilderLab auth login: {error}"
+                    ));
+                }
+                println!("Could not open a browser automatically. Open the URL above manually.");
+            }
+        }
+        LoginType::CliHosted => {
+            eprintln!("Opening BuilderLab hosted-app login in your browser:");
+            eprintln!("{login_url}");
+            if webbrowser::open(login_url.as_str()).is_err() {
+                eprintln!("Could not open a browser automatically. Open the URL above manually.");
+            }
+        }
+    }
+
+    let code = wait_for_exchange_code(&rx, LOGIN_CALLBACK_TIMEOUT)?;
+    Ok((code, attempt))
 }
 
 pub fn verify_stored_session(
@@ -238,6 +343,17 @@ pub fn logout_stored_session(
     };
 
     logout_session_credential(&client, config.playpen.as_deref(), &service_url, &stored)
+}
+
+/// Revoke a stored `cli_hosted` session on the server. The caller deletes the
+/// local copy whatever the result.
+pub fn logout_hosted_session(
+    config: &SkillsConfig,
+    credential: &StoredSessionCredential,
+) -> Result<bool> {
+    let service_url = kgoose_service_url(&config.kgoose_base_url, &config.kgoose_service_path);
+    let client = build_auth_http_client(Duration::from_secs(30))?;
+    logout_hosted_session_credential(&client, config.playpen.as_deref(), &service_url, credential)
 }
 
 fn wait_for_exchange_code(
@@ -415,10 +531,12 @@ mod tests {
         SessionCredentialStorage, SessionStorageKey, StoredSessionCredential,
     };
 
+    use builderlab_auth::auth_login::HostedLoginExchangeResponse;
+
     use super::{
-        auth_callback_page, receive_exchange_code, store_login_credential,
-        validate_and_store_login_credential, verify_stored_session_with, wait_for_exchange_code,
-        AuthCallbackPage,
+        auth_callback_page, hosted_credential_from_exchange, receive_exchange_code,
+        store_login_credential, validate_and_store_login_credential, verify_stored_session_with,
+        wait_for_exchange_code, AuthCallbackPage,
     };
 
     #[test]
@@ -576,6 +694,7 @@ mod tests {
         StoredSessionCredential {
             session_credential: value.to_string(),
             expires_at: None,
+            ..Default::default()
         }
     }
 
@@ -655,6 +774,61 @@ mod tests {
         assert!(error.to_string().contains("no active workspaces"));
         assert!(storage.writes.borrow().is_empty());
         assert!(storage.get(&key).expect("read storage").is_none());
+    }
+
+    fn hosted_exchange(cookie_domain: &str) -> HostedLoginExchangeResponse {
+        HostedLoginExchangeResponse {
+            session_credential: "hosted-secret".to_string(),
+            cookie_name: "bb_hosted_session".to_string(),
+            cookie_domain: cookie_domain.to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn hosted_login_accepts_only_the_expected_cookie_domain() {
+        let stored = hosted_credential_from_exchange(
+            hosted_exchange(".Apps.Block.Builderlab.xyz"),
+            "apps.block.builderlab.xyz",
+        )
+        .expect("matching cookie domain");
+        assert_eq!(stored.session_credential, "hosted-secret");
+        assert_eq!(stored.cookie_name.as_deref(), Some("bb_hosted_session"));
+        assert_eq!(
+            stored.cookie_domain.as_deref(),
+            Some("apps.block.builderlab.xyz")
+        );
+        assert_eq!(stored.expires_at.as_deref(), Some("2099-01-01T00:00:00Z"));
+
+        for cookie_domain in [
+            "block.builderlab.xyz",
+            "builderlab.xyz",
+            "apps.other.builderlab.xyz",
+            "evil.example",
+        ] {
+            let error = hosted_credential_from_exchange(
+                hosted_exchange(cookie_domain),
+                "apps.block.builderlab.xyz",
+            )
+            .expect_err("reject a different cookie domain");
+            assert!(!format!("{error:#}").contains("hosted-secret"));
+        }
+    }
+
+    #[test]
+    fn hosted_login_rejects_values_that_cannot_be_sent_as_a_cookie() {
+        let mut exchange = hosted_exchange("apps.block.builderlab.xyz");
+        exchange.cookie_name = "bad name".to_string();
+        assert!(hosted_credential_from_exchange(exchange, "apps.block.builderlab.xyz").is_err());
+
+        for value in ["", "a b", "a;b", "a\"b", "a\\b", "a\nb", "a,b"] {
+            let mut exchange = hosted_exchange("apps.block.builderlab.xyz");
+            exchange.session_credential = value.to_string();
+            assert!(
+                hosted_credential_from_exchange(exchange, "apps.block.builderlab.xyz").is_err(),
+                "credential {value:?}"
+            );
+        }
     }
 
     #[test]

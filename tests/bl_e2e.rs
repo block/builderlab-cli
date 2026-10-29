@@ -2020,10 +2020,17 @@ fn bl_auth_logout_removes_stored_file_session() {
     let bl_home = temp.join("bl-home");
     write_bl_org_config(&bl_home, "test");
     let storage_path = temp.join("auth-sessions.json");
-    let server = MockServer::start(vec![MockResponse::json(json!({}))]);
+    let server = MockServer::start(vec![
+        MockResponse::json(json!({})),
+        MockResponse::json(json!({})),
+    ]);
     let server_url = format!("{}/api/goose", server.base_url);
     let default_key = browser_auth_storage_key("default", &server_url);
     let other_key = browser_auth_storage_key("other", &server_url);
+    let hosted_key = browser_auth_storage_key(
+        "default",
+        &format!("{server_url}#cli_hosted=apps.test.builderlab.xyz"),
+    );
     let purpose_storage_path = PathBuf::from(format!("{}.purpose-tokens", storage_path.display()));
     fs::write(
         &storage_path,
@@ -2035,6 +2042,12 @@ fn bl_auth_logout_removes_stored_file_session() {
             other_key: {
                 "sessionCredential": "other-session",
                 "expiresAt": "2026-06-15T00:00:00Z"
+            },
+            hosted_key: {
+                "sessionCredential": "hosted-session",
+                "expiresAt": "2026-06-15T00:00:00Z",
+                "cookieName": "bb_hosted_session",
+                "cookieDomain": "apps.test.builderlab.xyz"
             }
         }))
         .expect("serialize storage"),
@@ -2066,7 +2079,17 @@ fn bl_auth_logout_removes_stored_file_session() {
     assert_eq!(response["server_revoked"], json!(true));
     assert_eq!(response["storage"], json!("file"));
     assert_eq!(response["purpose_token_removed"], json!(true));
-    assert_eq!(requests.len(), 1);
+    assert_eq!(response["hosted_sessions_removed"], json!(1));
+    assert_eq!(response["hosted_sessions_server_revoked"], json!(1));
+    assert_eq!(
+        response["hosted_sessions"],
+        json!([{
+            "hosted_domain": "apps.test.builderlab.xyz",
+            "server_revoked": true,
+            "removed": true,
+        }])
+    );
+    assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].method, "POST");
     assert_eq!(requests[0].path, "/api/goose/v1/auth/logout");
     assert_eq!(
@@ -2076,9 +2099,19 @@ fn bl_auth_logout_removes_stored_file_session() {
             .map(String::as_str),
         Some("default-session")
     );
+    // The hosted session is revoked the way hosted apps accept it: as the
+    // hosted-site cookie, never as the CLI credential header.
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].path, "/api/goose/v1/auth/logout");
+    assert_eq!(
+        requests[1].headers.get("cookie").map(String::as_str),
+        Some("bb_hosted_session=hosted-session")
+    );
+    assert!(!requests[1].headers.contains_key("x-bb-session-credential"));
 
     let storage = fs::read_to_string(&storage_path).expect("read storage");
     assert!(!storage.contains("default-session"));
+    assert!(!storage.contains("hosted-session"));
     assert!(storage.contains("other-session"));
     assert!(!purpose_storage_path.exists());
 
@@ -2097,6 +2130,121 @@ fn bl_auth_logout_removes_stored_file_session() {
     assert_eq!(response["removed"], json!(false));
     assert_eq!(response["server_revoked"], json!(false));
     assert_eq!(response["purpose_token_removed"], json!(false));
+    assert_eq!(response["hosted_sessions_removed"], json!(0));
+    assert_eq!(response["hosted_sessions_server_revoked"], json!(0));
+    assert_eq!(response["hosted_sessions"], json!([]));
+
+    fs::remove_dir_all(temp).expect("remove temp dir");
+}
+
+#[test]
+fn bl_auth_logout_removes_hosted_sessions_even_when_revocation_fails() {
+    let temp = temp_test_dir("bl-auth-logout-hosted-failure");
+    let bl_home = temp.join("bl-home");
+    write_bl_org_config(&bl_home, "test");
+    let storage_path = temp.join("auth-sessions.json");
+    // The server is unreachable, so neither session can be revoked.
+    let server_url = "http://127.0.0.1:9/api/goose";
+    let hosted_key = browser_auth_storage_key(
+        "default",
+        &format!("{server_url}#cli_hosted=apps.test.builderlab.xyz"),
+    );
+    fs::write(
+        &storage_path,
+        serde_json::to_string_pretty(&json!({
+            hosted_key: {
+                "sessionCredential": "hosted-session",
+                "cookieName": "bb_hosted_session",
+                "cookieDomain": "apps.test.builderlab.xyz"
+            }
+        }))
+        .expect("serialize storage"),
+    )
+    .expect("write auth storage");
+
+    let output = bl_command()
+        .env("BL_HOME", &bl_home)
+        .env("BL_AUTH_STORAGE", "file")
+        .env("BL_AUTH_STORAGE_FILE", &storage_path)
+        .env("KGOOSE_BASE_URL", "http://127.0.0.1:9")
+        .args(["auth", "logout", "--json"])
+        .output()
+        .expect("run bl auth logout");
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(output.status.success(), "stderr was: {stderr}");
+    let response = serde_json::from_str::<Value>(&stdout).expect("parse logout output");
+    assert_eq!(
+        response["hosted_sessions"],
+        json!([{
+            "hosted_domain": "apps.test.builderlab.xyz",
+            "server_revoked": false,
+            "removed": true,
+        }])
+    );
+    assert_eq!(response["hosted_sessions_server_revoked"], json!(0));
+    assert!(response["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .unwrap_or_default()
+            .contains("failed to destroy server hosted-app session")));
+    let storage = fs::read_to_string(&storage_path).expect("read storage");
+    assert!(!storage.contains("hosted-session"));
+
+    fs::remove_dir_all(temp).expect("remove temp dir");
+}
+
+#[test]
+fn bl_curl_refuses_unsafe_targets_before_login_or_curl() {
+    let temp = temp_test_dir("bl-curl-refusals");
+    let bl_home = temp.join("bl-home");
+    write_bl_org_config(&bl_home, "test");
+    for (args, code) in [
+        (
+            vec!["curl", "https://evil.example/"],
+            "invalid_hosted_app_url",
+        ),
+        (
+            vec!["curl", "http://myapp.apps.test.builderlab.xyz/"],
+            "invalid_hosted_app_url",
+        ),
+        (
+            vec!["curl", "https://myapp.apps.other.builderlab.xyz/"],
+            "hosted_app_tenant_mismatch",
+        ),
+        (
+            vec!["curl", "https://myapp.apps.test.builderlab.xyz/", "-v"],
+            "unsupported_curl_argument",
+        ),
+        (
+            vec![
+                "curl",
+                "https://myapp.apps.test.builderlab.xyz/",
+                "https://evil.example/",
+            ],
+            "unsupported_curl_argument",
+        ),
+    ] {
+        let output = bl_command()
+            .env("BL_HOME", &bl_home)
+            .env("BL_AUTH_STORAGE", "file")
+            .env("BL_AUTH_STORAGE_FILE", temp.join("auth-sessions.json"))
+            .env("KGOOSE_BASE_URL", "http://127.0.0.1:9")
+            .args(["--json"])
+            .args(&args)
+            .output()
+            .expect("run bl curl");
+        let (stdout, stderr) = output_text(&output);
+
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+        let error = serde_json::from_str::<Value>(&stderr).expect("parse error JSON");
+        assert_eq!(error["error"]["code"], json!(code), "{args:?}");
+    }
+    assert!(!temp.join("auth-sessions.json").exists());
 
     fs::remove_dir_all(temp).expect("remove temp dir");
 }

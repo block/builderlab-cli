@@ -11,7 +11,8 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{json, Value};
 
 use super::auth_login::{
-    logout_stored_session, run_browser_login, verify_stored_session, BrowserLoginCredentialSource,
+    logout_hosted_session, logout_stored_session, run_browser_login, verify_stored_session,
+    BrowserLoginCredentialSource,
 };
 use super::auth_storage::default_session_storage;
 use super::description::describe_command_tree;
@@ -257,7 +258,9 @@ pub fn auth_command() -> Command {
                 .about("Remove browser-based CLI auth for the selected profile")
                 .long_about(
                     "Remove the browser-based CLI auth session credential for the selected \
-                     profile and server URL from the configured browser auth storage.",
+                     profile and server URL from the configured browser auth storage. This \
+                     also revokes and removes the hosted-app sessions `bl curl` stored for \
+                     the configured org.",
                 ),
         )
 }
@@ -671,6 +674,55 @@ fn auth_logout_browser(config: &SkillsConfig) -> Result<()> {
             false
         }
     };
+    // Revoke each stored `bl curl` hosted-app session, then delete the local
+    // copy whatever the server said, as for the CLI session above.
+    let mut hosted_sessions = Vec::new();
+    if let Some(org) = config.org.as_deref() {
+        for hosted_domain in super::curl::hosted_app_domains_for_org(org) {
+            let key = super::auth_storage::hosted_session_storage_key(config, &hosted_domain);
+            let stored = match storage.get(&key) {
+                Ok(stored) => stored,
+                Err(err) => {
+                    warnings.push(format!(
+                        "failed to read local hosted-app session for {hosted_domain}: {err}"
+                    ));
+                    None
+                }
+            };
+            let hosted_server_revoked = match stored.as_ref() {
+                Some(credential) => match logout_hosted_session(config, credential) {
+                    Ok(revoked) => revoked,
+                    Err(err) => {
+                        warnings.push(format!(
+                            "failed to destroy server hosted-app session for {hosted_domain}: {err}"
+                        ));
+                        false
+                    }
+                },
+                None => false,
+            };
+            let hosted_removed = match storage.delete(&key) {
+                Ok(removed) => removed,
+                Err(err) => {
+                    warnings.push(format!(
+                        "failed to remove local hosted-app session for {hosted_domain}: {err}"
+                    ));
+                    false
+                }
+            };
+            if stored.is_some() || hosted_removed {
+                hosted_sessions.push((hosted_domain, hosted_server_revoked, hosted_removed));
+            }
+        }
+    }
+    let hosted_sessions_server_revoked = hosted_sessions
+        .iter()
+        .filter(|(_, revoked, _)| *revoked)
+        .count();
+    let hosted_sessions_removed = hosted_sessions
+        .iter()
+        .filter(|(_, _, removed)| *removed)
+        .count();
     let purpose_token_removed = match storage.delete_legacy_purpose_token_cache(&storage_key) {
         Ok(removed) => removed,
         Err(err) => {
@@ -688,6 +740,16 @@ fn auth_logout_browser(config: &SkillsConfig) -> Result<()> {
             "storage": storage.kind(),
             "server_revoked": server_revoked,
             "removed": removed,
+            "hosted_sessions": hosted_sessions
+                .iter()
+                .map(|(hosted_domain, server_revoked, removed)| json!({
+                    "hosted_domain": hosted_domain,
+                    "server_revoked": server_revoked,
+                    "removed": removed,
+                }))
+                .collect::<Vec<_>>(),
+            "hosted_sessions_server_revoked": hosted_sessions_server_revoked,
+            "hosted_sessions_removed": hosted_sessions_removed,
             "purpose_token_removed": purpose_token_removed,
             "warnings": warnings,
         }));
@@ -702,6 +764,18 @@ fn auth_logout_browser(config: &SkillsConfig) -> Result<()> {
         config.style.success("Removed BuilderLab CLI auth session");
     } else {
         println!("No BuilderLab CLI auth session was stored");
+    }
+    for (hosted_domain, server_revoked, removed) in &hosted_sessions {
+        if *server_revoked {
+            config.style.success(&format!(
+                "Destroyed BuilderLab hosted-app session for {hosted_domain} on the server"
+            ));
+        }
+        if *removed {
+            config.style.success(&format!(
+                "Removed BuilderLab hosted-app session for {hosted_domain}"
+            ));
+        }
     }
     for warning in warnings {
         config.style.warn(&warning);

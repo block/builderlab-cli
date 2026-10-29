@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use reqwest::blocking::{Client, ClientBuilder};
-use reqwest::header::{ACCEPT, USER_AGENT};
+use reqwest::header::{ACCEPT, COOKIE, USER_AGENT};
 use reqwest::redirect::Policy;
 use reqwest::StatusCode as HttpStatusCode;
 use serde::{Deserialize, Serialize};
@@ -48,10 +48,50 @@ fn random_token() -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// Session type requested from `/v1/auth/login`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginType {
+    /// CLI session sent to BuilderLab APIs in `X-BB-Session-Credential`.
+    Cli,
+    /// Tenant-wide hosted-app session, sent to hosted apps only as the
+    /// hosted-site cookie.
+    CliHosted,
+}
+
+impl LoginType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::CliHosted => "cli_hosted",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LoginExchangeResponse {
     pub session_credential: String,
     pub expires_at: String,
+}
+
+/// Exchange response for a `type=cli_hosted` login code.
+#[derive(Deserialize)]
+pub struct HostedLoginExchangeResponse {
+    pub session_credential: String,
+    pub cookie_name: String,
+    pub cookie_domain: String,
+    pub expires_at: String,
+}
+
+// Never print the credential through Debug.
+impl std::fmt::Debug for HostedLoginExchangeResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostedLoginExchangeResponse")
+            .field("cookie_name", &self.cookie_name)
+            .field("cookie_domain", &self.cookie_domain)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +152,26 @@ pub fn exchange_login_code(
     code: &str,
     code_verifier: &str,
 ) -> Result<LoginExchangeResponse> {
+    exchange_login_code_as(client, playpen, server_url, code, code_verifier)
+}
+
+pub fn exchange_hosted_login_code(
+    client: &Client,
+    playpen: Option<&str>,
+    server_url: &str,
+    code: &str,
+    code_verifier: &str,
+) -> Result<HostedLoginExchangeResponse> {
+    exchange_login_code_as(client, playpen, server_url, code, code_verifier)
+}
+
+fn exchange_login_code_as<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    playpen: Option<&str>,
+    server_url: &str,
+    code: &str,
+    code_verifier: &str,
+) -> Result<T> {
     let url = auth_url(server_url, "/v1/auth/login/exchange")?;
     let mut request = client
         .post(url)
@@ -144,6 +204,7 @@ pub fn exchange_login_code_and_verify(
     let credential = StoredSessionCredential {
         session_credential: exchange.session_credential,
         expires_at: Some(exchange.expires_at),
+        ..Default::default()
     };
     let me =
         verify_session_credential(client, playpen, server_url, &credential)?.ok_or_else(|| {
@@ -194,18 +255,58 @@ pub fn logout_session_credential(
     let Some(session_credential) = credential.session_credential_header_value() else {
         return Ok(false);
     };
+    post_logout(
+        client,
+        playpen,
+        server_url,
+        SESSION_CREDENTIAL_HEADER,
+        &session_credential,
+        "destroy stored BuilderLab CLI auth session",
+    )
+}
+
+/// Revoke a `cli_hosted` session. The backend accepts it only the way hosted
+/// apps do: as the hosted-site cookie.
+pub fn logout_hosted_session_credential(
+    client: &Client,
+    playpen: Option<&str>,
+    server_url: &str,
+    credential: &StoredSessionCredential,
+) -> Result<bool> {
+    let (Some(cookie_name), Some(session_credential)) = (
+        credential.cookie_name.as_deref(),
+        credential.session_credential_header_value(),
+    ) else {
+        return Ok(false);
+    };
+    post_logout(
+        client,
+        playpen,
+        server_url,
+        COOKIE.as_str(),
+        &format!("{cookie_name}={session_credential}"),
+        "destroy stored BuilderLab hosted-app session",
+    )
+}
+
+fn post_logout(
+    client: &Client,
+    playpen: Option<&str>,
+    server_url: &str,
+    credential_header: &str,
+    credential_value: &str,
+    context: &'static str,
+) -> Result<bool> {
     let url = auth_url(server_url, "/v1/auth/logout")?;
     let mut request = client
         .post(url)
         .header(USER_AGENT, CLI_USER_AGENT)
         .header(ACCEPT, "application/json")
-        .header(SESSION_CREDENTIAL_HEADER, session_credential);
+        .header(credential_header, credential_value);
     if let Some(baggage) = playpen_baggage(playpen) {
         request = request.header("Baggage", baggage);
     }
-    let response = request
-        .send()
-        .context("destroy stored BuilderLab CLI auth session")?;
+    let response = request.send().context(context)?;
     let status = response.status();
     if status == HttpStatusCode::UNAUTHORIZED || status == HttpStatusCode::FORBIDDEN {
         return Ok(false);
@@ -217,9 +318,18 @@ pub fn logout_session_credential(
 }
 
 pub fn login_url(server_url: &str, callback_url: &str, attempt: &LoginAttempt) -> Result<Url> {
+    login_url_for_type(server_url, callback_url, attempt, LoginType::Cli)
+}
+
+pub fn login_url_for_type(
+    server_url: &str,
+    callback_url: &str,
+    attempt: &LoginAttempt,
+    login_type: LoginType,
+) -> Result<Url> {
     let mut url = auth_url(server_url, "/v1/auth/login")?;
     url.query_pairs_mut()
-        .append_pair("type", "cli")
+        .append_pair("type", login_type.as_str())
         .append_pair("returnTo", callback_url)
         .append_pair("state", attempt.state())
         .append_pair("code_challenge", &attempt.code_challenge())
@@ -261,6 +371,7 @@ mod tests {
         let credential = StoredSessionCredential {
             session_credential: "expired-session".to_string(),
             expires_at: None,
+            ..Default::default()
         };
 
         let verified = verify_session_credential(&client, None, &server.base_url, &credential)
@@ -283,6 +394,7 @@ mod tests {
         let credential = StoredSessionCredential {
             session_credential: secret.to_string(),
             expires_at: None,
+            ..Default::default()
         };
 
         let error = verify_session_credential(&client, None, &server.base_url, &credential)
@@ -303,6 +415,7 @@ mod tests {
         let credential = StoredSessionCredential {
             session_credential: String::new(),
             expires_at: None,
+            ..Default::default()
         };
 
         let verified = verify_session_credential(&client, None, &base_url, &credential)
@@ -318,6 +431,7 @@ mod tests {
         let credential = StoredSessionCredential {
             session_credential: "valid-session".to_string(),
             expires_at: None,
+            ..Default::default()
         };
 
         let logged_out = logout_session_credential(&client, None, &server.base_url, &credential)
@@ -339,6 +453,7 @@ mod tests {
         let credential = StoredSessionCredential {
             session_credential: "expired-session".to_string(),
             expires_at: None,
+            ..Default::default()
         };
 
         let logged_out = logout_session_credential(&client, None, &server.base_url, &credential)
@@ -354,6 +469,47 @@ mod tests {
     }
 
     #[test]
+    fn logout_hosted_session_credential_sends_only_the_hosted_cookie() {
+        let server = TestServer::single(200, r#"{}"#);
+        let client = build_auth_http_client(Duration::from_secs(5)).expect("client");
+        let credential = StoredSessionCredential {
+            session_credential: "hosted-session".to_string(),
+            cookie_name: Some("bb_hosted_session".to_string()),
+            cookie_domain: Some("apps.example.test".to_string()),
+            ..Default::default()
+        };
+
+        let revoked =
+            logout_hosted_session_credential(&client, None, &server.base_url, &credential)
+                .expect("logout hosted session");
+        let request = server.finish_one();
+
+        assert!(revoked);
+        assert_eq!(request.path, "/v1/auth/logout");
+        assert_eq!(
+            request.cookie.as_deref(),
+            Some("bb_hosted_session=hosted-session")
+        );
+        assert_eq!(request.bl_session_credential, None);
+    }
+
+    #[test]
+    fn logout_hosted_session_credential_skips_sessions_without_a_cookie_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let client = build_auth_http_client(Duration::from_secs(1)).expect("client");
+        let credential = StoredSessionCredential {
+            session_credential: "hosted-session".to_string(),
+            ..Default::default()
+        };
+
+        assert!(
+            !logout_hosted_session_credential(&client, None, &base_url, &credential)
+                .expect("skip logout")
+        );
+    }
+
+    #[test]
     fn verify_session_credential_accepts_successful_me_response() {
         let server = TestServer::single(
             200,
@@ -363,6 +519,7 @@ mod tests {
         let credential = StoredSessionCredential {
             session_credential: "valid-session".to_string(),
             expires_at: None,
+            ..Default::default()
         };
 
         let verified = verify_session_credential(&client, None, &server.base_url, &credential)
@@ -443,6 +600,62 @@ mod tests {
         );
         assert_eq!(query["code_challenge_method"], "S256");
         assert!(!query.contains_key("code_verifier"));
+    }
+
+    #[test]
+    fn cli_hosted_login_url_uses_the_same_pkce_parameters() {
+        let url = login_url_for_type(
+            "https://example.com/cash-app/goose",
+            "http://127.0.0.1:1234/callback",
+            &LoginAttempt {
+                state: "client-state".to_string(),
+                code_verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_string(),
+            },
+            LoginType::CliHosted,
+        )
+        .expect("login URL");
+
+        assert_eq!(url.path(), "/cash-app/goose/v1/auth/login");
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(query["type"], "cli_hosted");
+        assert_eq!(query["returnTo"], "http://127.0.0.1:1234/callback");
+        assert_eq!(query["state"], "client-state");
+        assert_eq!(
+            query["code_challenge"],
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+        assert_eq!(query["code_challenge_method"], "S256");
+        assert!(!query.contains_key("code_verifier"));
+    }
+
+    #[test]
+    fn hosted_exchange_returns_cookie_metadata_without_debug_leaks() {
+        let server = TestServer::single(
+            200,
+            r#"{"session_credential":"hosted-secret","cookie_name":"bb_hosted_session","cookie_domain":"apps.block.builderlab.xyz","expires_at":"2026-06-15T00:00:00Z"}"#,
+        );
+        let client = build_auth_http_client(Duration::from_secs(5)).expect("client");
+
+        let exchange = exchange_hosted_login_code(
+            &client,
+            None,
+            &server.base_url,
+            "one-time-code",
+            "test-verifier",
+        )
+        .expect("hosted exchange");
+        let request = server.finish_one();
+
+        assert_eq!(request.path, "/v1/auth/login/exchange");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request.body).expect("exchange JSON"),
+            serde_json::json!({"code": "one-time-code", "code_verifier": "test-verifier"})
+        );
+        assert_eq!(exchange.session_credential, "hosted-secret");
+        assert_eq!(exchange.cookie_name, "bb_hosted_session");
+        assert_eq!(exchange.cookie_domain, "apps.block.builderlab.xyz");
+        assert_eq!(exchange.expires_at, "2026-06-15T00:00:00Z");
+        assert!(!format!("{exchange:?}").contains("hosted-secret"));
     }
 
     #[test]
@@ -528,6 +741,7 @@ mod tests {
     struct RecordedRequest {
         path: String,
         bl_session_credential: Option<String>,
+        cookie: Option<String>,
         body: String,
     }
 
@@ -577,6 +791,7 @@ mod tests {
             .to_string();
 
         let mut bl_session_credential = None;
+        let mut cookie = None;
         let mut content_length = 0;
         loop {
             let mut line = String::new();
@@ -590,6 +805,9 @@ mod tests {
                 }
                 if name.eq_ignore_ascii_case(SESSION_CREDENTIAL_HEADER) {
                     bl_session_credential = Some(value.trim().to_string());
+                }
+                if name.eq_ignore_ascii_case("cookie") {
+                    cookie = Some(value.trim().to_string());
                 }
             }
         }
@@ -605,6 +823,7 @@ mod tests {
         RecordedRequest {
             path,
             bl_session_credential,
+            cookie,
             body: String::from_utf8(body_bytes).expect("UTF-8 body"),
         }
     }

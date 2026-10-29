@@ -176,6 +176,7 @@ fn run_switch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
                 &StoredSessionCredential {
                     session_credential: new_credential,
                     expires_at: session.credential.expires_at.clone(),
+                    ..Default::default()
                 },
             )
             .context(
