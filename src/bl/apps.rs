@@ -2209,6 +2209,13 @@ fn sanitize_recovery_field(value: &Value, credential: &ComposeSessionCredential)
     Some(value)
 }
 
+fn is_app_scoped_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    path.strip_prefix("/v1/agent/apps/")
+        .and_then(|rest| rest.split('/').next())
+        .is_some_and(|app_id| !app_id.is_empty() && app_id != "plan")
+}
+
 fn control_plane_http_failure(
     method: &str,
     path: &str,
@@ -2265,9 +2272,16 @@ fn control_plane_http_failure(
                     .or_else(|| value.pointer("/error/next_action"))
             })
             .and_then(|value| sanitize_recovery_field(value, credential))
-            .or_else(|| (status == StatusCode::FORBIDDEN).then(|| json!(
-                "Check Apps access for this account and environment, and your workspace and app permissions. Ask the app owner to confirm your viewing or publishing access."
-            )))
+            .or_else(|| {
+                (status == StatusCode::FORBIDDEN).then(|| {
+                    // Only a request about one app has an owner to ask.
+                    json!(if is_app_scoped_path(path) {
+                        "Check Apps access for this account and environment, and your workspace and app permissions. Ask the app owner to confirm your viewing or publishing access."
+                    } else {
+                        "Check Apps access for this account and environment, and your workspace permissions."
+                    })
+                })
+            })
     };
     let mut message = format!("{method} {path} failed with {status} ({code})");
     if let Some((diagnostic, guidance)) = validation {
@@ -2892,6 +2906,50 @@ mod tests {
     }
 
     #[test]
+    fn app_scoped_paths_are_requests_about_one_app() {
+        for path in [
+            "/v1/agent/apps/demo",
+            "/v1/agent/apps/demo?environment=staging",
+            "/v1/agent/apps/demo/access",
+            "/v1/agent/apps/merchant%2Flookup%20app/deploy",
+        ] {
+            assert!(is_app_scoped_path(path), "{path}");
+        }
+        for path in [
+            APPS_CONTRACT_PATH,
+            APPS_PLAN_PATH,
+            "/v1/agent/apps",
+            "/v1/agent/apps?scope=owned",
+            "/v1/agent/apps/",
+        ] {
+            assert!(!is_app_scoped_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn bl_apps_generic_denial_asks_the_owner_only_for_an_app_request() {
+        let credential = "apps-e2e-only.app-denial.session";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::raw(403, "").with_trace_id(REQUEST_TRACE_ID)
+        ]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &["apps", "get", "demo", "--base-url", APPROVED_TEST_BASE_URL],
+            credential,
+        )
+        .output()
+        .expect("run app denial");
+        assert_eq!(output.status.code(), Some(exit_codes::FORBIDDEN));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("Ask the app owner to confirm"), "{stderr}");
+        assert!(!stderr.contains("bl workspace"), "{stderr}");
+        auth_server.finish();
+        assert_eq!(control_plane.finish()[0].path, "/v1/agent/apps/demo");
+    }
+
+    #[test]
     fn bl_apps_process_distinguishes_account_setup_from_other_denials() {
         let credential = "apps-e2e-only.account-access.session";
         let needs_details = json!({
@@ -2924,28 +2982,28 @@ mod tests {
                 403,
                 "",
                 "control_plane_request_failed",
-                "workspace and app permissions",
+                "and your workspace permissions.",
             ),
             (
                 json!({"account_status": "ACCOUNT_STATUS_REJECTED", "enabled_products": []}),
                 403,
                 "",
                 "control_plane_request_failed",
-                "workspace and app permissions",
+                "and your workspace permissions.",
             ),
             (
                 json!({"account_status": "ACCOUNT_STATUS_FUTURE", "enabled_products": []}),
                 403,
                 "",
                 "control_plane_request_failed",
-                "workspace and app permissions",
+                "and your workspace permissions.",
             ),
             (
                 json!({}),
                 403,
                 "",
                 "control_plane_request_failed",
-                "workspace and app permissions",
+                "and your workspace permissions.",
             ),
             (
                 needs_details.clone(),
@@ -2997,6 +3055,8 @@ mod tests {
                 assert!(!stderr.contains("apps@example.com"));
                 assert!(!stderr.contains("bl workspace switch"));
                 assert!(!stderr.contains("bl workspace list"));
+                // Listing apps has no app owner to ask.
+                assert!(!stderr.contains("Ask the app owner to confirm"), "{stderr}");
                 if code != "account_setup_required" {
                     assert!(!stderr.contains("Finish account setup"));
                 }
