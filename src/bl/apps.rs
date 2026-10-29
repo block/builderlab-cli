@@ -980,10 +980,16 @@ fn build_app_handoff(
         (false, false) => "App access could not be confirmed. Report the audience as unknown; do not claim it is private or shared.",
     };
     let mut next_action = format!("{report} Copying the link does not change access.");
-    if management.is_none() {
+    if portal.is_none() {
         next_action.push_str(&format!(
             " There is no Share & manage link on this machine. Tell the owner: {} To print the link, rerun with --management-base-url <HTTPS_PORTAL_ORIGIN> or set {MANAGEMENT_BASE_URL_ENV_VAR}.",
             share_and_manage_without_portal(app_id)
+        ));
+    } else if management.is_none() {
+        // The portal is configured, so the missing piece is the app's workspace, which no setting here supplies.
+        next_action.push_str(&format!(
+            " The app came back without its workspace, so there is no direct Share & manage link. Tell the owner: {}",
+            share_and_manage_step(portal, app_id)
         ));
     }
     let who = verified.map(|policy| {
@@ -3373,6 +3379,29 @@ mod tests {
         assert_eq!(result["audience"]["policy"], access);
         assert!(result["audience"]["reason"].is_null());
         assert_eq!(result["recipient_browser_access_verified"], false);
+    }
+
+    #[test]
+    fn handoff_without_a_workspace_does_not_ask_for_a_portal_that_is_already_set() {
+        let portal = management_portal_url("https://app.builderlab.xyz").unwrap();
+        let app = json!({"app":{"app_id":"demo"}});
+        let policy = json!({"ok":true,"app_id":"demo","visibility":"organization",
+            "viewers":[],"community_grant_revision":0});
+        let handoff = build_app_handoff("demo", Some(&portal), &app, Ok(&policy)).unwrap();
+        assert!(handoff["management_url"].is_null());
+        let next_action = handoff["next_action"].as_str().unwrap();
+        assert!(
+            !next_action.contains("--management-base-url"),
+            "{next_action}"
+        );
+        assert!(
+            !next_action.contains(MANAGEMENT_BASE_URL_ENV_VAR),
+            "{next_action}"
+        );
+        assert!(
+            next_action.contains("The app came back without its workspace, so there is no direct Share & manage link. Tell the owner: Open Share & manage at https://app.builderlab.xyz/hosted-apps and choose demo."),
+            "{next_action}"
+        );
     }
 
     #[test]
