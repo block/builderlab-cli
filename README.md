@@ -329,11 +329,15 @@ change the workstation's active workspace or rotate a session.
 
 ### App completion handoff
 
-After readiness, `bl apps handoff APP_ID --json` reads the current app and audience
-and returns an exact `management_url` into its Share & manage panel. Configure
-`BL_APPS_MANAGEMENT_BASE_URL` (or `--management-base-url`) with the HTTPS portal
-origin for the same environment. The CLI does not derive a portal from a mesh
-hostname. Keep the configured control-plane origin for delegated authentication.
+After readiness, `bl apps handoff APP_ID --json` reads the current app and audience.
+When `--management-base-url` or `BL_APPS_MANAGEMENT_BASE_URL` gives the HTTPS portal
+origin for the same environment, it also returns an exact `management_url` into the
+app's Share & manage panel; the flag wins over the variable. Without an origin, or
+with a blank one, handoff still reports the audience, returns `management_url: null`,
+and its `next_action` points the owner to Hosted Apps in the BuilderLab portal. An
+origin that is set but invalid is an error. The CLI never guesses the portal from a
+workstation, app or mesh hostname. Keep the configured control-plane origin for
+delegated authentication.
 
 The result separates verified policy from unknown access and does not claim
 recipient browser acceptance. It performs no sharing, session switch, or deployment.
