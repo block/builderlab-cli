@@ -652,32 +652,20 @@ fn configured_management_portal(flag: Option<&String>) -> Result<Option<url::Url
         .transpose()
 }
 
-/// Next step for an owner who needs the Share & manage page for an app.
-fn share_and_manage_step(
-    portal: Option<&url::Url>,
-    app_id: &str,
-    workspace_id: Option<&str>,
-) -> String {
-    match (
-        portal.and_then(|portal| portal.join("/hosted-apps").ok()),
-        workspace_id,
-    ) {
-        // The portal opens an app's dialog only when it gets both `app` and `workspace`.
-        (Some(mut link), Some(workspace_id)) => {
-            link.query_pairs_mut()
-                .append_pair("app", app_id)
-                .append_pair("workspace", workspace_id);
-            format!("Open Share & manage for this app at {link}.")
-        }
-        (Some(link), None) => format!("Open Share & manage at {link} and choose {app_id}."),
-        (None, _) => "Use the Share & manage dialog in the browser for this app.".to_string(),
+/// Next step for an owner who needs Share & manage for an app. The portal opens
+/// an app's dialog only for `app` plus `workspace`, and the community routes
+/// never report a workspace, so name the app instead of deep-linking.
+fn share_and_manage_step(portal: Option<&url::Url>, app_id: &str) -> String {
+    match portal.and_then(|portal| portal.join("/hosted-apps").ok()) {
+        Some(link) => format!("Open Share & manage at {link} and choose {app_id}."),
+        None => "Use the Share & manage dialog in the browser for this app.".to_string(),
     }
 }
 
-fn community_share_and_manage_step(app_id: &str, workspace_id: Option<&str>) -> String {
+fn community_share_and_manage_step(app_id: &str) -> String {
     // An unusable origin only drops the link; the failure it decorates stands.
     let portal = configured_management_portal(None).ok().flatten();
-    share_and_manage_step(portal.as_ref(), app_id, workspace_id)
+    share_and_manage_step(portal.as_ref(), app_id)
 }
 
 fn build_app_handoff(
@@ -1257,8 +1245,7 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     if proxy_auth_for_url(base_url) {
         let next_action = format!(
             "{} Or run `bl apps community` with `--base-url` set to an approved BuilderLab ingress after `bl auth login`.",
-            // Refusing happens before any request, so the workspace is unknown.
-            community_share_and_manage_step(app_id, None)
+            community_share_and_manage_step(app_id)
         );
         let mut error = CliFailure::new(
             exit_codes::GENERAL,
@@ -1283,13 +1270,7 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         .ok_or_else(|| {
             let next_action = format!(
                 "{} Check that the app is shared there, then retry.",
-                community_share_and_manage_step(
-                    app_id,
-                    current
-                        .get("workspace_id")
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.is_empty())
-                )
+                community_share_and_manage_step(app_id)
             );
             let mut error = CliFailure::new(
                 exit_codes::GENERAL,
@@ -7784,27 +7765,14 @@ mod tests {
 
     #[test]
     fn bl_apps_community_missing_lifecycle_tells_the_owner_to_open_share_and_manage() {
-        for (portal, workspace, expected) in [
+        for (portal, expected) in [
             (
                 Some("https://app.builderlab.xyz"),
-                None,
                 "at https://app.builderlab.xyz/hosted-apps and choose my-app.",
             ),
-            (
-                Some("https://app.builderlab.xyz"),
-                Some("owning-workspace"),
-                "at https://app.builderlab.xyz/hosted-apps?app=my-app&workspace=owning-workspace.",
-            ),
-            (
-                None,
-                Some("owning-workspace"),
-                "Share & manage dialog in the browser",
-            ),
+            (None, "Share & manage dialog in the browser"),
         ] {
-            let mut sharing = json!({"ok": true, "community_grant_revision": 7});
-            if let Some(workspace) = workspace {
-                sharing["workspace_id"] = json!(workspace);
-            }
+            let sharing = json!({"ok": true, "community_grant_revision": 7});
             let auth_server = ProcessServer::start(vec![process_auth_response()]);
             let control_plane = ProcessServer::start(vec![
                 ProcessResponse::json(sharing).with_trace_id(REQUEST_TRACE_ID)
