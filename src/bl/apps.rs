@@ -748,7 +748,8 @@ fn community_names(config: &SkillsConfig, ids: Option<&Value>) -> BTreeMap<Strin
     if ids.and_then(Value::as_array).is_none_or(Vec::is_empty) {
         return BTreeMap::new();
     }
-    joined_communities_for(config)
+    // Only decoration: don't hold up the answer for long if Kgoose is slow.
+    joined_communities_for(config, Duration::from_secs(5))
         .unwrap_or_default()
         .iter()
         .filter_map(|community| {
@@ -1556,7 +1557,7 @@ const JOINED_COMMUNITIES_PATH: &str = "/v1/buzz/joined-communities/list";
 /// Kgoose resolves the caller's linked Buzz identity and asks the relay which
 /// communities it has joined, the same list Share & manage offers.
 fn run_community_list(config: &SkillsConfig) -> Result<()> {
-    let communities = joined_communities_for(config)?;
+    let communities = joined_communities_for(config, Duration::from_secs(30))?;
     if config.json {
         return print_json(&json!({"ok": true, "communities": communities}));
     }
@@ -1564,7 +1565,7 @@ fn run_community_list(config: &SkillsConfig) -> Result<()> {
     Ok(())
 }
 
-fn joined_communities_for(config: &SkillsConfig) -> Result<Vec<Value>> {
+fn joined_communities_for(config: &SkillsConfig, timeout: Duration) -> Result<Vec<Value>> {
     let storage = default_session_storage(config)?;
     let session = storage
         .get(&session_storage_key_from_config(config))?
@@ -1572,7 +1573,7 @@ fn joined_communities_for(config: &SkillsConfig) -> Result<Vec<Value>> {
         .ok_or_else(auth_required_error)?;
     let service_url = kgoose_service_url(&config.kgoose_base_url, &config.kgoose_service_path);
     let url = auth_url(&service_url, JOINED_COMMUNITIES_PATH)?;
-    let mut request = build_auth_http_client(Duration::from_secs(30))?
+    let mut request = build_auth_http_client(timeout)?
         .post(url)
         .header(USER_AGENT, CLI_USER_AGENT)
         .header(ACCEPT, "application/json")
