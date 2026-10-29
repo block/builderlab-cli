@@ -191,6 +191,12 @@ pub fn command() -> Command {
                         .value_name("MODE")
                         .value_parser(["none", "sqlite", "mysql"])
                         .help("Requested persistence mode (mysql requires --runtime-profile process or fetch-js)"),
+                )
+                .arg(
+                    Arg::new("private")
+                        .long("private")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Make the app private before initialization, so only its owner, publishers and people you add can view it"),
                 ),
         ))
         .subcommand(control_plane_args(
@@ -483,6 +489,36 @@ pub fn command() -> Command {
                 .subcommand(community_action_command("grant"))
                 .subcommand(community_action_command("revoke")),
         )
+        .subcommand(control_plane_args(
+            Command::new("visibility")
+                .about("Switch an app between its workspace and private audiences")
+                .long_about(
+                    "Choose who can view an app without changing anyone added to it. `workspace` lets \
+                     everyone in the app's workspace view it. `private` limits it to the owner, \
+                     publishers, explicit viewers and shared communities. Viewers, publishers and \
+                     community grants are kept either way. Only the original owner may change \
+                     visibility. Use `bl apps handoff` to confirm the resulting audience.",
+                )
+                .arg(
+                    Arg::new("app-id")
+                        .value_name("APP_ID")
+                        .required(true)
+                        .help("App identifier returned by `bl apps list` or `bl apps create`"),
+                )
+                .arg(
+                    Arg::new("audience")
+                        .value_name("AUDIENCE")
+                        .value_parser(["workspace", "private"])
+                        .required(true)
+                        .help("`workspace` for everyone in your workspace, `private` for only people you add"),
+                )
+                .arg(
+                    Arg::new("environment")
+                        .long("environment")
+                        .value_name("ENVIRONMENT")
+                        .help("Optional Compose environment override"),
+                ),
+        ))
 }
 
 fn community_action_command(action: &'static str) -> Command {
@@ -553,6 +589,7 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("debug", debug_matches)) => run_debug(config, debug_matches),
         Some(("access", access_matches)) => run_access(config, access_matches),
         Some(("community", community_matches)) => run_community(config, community_matches),
+        Some(("visibility", visibility_matches)) => run_visibility(config, visibility_matches),
         _ => anyhow::bail!("expected an apps subcommand"),
     }
 }
@@ -787,6 +824,19 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let mutation_request = mutation_request_from_plan(&plan);
     let (reservation, reservation_reconciled) =
         reconcile_create_reservation(&client, &credential, &app_id, &plan, &mutation_request)?;
+    // Private is applied before initialization so a private app is never visible.
+    let visibility = if matches.get_flag("private") {
+        let environment = mutation_request.get("environment").and_then(Value::as_str);
+        let response = client
+            .set_visibility(&credential, &app_id, PRIVATE_VISIBILITY, environment)
+            .and_then(|response| require_visibility(&app_id, PRIVATE_VISIBILITY, response))
+            .with_context(|| {
+                format!("Apps Platform reserved app_id {app_id:?}, but did not make it private. Do not deploy it. After fixing the error, run `bl apps visibility {app_id} private` or retry the same `bl apps create --private` command.")
+            })?;
+        Some(response)
+    } else {
+        None
+    };
     let initialize = if plan_requests_initialize {
         let response = client
             .initialize(&credential, &app_id, &mutation_request)
@@ -826,6 +876,7 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         "initialized": initialize.is_some(),
         "plan": plan,
         "reservation": reservation,
+        "visibility": visibility,
         "initialize": initialize,
     }))
 }
@@ -1243,6 +1294,46 @@ fn run_access_set(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     print_json(&response)
 }
 
+const WORKSPACE_VISIBILITY: &str = "organization";
+const PRIVATE_VISIBILITY: &str = "restricted";
+
+fn run_visibility(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let app_id = matches
+        .get_one::<String>("app-id")
+        .context("expected app id")?;
+    let visibility = match matches
+        .get_one::<String>("audience")
+        .map(String::as_str)
+        .context("expected app audience")?
+    {
+        "workspace" => WORKSPACE_VISIBILITY,
+        "private" => PRIVATE_VISIBILITY,
+        audience => anyhow::bail!("unknown app audience {audience:?}"),
+    };
+    let environment = matches.get_one::<String>("environment").map(String::as_str);
+    let (client, credential) = control_plane_context(config, matches)?;
+    let response = client.set_visibility(&credential, app_id, visibility, environment)?;
+    print_json(&require_visibility(app_id, visibility, response)?)
+}
+
+/// Accepts a visibility response only when it reports the requested app and visibility.
+fn require_visibility(app_id: &str, visibility: &str, response: Value) -> Result<Value> {
+    let updated_app_id = required_response_string(&response, "app_id", "Apps Platform visibility")?;
+    require_exact_app_id("visibility", app_id, updated_app_id)
+        .map_err(|error| correlate_response_error(error, &response))?;
+    let updated_visibility =
+        required_response_string(&response, "visibility", "Apps Platform visibility")?;
+    if updated_visibility != visibility {
+        return Err(correlate_response_error(
+            anyhow::anyhow!(
+                "Apps Platform visibility returned {updated_visibility:?}; expected {visibility:?}"
+            ),
+            &response,
+        ));
+    }
+    Ok(response)
+}
+
 fn control_plane_context(
     config: &SkillsConfig,
     matches: &ArgMatches,
@@ -1284,6 +1375,13 @@ struct RollbackRequest<'a> {
 #[derive(Serialize)]
 struct DeleteAppRequest<'a> {
     environment: &'a str,
+}
+
+#[derive(Serialize)]
+struct VisibilityRequest<'a> {
+    visibility: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1841,6 +1939,27 @@ impl ControlPlaneClient {
                 .json(request)
                 .build()
                 .context("build Apps Platform access update request")
+        })
+    }
+
+    fn set_visibility(
+        &self,
+        credential: &ComposeSessionCredential,
+        app_id: &str,
+        visibility: &str,
+        environment: Option<&str>,
+    ) -> Result<Value> {
+        let url = self.app_resource_url(app_id, "visibility", &[])?;
+        let path = url.path().to_string();
+        let request = VisibilityRequest {
+            visibility,
+            environment,
+        };
+        self.authorized_json_request(credential, "PUT", &path, |authorization| {
+            self.standard_request(self.client.put(url.clone()), authorization)
+                .json(&request)
+                .build()
+                .context("build Apps Platform visibility update request")
         })
     }
 
@@ -3821,6 +3940,7 @@ mod tests {
             assert_eq!(value["initialized"], true);
             assert_eq!(value["plan"], plan);
             assert_eq!(value["reservation"], reservation);
+            assert_eq!(value["visibility"], Value::Null);
             assert_eq!(value["initialize"], initialized);
             let auth_requests = auth_server.finish();
             let requests = control_plane.finish();
@@ -7620,6 +7740,351 @@ mod tests {
             assert!(auth_server.finish().is_empty());
             assert!(control_plane.finish().is_empty());
         }
+    }
+
+    fn private_create_plan() -> Value {
+        json!({
+            "app_id": "merchant-lookup",
+            "environment": "staging",
+            "persistence": "sqlite",
+            "runtime_profile": "fetch-js",
+            "runtime_class": "default",
+            "initialize": {"required": true, "recommended": false}
+        })
+    }
+
+    fn private_create_command(
+        auth_server: &ProcessServer,
+        control_plane: &ProcessServer,
+        credential: &str,
+    ) -> ProcessCommand {
+        process_command(
+            auth_server,
+            control_plane,
+            &[
+                "apps",
+                "create",
+                "--app-id",
+                "merchant-lookup",
+                "--environment",
+                "staging",
+                "--private",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--client-version",
+                "0.2.0",
+                "--json",
+            ],
+            credential,
+        )
+    }
+
+    #[test]
+    fn bl_apps_create_private_sets_visibility_after_reserve_and_before_initialize() {
+        let credential = "apps-e2e-only.private.session+credential";
+        let visibility = json!({
+            "ok": true,
+            "app_id": "merchant-lookup",
+            "visibility": "restricted",
+            "viewers": [],
+        });
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(private_create_plan()),
+            ProcessResponse::json(json!({"app_id": "merchant-lookup"})),
+            ProcessResponse::json(visibility.clone()),
+            ProcessResponse::json(json!({
+                "app_id": "merchant-lookup",
+                "external_url": "https://merchant-lookup--bpsites.example/"
+            })),
+        ]);
+        let output = private_create_command(&auth_server, &control_plane, credential)
+            .output()
+            .expect("run private create process");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = serde_json::from_str::<Value>(&process_stdout(&output)).unwrap();
+        assert_eq!(value["visibility"], visibility);
+        assert_eq!(value["initialized"], true);
+        assert_process_auth(&auth_server.finish()[0], credential);
+        let requests = control_plane.finish();
+        let order: Vec<_> = requests
+            .iter()
+            .map(|request| (request.method.as_str(), request.path.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("POST", APPS_PLAN_PATH),
+                ("POST", "/v1/agent/apps/merchant-lookup/reserve"),
+                ("PUT", "/v1/agent/apps/merchant-lookup/visibility"),
+                ("POST", "/v1/agent/apps/merchant-lookup/initialize"),
+            ]
+        );
+        assert_process_control_plane(
+            &requests[2],
+            "PUT",
+            "/v1/agent/apps/merchant-lookup/visibility",
+            credential,
+        );
+        assert_eq!(
+            requests[2].body,
+            json!({"visibility": "restricted", "environment": "staging"})
+        );
+    }
+
+    #[test]
+    fn bl_apps_create_private_stops_before_initialize_when_app_is_not_private() {
+        for (response, expected) in [
+            (
+                ProcessResponse::raw(403, json!({"error": {"code": "access_denied"}}).to_string())
+                    .with_trace_id(REQUEST_TRACE_ID),
+                "access_denied",
+            ),
+            (
+                ProcessResponse::json(json!({
+                    "ok": true,
+                    "app_id": "merchant-lookup",
+                    "visibility": "organization",
+                })),
+                "Apps Platform visibility returned",
+            ),
+            (
+                ProcessResponse::json(json!({
+                    "ok": true,
+                    "app_id": "other-app",
+                    "visibility": "restricted",
+                })),
+                "No replacement app was accepted",
+            ),
+        ] {
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![
+                ProcessResponse::json(private_create_plan()),
+                ProcessResponse::json(json!({"app_id": "merchant-lookup"})),
+                response,
+            ]);
+            let output = private_create_command(
+                &auth_server,
+                &control_plane,
+                "apps-e2e-only.private-denied.session",
+            )
+            .output()
+            .expect("run failed private create process");
+            assert!(!output.status.success());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr.contains("did not make it private. Do not deploy it."),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("run `bl apps visibility merchant-lookup private`"),
+                "{stderr}"
+            );
+            assert!(stderr.contains(expected), "{stderr}");
+            auth_server.finish();
+            let requests = control_plane.finish();
+            assert_eq!(
+                requests.len(),
+                3,
+                "no initialize after a failed private setup"
+            );
+            assert_eq!(requests[2].method, "PUT");
+            assert_eq!(
+                requests[2].path,
+                "/v1/agent/apps/merchant-lookup/visibility"
+            );
+        }
+    }
+
+    #[test]
+    fn bl_apps_create_private_retry_reconciles_the_reservation_then_makes_it_private() {
+        let credential = "apps-e2e-only.private-retry.session";
+        let collision = ProcessResponse::json_status(
+            409,
+            json!({"ok": false, "error": {"code": "app_id_collision"}}),
+        );
+        // Setting visibility leaves route_revision at 1, so the earlier
+        // reservation still matches on retry.
+        let existing_reservation = json!({
+            "ok": true,
+            "app": {
+                "app_id": "merchant-lookup",
+                "environment": "staging",
+                "persistence": "sqlite",
+                "runtime_class": "default",
+                "runtime_profile": "fetch-js",
+                "role": "owner",
+                "status": "idle",
+                "route_status": "idle",
+                "route_revision": 1
+            },
+            "versions": []
+        });
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(private_create_plan()),
+            collision,
+            ProcessResponse::json(existing_reservation),
+            ProcessResponse::json(json!({
+                "ok": true,
+                "app_id": "merchant-lookup",
+                "visibility": "restricted",
+                "viewers": [],
+            })),
+            ProcessResponse::json(json!({
+                "app_id": "merchant-lookup",
+                "external_url": "https://merchant-lookup--bpsites.example/"
+            })),
+        ]);
+        let output = private_create_command(&auth_server, &control_plane, credential)
+            .output()
+            .expect("run private create retry process");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = serde_json::from_str::<Value>(&process_stdout(&output)).unwrap();
+        assert_eq!(value["reservation_reconciled"], true);
+        assert_eq!(value["visibility"]["visibility"], "restricted");
+        auth_server.finish();
+        let order: Vec<_> = control_plane
+            .finish()
+            .into_iter()
+            .map(|request| (request.method, request.path))
+            .collect();
+        let path = |path: &str| path.to_string();
+        assert_eq!(
+            order,
+            [
+                (path("POST"), path(APPS_PLAN_PATH)),
+                (path("POST"), path("/v1/agent/apps/merchant-lookup/reserve")),
+                (
+                    path("GET"),
+                    path("/v1/agent/apps/merchant-lookup?environment=staging")
+                ),
+                (
+                    path("PUT"),
+                    path("/v1/agent/apps/merchant-lookup/visibility")
+                ),
+                (
+                    path("POST"),
+                    path("/v1/agent/apps/merchant-lookup/initialize")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn bl_apps_visibility_switches_only_the_base_audience() {
+        for (audience, visibility) in [("workspace", "organization"), ("private", "restricted")] {
+            let credential = "apps-e2e-only.visibility.session";
+            let updated = json!({
+                "ok": true,
+                "app_id": "my-app",
+                "visibility": visibility,
+                "viewers": ["carol"],
+                "shared_communities": ["buzz-alpha"],
+            });
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![ProcessResponse::json(updated.clone())]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "visibility",
+                    "my-app",
+                    audience,
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--json",
+                ],
+                credential,
+            )
+            .output()
+            .expect("run visibility process");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value = serde_json::from_str::<Value>(&process_stdout(&output)).unwrap();
+            assert_eq!(value, updated);
+            assert_process_auth(&auth_server.finish()[0], credential);
+            let requests = control_plane.finish();
+            assert_eq!(requests.len(), 1);
+            let path = "/v1/agent/apps/my-app/visibility";
+            assert_process_control_plane(&requests[0], "PUT", path, credential);
+            // Only the visibility is sent, so viewers and grants are never replaced.
+            assert_eq!(requests[0].body, json!({"visibility": visibility}));
+        }
+    }
+
+    #[test]
+    fn bl_apps_visibility_rejects_a_response_for_another_audience() {
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![ProcessResponse::json(json!({
+            "ok": true,
+            "app_id": "my-app",
+            "visibility": "organization",
+        }))]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "visibility",
+                "my-app",
+                "private",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--json",
+            ],
+            "apps-e2e-only.visibility-mismatch.session",
+        )
+        .output()
+        .expect("run mismatched visibility process");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("Apps Platform visibility returned"),
+            "{stderr}"
+        );
+        auth_server.finish();
+        assert_eq!(control_plane.finish().len(), 1);
+    }
+
+    #[test]
+    fn visibility_accepts_only_user_facing_audiences_before_auth_or_network() {
+        for audience in ["organization", "restricted", "public"] {
+            let error = command()
+                .try_get_matches_from([
+                    "apps",
+                    "visibility",
+                    "app",
+                    audience,
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                ])
+                .expect_err("reject internal or unknown audience");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        }
+        let mut apps = command();
+        let help = apps.render_long_help().to_string();
+        assert!(help.contains("\n  visibility"), "{help}");
+        let create = apps.find_subcommand_mut("create").unwrap();
+        assert!(create.render_long_help().to_string().contains("--private"));
+        let described = describe_commands();
+        assert!(described["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["name"] == "visibility"));
     }
 
     #[test]
