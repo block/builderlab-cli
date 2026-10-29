@@ -327,15 +327,33 @@ matching Roxy policy deployed.
 `bl workspace switch` continues to require a local CLI login; listing does not
 change the workstation's active workspace or rotate a session.
 
-### App completion handoff
+### Who can open an app
 
-After readiness, `bl apps handoff APP_ID --json` reads the current app and audience
-and returns an exact `management_url` into its Share & manage panel. Configure
-`BL_APPS_MANAGEMENT_BASE_URL` (or `--management-base-url`) with the HTTPS portal
-origin for the same environment. The CLI does not derive a portal from a mesh
-hostname. Keep the configured control-plane origin for delegated authentication.
+After readiness, `bl apps get APP_ID` shows the app, who can open it and its Share &
+manage link, for example:
+
+```text
+Who can open it: Only you. So can members of the Buzz community Alpha Team.
+```
+
+`bl apps visibility APP_ID workspace|private` switches between everyone in the app's
+workspace and only you, and `bl apps community grant|revoke APP_ID COMMUNITY_ID`
+shares with a Buzz community; `bl apps community list` shows the IDs. Each prints who
+can open the app afterwards. Add `--json` for the full response. `get --json` keeps
+the inspection fields and adds `who_can_open`, `audience`, `app_url`,
+`management_url` and `next_action` beside them. `bl apps handoff` is a hidden alias
+for `get`, kept for older scripts.
+
+When `--management-base-url` or `BL_APPS_MANAGEMENT_BASE_URL` gives the HTTPS portal
+origin for the same environment, `get` also returns an exact `management_url` into the
+app's Share & manage panel; the flag wins over the variable. Without an origin, or
+with a blank one, it still reports the audience, returns `management_url: null`,
+and points the owner to Hosted Apps in the BuilderLab portal. An invalid
+`--management-base-url` is an error before any request; an invalid
+`BL_APPS_MANAGEMENT_BASE_URL` only drops the link and says why. The CLI never guesses the portal from a workstation, app or
+mesh hostname. Keep the configured control-plane origin for delegated authentication.
 
 The result separates verified policy from unknown access and does not claim
-recipient browser acceptance. It performs no sharing, session switch, or deployment.
-If policy inspection is unavailable, agents must report the audience as unknown.
+recipient browser acceptance. `get` performs no sharing, session switch, or deployment.
+If policy inspection is unavailable, the audience is reported as unknown.
 Portal deep links require the matching portal and Kgoose workspace-selection changes.
