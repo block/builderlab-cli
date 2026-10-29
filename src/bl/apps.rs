@@ -608,7 +608,9 @@ fn build_app_handoff(
         .map(|error| handoff_read_failure_reason(error));
     let verified = access.ok().filter(|policy| {
         let string_array = |field| {
-            policy.get(field).and_then(Value::as_array)
+            policy
+                .get(field)
+                .and_then(Value::as_array)
                 .is_some_and(|values| values.iter().all(Value::is_string))
         };
         policy.get("ok") == Some(&Value::Bool(true))
@@ -617,14 +619,12 @@ fn build_app_handoff(
                 policy.get("visibility").and_then(Value::as_str),
                 Some("organization" | "restricted")
             )
-            // Compose omits empty grant arrays. Both non-optional revisions
-            // establish that this response reports workspace AND community grants.
-            && ["workspace_grant_revision", "community_grant_revision"].iter()
-                .all(|field| policy.get(field).and_then(Value::as_u64).is_some())
+            // Compose omits an empty community list but always reports its revision.
+            && policy.get("community_grant_revision").and_then(Value::as_u64).is_some()
             && string_array("viewers")
             && (policy.get("visibility").and_then(Value::as_str) != Some("restricted")
                 || string_array("effective_viewers"))
-            && ["shared_workspace_ids", "shared_community_ids", "effective_viewers", "publishers"].iter()
+            && ["shared_community_ids", "effective_viewers", "publishers"].iter()
                 .all(|field| policy.get(field).is_none() || string_array(field))
     });
     let reason = verified
@@ -2266,7 +2266,7 @@ fn control_plane_http_failure(
             })
             .and_then(|value| sanitize_recovery_field(value, credential))
             .or_else(|| (status == StatusCode::FORBIDDEN).then(|| json!(
-                "Check Apps access for this account and environment, and your workspace and app permissions. Use `bl workspace list` and `bl workspace switch` to check the active workspace."
+                "Check Apps access for this account and environment, and your workspace and app permissions. Ask the app owner to confirm your viewing or publishing access."
             )))
     };
     let mut message = format!("{method} {path} failed with {status} ({code})");
@@ -2496,19 +2496,19 @@ mod tests {
     }
 
     #[test]
-    fn handoff_requires_complete_workspace_and_community_grant_reporting() {
+    fn handoff_requires_complete_community_grant_reporting() {
         let portal = management_portal_url("https://app.builderlab.xyz").unwrap();
         let app = json!({"app":{"app_id":"demo","workspace_id":"team"}});
         for visibility in ["restricted", "organization"] {
-            // Compose omits empty grant arrays, but always reports both revisions.
+            // No legacy workspace-grant fields are needed to confirm the audience.
             let complete = json!({"ok":true,"app_id":"demo","visibility":visibility,
                 "viewers":[],"effective_viewers":["owner"],
-                "workspace_grant_revision":0,"community_grant_revision":0});
+                "community_grant_revision":0});
             let result = build_app_handoff("demo", &portal, &app, Ok(&complete)).unwrap();
             assert_eq!(result["audience"]["status"], "verified");
             assert_eq!(result["audience"]["policy"], complete);
 
-            for field in ["workspace_grant_revision", "community_grant_revision"] {
+            for field in ["community_grant_revision"] {
                 for invalid in [
                     None,
                     Some(Value::Null),
@@ -2530,7 +2530,6 @@ mod tests {
                 }
             }
             for field in [
-                "shared_workspace_ids",
                 "shared_community_ids",
                 "viewers",
                 "effective_viewers",
@@ -2996,6 +2995,8 @@ mod tests {
                 assert!(!stderr.contains(credential));
                 assert!(!stderr.contains("private-diagnostic"));
                 assert!(!stderr.contains("apps@example.com"));
+                assert!(!stderr.contains("bl workspace switch"));
+                assert!(!stderr.contains("bl workspace list"));
                 if code != "account_setup_required" {
                     assert!(!stderr.contains("Finish account setup"));
                 }
