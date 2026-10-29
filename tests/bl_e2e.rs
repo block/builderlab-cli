@@ -3998,7 +3998,7 @@ fn bl_apps_delete_requires_an_explicit_environment() {
 }
 
 #[test]
-fn bl_apps_access_help_exposes_get_and_full_policy_replacement() {
+fn bl_apps_access_help_points_to_visibility_and_keeps_hidden_replacement_working() {
     let access_output = bl_command()
         .args(["apps", "access", "--help"])
         .output()
@@ -4008,12 +4008,14 @@ fn bl_apps_access_help_exposes_get_and_full_policy_replacement() {
         access_output.status.success(),
         "stderr was: {access_stderr}"
     );
-    for expected in ["get", "set", "visibility and explicit viewer list"] {
+    for expected in ["get", "bl apps visibility", "bl apps community"] {
         assert!(
             access_stdout.contains(expected),
             "access help omitted {expected:?}: {access_stdout}"
         );
     }
+    // Individual viewers are out of the help; `set` still runs for older scripts.
+    assert!(!access_stdout.contains("\n  set "), "{access_stdout}");
 
     let get_output = bl_command()
         .args(["apps", "access", "get", "--help"])

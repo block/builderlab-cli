@@ -8,6 +8,7 @@
 //! `ext_authz` and removes it before forwarding the request internally. Compose
 //! never receives the session credential.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -69,7 +70,7 @@ const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
 ];
 
 pub fn command() -> Command {
-    let about = "Manage apps through the BuilderLab Apps Platform. Use `bl apps handoff` to inspect the audience, and `bl apps community` or Share & manage for community sharing.";
+    let about = "Manage apps through the BuilderLab Apps Platform. `bl apps get` shows who can open an app and links to Share & manage. `bl apps visibility` switches an app between your workspace and only you, and `bl apps community` shares it with a Buzz community.";
     Command::new("apps")
         .about("Manage apps through Apps Platform")
         .long_about(about)
@@ -107,22 +108,7 @@ pub fn command() -> Command {
                         .help("Include logically deleted apps"),
                 ),
         ))
-        .subcommand(control_plane_args(
-            Command::new("get")
-                .about("Get one manageable app and its recorded versions")
-                .arg(
-                    Arg::new("app-id")
-                        .value_name("APP_ID")
-                        .required(true)
-                        .help("App identifier returned by `bl apps list` or `bl apps create`"),
-                )
-                .arg(
-                    Arg::new("environment")
-                        .long("environment")
-                        .value_name("ENVIRONMENT")
-                        .help("Optional Compose environment override"),
-                ),
-        ))
+        .subcommand(control_plane_args(app_get_command("get")))
         .subcommand(control_plane_args(
             Command::new("versions")
                 .about("List active and rollback-candidate versions for an app")
@@ -197,17 +183,11 @@ pub fn command() -> Command {
                     Arg::new("private")
                         .long("private")
                         .action(clap::ArgAction::SetTrue)
-                        .help("Make the app private before initialization, so only its owner, publishers and people you add can view it"),
+                        .help("Make the app private before initialization, so only you and its publishers can open it until you share it"),
                 ),
         ))
-        .subcommand(control_plane_args(
-            Command::new("handoff")
-                .about("Read the app audience and build its Share & manage link")
-                .long_about("Read an existing app and its access policy without changing either. The audience is reported without a portal origin. To also print the Share & manage link, pass the portal origin for the same environment through --management-base-url or BL_APPS_MANAGEMENT_BASE_URL; without it the link is omitted. Readiness and recipient browser access must be verified separately.")
-                .arg(Arg::new("app-id").value_name("APP_ID").required(true))
-                .arg(Arg::new("environment").long("environment").value_name("ENVIRONMENT"))
-                .arg(Arg::new("management-base-url").long("management-base-url").value_name("HTTPS_PORTAL_ORIGIN")),
-        ))
+        // Older skills call `handoff`; it prints exactly what `get` prints.
+        .subcommand(control_plane_args(app_get_command("handoff").hide(true)))
         .subcommand(control_plane_args(
             Command::new("initialize")
                 .about("Initialize or repair an existing app stack and persistence")
@@ -397,11 +377,13 @@ pub fn command() -> Command {
         ))
         .subcommand(
             Command::new("access")
-                .about("Read or update an app's viewer access policy")
+                .about("Read an app's stored access policy")
                 .long_about(
-                    "Read or update an Apps Platform app's visibility and explicit viewer list. \
-                     Approved publishers may read access settings, while only the original owner \
-                     may update them.",
+                    "Read the access policy behind `bl apps get`, as Apps Platform stores it. \
+                     Visibility `organization` means everyone in the app's workspace and \
+                     `restricted` means private. To change who can open an app, use \
+                     `bl apps visibility` or `bl apps community`. Approved publishers may read \
+                     access settings.",
                 )
                 .subcommand_required(true)
                 .arg_required_else_help(true)
@@ -422,8 +404,11 @@ pub fn command() -> Command {
                                 .help("Optional Compose environment override"),
                         ),
                 ))
+                // Replaced by `bl apps visibility`, which keeps community grants
+                // and existing viewers. Hidden, not removed, for older scripts.
                 .subcommand(control_plane_args(
                     Command::new("set")
+                        .hide(true)
                         .about("Replace an app's visibility and explicit viewer list")
                         .long_about(
                             "Replace an app's complete access policy. For restricted visibility, \
@@ -481,8 +466,9 @@ pub fn command() -> Command {
                     "Grant or revoke viewing access for current members of a Buzz community. \
                      The app owner must be a current member of the community to grant access, but can revoke after leaving it. \
                      A grant adds viewers and never changes the app's visibility. Community viewers can view the app \
-                     but cannot use its hosted tools. Use `bl apps handoff` to confirm the resulting audience. \
-                     Not yet available through the Blox workstation proxy; use Share & manage or an approved ingress.",
+                     but cannot use its hosted tools. Use `bl apps get` to see who can open the app afterwards. \
+                     `bl apps community list` shows the communities you can share with. Granting and revoking \
+                     don't work from a Blox workstation yet; use Share & manage in the BuilderLab portal there.",
                 )
                 .subcommand_required(true)
                 .arg_required_else_help(true)
@@ -502,11 +488,11 @@ pub fn command() -> Command {
             Command::new("visibility")
                 .about("Switch an app between its workspace and private audiences")
                 .long_about(
-                    "Choose who can view an app without changing anyone added to it. `workspace` lets \
-                     everyone in the app's workspace view it. `private` limits it to the owner, \
-                     publishers, explicit viewers and shared communities. Viewers, publishers and \
-                     community grants are kept either way. Only the original owner may change \
-                     visibility. Use `bl apps handoff` to confirm the resulting audience.",
+                    "Choose who can open an app. `workspace` lets everyone in the app's workspace \
+                     open it. `private` limits it to you and its publishers. Buzz communities you \
+                     shared it with keep access either way, so switching back and forth loses \
+                     nothing. Only the app's owner may change this. Prints who can open the app \
+                     afterwards.",
                 )
                 .arg(
                     Arg::new("app-id")
@@ -519,7 +505,7 @@ pub fn command() -> Command {
                         .value_name("AUDIENCE")
                         .value_parser(["workspace", "private"])
                         .required(true)
-                        .help("`workspace` for everyone in your workspace, `private` for only people you add"),
+                        .help("`workspace` for everyone in the app's workspace, `private` for only you"),
                 )
                 .arg(
                     Arg::new("environment")
@@ -530,6 +516,37 @@ pub fn command() -> Command {
         ))
 }
 
+fn app_get_command(name: &'static str) -> Command {
+    Command::new(name)
+        .about("Show an app, who can open it, and its Share & manage link")
+        .long_about(
+            "Show an app and who can open it, without changing anything. The audience is read \
+             from the app's access policy; if that read fails, it is reported as unknown rather \
+             than guessed. To also print the Share & manage link, pass the portal origin for \
+             the same environment with --management-base-url or BL_APPS_MANAGEMENT_BASE_URL. \
+             Add --json for every field, including recorded versions. Whether a recipient's \
+             browser can open the app is not checked.",
+        )
+        .arg(
+            Arg::new("app-id")
+                .value_name("APP_ID")
+                .required(true)
+                .help("App identifier returned by `bl apps list` or `bl apps create`"),
+        )
+        .arg(
+            Arg::new("environment")
+                .long("environment")
+                .value_name("ENVIRONMENT")
+                .help("Optional Compose environment override"),
+        )
+        .arg(
+            Arg::new("management-base-url")
+                .long("management-base-url")
+                .value_name("HTTPS_PORTAL_ORIGIN")
+                .help("BuilderLab portal origin used to build the Share & manage link"),
+        )
+}
+
 fn community_action_command(action: &'static str) -> Command {
     control_plane_args(
         Command::new(action)
@@ -538,12 +555,17 @@ fn community_action_command(action: &'static str) -> Command {
             } else {
                 "Remove a Buzz community's viewing access to an app"
             })
-            .arg(Arg::new("app-id").value_name("APP_ID").required(true))
+            .arg(
+                Arg::new("app-id")
+                    .value_name("APP_ID")
+                    .required(true)
+                    .help("App identifier returned by `bl apps list` or `bl apps create`"),
+            )
             .arg(
                 Arg::new("community-id")
                     .value_name("COMMUNITY_ID")
                     .required(true)
-                    .help("Buzz community identifier"),
+                    .help("Buzz community ID, as listed by `bl apps community list`"),
             ),
     )
 }
@@ -587,7 +609,7 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("contract", contract_matches)) => run_contract(config, contract_matches),
         Some(("list", list_matches)) => run_list(config, list_matches),
         Some(("get", get_matches)) => run_get(config, get_matches),
-        Some(("handoff", handoff_matches)) => run_handoff(config, handoff_matches),
+        Some(("handoff", handoff_matches)) => run_get(config, handoff_matches),
         Some(("versions", versions_matches)) => run_versions(config, versions_matches),
         Some(("create", create_matches)) => run_create(config, create_matches),
         Some(("initialize", initialize_matches)) => run_initialize(config, initialize_matches),
@@ -626,13 +648,162 @@ fn run_list(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
 }
 
 fn run_get(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let portal = configured_management_portal(matches.get_one::<String>("management-base-url"))?;
     let app_id = matches
         .get_one::<String>("app-id")
         .context("expected app id")?;
     let environment = matches.get_one::<String>("environment").map(String::as_str);
     let (client, credential) = control_plane_context(config, matches)?;
-    let response = client.get_app(&credential, app_id, environment)?;
-    print_json(&response)
+    let inspection = client.get_app(&credential, app_id, environment)?;
+    // A policy-read failure must not turn a successful deployment into a false private/shared claim.
+    let access = client.get_access(&credential, app_id, environment);
+    let handoff = build_app_handoff(app_id, portal.as_ref(), &inspection, access.as_ref())?;
+    if config.json {
+        return print_json(&with_handoff(inspection, handoff));
+    }
+    let names = community_names(
+        config,
+        handoff["audience"]["policy"].get("shared_community_ids"),
+    );
+    print!("{}", app_summary_text(&inspection, &handoff, &names));
+    Ok(())
+}
+
+/// The inspection fields stay where `get --json` always had them; the handoff
+/// fields are added beside them, so `handoff --json` callers keep theirs too.
+fn with_handoff(mut inspection: Value, handoff: Value) -> Value {
+    if let (Some(fields), Value::Object(handoff)) = (inspection.as_object_mut(), handoff) {
+        fields.extend(handoff);
+    }
+    inspection
+}
+
+fn policy_strings<'a>(policy: &'a Value, field: &str) -> Vec<&'a str> {
+    policy
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// One readable answer to "who can open this app?", following the Share &
+/// manage dialog: the base audience, then anyone else who can still open a
+/// private app, then shared communities. Compose lists the owner among the
+/// viewers, drops `effective_viewers` for workspace apps, and leaves out or
+/// nulls `shared_community_ids` when there are none; all of that reads the same.
+fn who_can_open(
+    policy: &Value,
+    caller_is_owner: bool,
+    community_names: &BTreeMap<String, String>,
+) -> String {
+    let mut sentences = Vec::new();
+    if policy.get("visibility").and_then(Value::as_str) == Some(PRIVATE_VISIBILITY) {
+        sentences.push(if caller_is_owner {
+            "Only you.".to_string()
+        } else {
+            "Only the app's owner.".to_string()
+        });
+        let owner = policy.get("owner").and_then(Value::as_str);
+        let mut others: Vec<&str> = if policy.get("effective_viewers").is_some() {
+            policy_strings(policy, "effective_viewers")
+        } else {
+            let mut people = policy_strings(policy, "viewers");
+            people.extend(policy_strings(policy, "publishers"));
+            people
+        };
+        others.retain(|person| Some(*person) != owner);
+        others.sort_unstable();
+        others.dedup();
+        match others.len() {
+            0 => {}
+            1 => sentences.push("1 other person can also open it.".to_string()),
+            count => sentences.push(format!("{count} other people can also open it.")),
+        }
+    } else {
+        sentences.push("Everyone in the app's workspace.".to_string());
+    }
+    let communities: Vec<String> = policy_strings(policy, "shared_community_ids")
+        .into_iter()
+        .map(|id| community_label(id, community_names))
+        .collect();
+    match communities.as_slice() {
+        [] => {}
+        [one] => sentences.push(format!("So can members of the Buzz community {one}.")),
+        many => sentences.push(format!(
+            "So can members of {} Buzz communities: {}.",
+            many.len(),
+            many.join(", ")
+        )),
+    }
+    sentences.join(" ")
+}
+
+fn community_label(id: &str, names: &BTreeMap<String, String>) -> String {
+    terminal_safe_text(names.get(id).map_or(id, String::as_str))
+}
+
+/// Community names make the summary readable, but they come from Kgoose, not
+/// Compose, so any failure (no local login, a Blox workstation) falls back to IDs.
+fn community_names(config: &SkillsConfig, ids: Option<&Value>) -> BTreeMap<String, String> {
+    if ids.and_then(Value::as_array).is_none_or(Vec::is_empty) {
+        return BTreeMap::new();
+    }
+    joined_communities_for(config)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|community| {
+            Some((
+                community.get("community_id")?.as_str()?.to_string(),
+                community.get("name")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn audience_unknown_text(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("unauthenticated") => "Unknown, because your session couldn't be used to read it. Run `bl auth login`, then try again.",
+        Some("forbidden") => "Unknown, because this account can't read the app's access. Ask the app's owner.",
+        Some("not_found") => "Unknown, because the app's access policy wasn't found.",
+        Some("unavailable") => "Unknown, because Apps Platform didn't answer. Try again in a minute.",
+        _ => "Unknown, because Apps Platform's answer was incomplete. Try again in a minute.",
+    }
+}
+
+fn app_summary_text(
+    inspection: &Value,
+    handoff: &Value,
+    names: &BTreeMap<String, String>,
+) -> String {
+    let app = &inspection["app"];
+    let text = |value: &Value| value.as_str().map(terminal_safe_text);
+    let app_id = text(&handoff["app_id"]).unwrap_or_default();
+    let mut out = match text(&app["name"]).filter(|name| *name != app_id) {
+        Some(name) => format!("{name} ({app_id})\n"),
+        None => format!("{app_id}\n"),
+    };
+    if let Some(url) = text(&handoff["app_url"]) {
+        out.push_str(&format!("Open app: {url}\n"));
+    }
+    let who = match handoff["audience"]["policy"] {
+        Value::Null => audience_unknown_text(handoff["audience"]["reason"].as_str()).to_string(),
+        ref policy => who_can_open(policy, app["role"].as_str() == Some("owner"), names),
+    };
+    out.push_str(&format!("Who can open it: {who}\n"));
+    match text(&handoff["management_url"]) {
+        Some(link) => out.push_str(&format!("Share & manage: {link}\n")),
+        None => out.push_str(&format!(
+            "Share & manage: {}\n",
+            share_and_manage_without_portal(&app_id)
+        )),
+    }
+    if let Some(status) = text(&app["status"]) {
+        match text(&app["active_version_id"]) {
+            Some(version) => out.push_str(&format!("Status: {status}, version {version}\n")),
+            None => out.push_str(&format!("Status: {status}\n")),
+        }
+    }
+    out
 }
 
 fn management_portal_url(value: &str) -> Result<url::Url> {
@@ -706,9 +877,12 @@ fn build_app_handoff(
         app_id,
         required_response_string(app, "app_id", "Apps handoff")?,
     )?;
-    let workspace = required_response_string(app, "workspace_id", "Apps handoff")?;
+    // Share & manage opens an app's dialog only with its workspace, so an app
+    // reported without one still shows its audience, just without the link.
+    let workspace = app.get("workspace_id").and_then(Value::as_str);
     let management = portal
-        .map(|portal| {
+        .zip(workspace)
+        .map(|(portal, workspace)| {
             let mut management = portal.join("/hosted-apps")?;
             management
                 .query_pairs_mut()
@@ -770,9 +944,16 @@ fn build_app_handoff(
             share_and_manage_without_portal(app_id)
         ));
     }
+    let who = verified.map(|policy| {
+        who_can_open(
+            policy,
+            app.get("role").and_then(Value::as_str) == Some("owner"),
+            &BTreeMap::new(),
+        )
+    });
     Ok(json!({
         "ok": true, "app_id": app_id, "app_url": app_url, "management_url": management,
-        "workspace_id": workspace,
+        "workspace_id": workspace, "who_can_open": who,
         "audience": {"status": if verified.is_some() {"verified"} else {"unknown"}, "policy": verified, "reason": reason},
         "next_action": next_action,
         "recipient_browser_access_verified": false
@@ -797,24 +978,6 @@ fn handoff_read_failure_reason(error: &anyhow::Error) -> &'static str {
         _ if failure.is_some_and(|failure| failure.code == "network_error") => "unavailable",
         _ => "request_failed",
     }
-}
-
-fn run_handoff(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
-    let portal = configured_management_portal(matches.get_one::<String>("management-base-url"))?;
-    let app_id = matches
-        .get_one::<String>("app-id")
-        .context("expected app id")?;
-    let environment = matches.get_one::<String>("environment").map(String::as_str);
-    let (client, credential) = control_plane_context(config, matches)?;
-    let inspection = client.get_app(&credential, app_id, environment)?;
-    // A policy-read failure must not turn a successful deployment into a false private/shared claim.
-    let access = client.get_access(&credential, app_id, environment);
-    print_json(&build_app_handoff(
-        app_id,
-        portal.as_ref(),
-        &inspection,
-        access.as_ref(),
-    )?)
 }
 
 fn run_versions(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
@@ -1326,7 +1489,39 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         action,
         expected_revision,
     )?;
-    print_json(&response)
+    if config.json {
+        return print_json(&response);
+    }
+    let names = community_names(config, Some(&json!([community_id])));
+    print!(
+        "{}",
+        community_change_text(app_id, community_id, action, &response, &names)
+    );
+    Ok(())
+}
+
+fn community_change_text(
+    app_id: &str,
+    community_id: &str,
+    action: &str,
+    response: &Value,
+    names: &BTreeMap<String, String>,
+) -> String {
+    let app = terminal_safe_text(app_id);
+    let community = community_label(community_id, names);
+    let listed = policy_strings(response, "shared_community_ids").contains(&community_id);
+    let summary = match (action, listed) {
+        ("grant", true) => format!(
+            "Members of the Buzz community {community} can open {app} now, whatever its visibility."
+        ),
+        ("revoke", false) => {
+            format!("{app} is no longer shared with the Buzz community {community}.")
+        }
+        // Report what the server said rather than what was asked for.
+        (_, true) => format!("{app} is still shared with the Buzz community {community}."),
+        (_, false) => format!("{app} isn't shared with the Buzz community {community}."),
+    };
+    format!("{summary}\nRun `bl apps get {app}` to see everyone who can open it.\n")
 }
 
 /// Compose sets an app's sharing lifecycle when it reserves, initializes or
@@ -1361,6 +1556,15 @@ const JOINED_COMMUNITIES_PATH: &str = "/v1/buzz/joined-communities/list";
 /// Kgoose resolves the caller's linked Buzz identity and asks the relay which
 /// communities it has joined, the same list Share & manage offers.
 fn run_community_list(config: &SkillsConfig) -> Result<()> {
+    let communities = joined_communities_for(config)?;
+    if config.json {
+        return print_json(&json!({"ok": true, "communities": communities}));
+    }
+    print!("{}", joined_communities_text(&communities));
+    Ok(())
+}
+
+fn joined_communities_for(config: &SkillsConfig) -> Result<Vec<Value>> {
     let storage = default_session_storage(config)?;
     let session = storage
         .get(&session_storage_key_from_config(config))?
@@ -1385,12 +1589,7 @@ fn run_community_list(config: &SkillsConfig) -> Result<()> {
         .text()
         .with_context(|| format!("read {JOINED_COMMUNITIES_PATH} response"))?
         .replace(&session, "[REDACTED]");
-    let communities = joined_communities(status, &body)?;
-    if config.json {
-        return print_json(&json!({"ok": true, "communities": communities}));
-    }
-    print!("{}", joined_communities_text(&communities));
-    Ok(())
+    joined_communities(status, &body)
 }
 
 fn joined_communities(status: StatusCode, body: &str) -> Result<Vec<Value>> {
@@ -1565,7 +1764,18 @@ fn run_visibility(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let environment = matches.get_one::<String>("environment").map(String::as_str);
     let (client, credential) = control_plane_context(config, matches)?;
     let response = client.set_visibility(&credential, app_id, visibility, environment)?;
-    print_json(&require_visibility(app_id, visibility, response)?)
+    let response = require_visibility(app_id, visibility, response)?;
+    if config.json {
+        return print_json(&response);
+    }
+    // Only the owner may change visibility, so the caller is the owner here.
+    let names = community_names(config, response.get("shared_community_ids"));
+    println!(
+        "Who can open {} now: {}",
+        terminal_safe_text(app_id),
+        who_can_open(&response, true, &names)
+    );
+    Ok(())
 }
 
 /// Accepts a visibility response only when it reports the requested app and visibility.
@@ -2721,11 +2931,61 @@ fn sanitize_recovery_field(value: &Value, credential: &ComposeSessionCredential)
     Some(value)
 }
 
-fn is_app_scoped_path(path: &str) -> bool {
+fn app_id_from_path(path: &str) -> Option<&str> {
     let path = path.split('?').next().unwrap_or(path);
     path.strip_prefix("/v1/agent/apps/")
         .and_then(|rest| rest.split('/').next())
-        .is_some_and(|app_id| !app_id.is_empty() && app_id != "plan")
+        .filter(|app_id| !app_id.is_empty() && *app_id != "plan")
+}
+
+fn is_app_scoped_path(path: &str) -> bool {
+    app_id_from_path(path).is_some()
+}
+
+/// What a stable Compose error code means for the person running `bl`, and
+/// the next step when the server sends none. The server's `error.message` is
+/// never printed because it can reflect request values, so these are
+/// CLI-owned, like the manifest validation diagnostics.
+fn known_failure_explanation(
+    code: &str,
+    app_id: Option<&str>,
+) -> Option<(&'static str, Option<String>)> {
+    let app = app_id.unwrap_or("<APP_ID>");
+    Some(match code {
+        "tier_resolution_unavailable" => (
+            "Apps Platform couldn't check your site allowance, so nothing was changed.",
+            Some("Wait a minute, then run the same command again. Creating an app picks up where it stopped.".to_string()),
+        ),
+        "owner_site_quota_unavailable" => (
+            "Apps Platform isn't accepting new deployments right now, so nothing was changed.",
+            Some("Wait a minute, then run the same command again.".to_string()),
+        ),
+        "workspace_mismatch" => (
+            "This app belongs to a different workspace than the one you're signed in to. Nothing was changed.",
+            Some("Run `bl workspace switch` to choose the app's workspace, then try again.".to_string()),
+        ),
+        "workspace_binding_required" => (
+            "Your session isn't tied to a workspace yet. Nothing was changed.",
+            Some("Run `bl workspace switch` to choose a workspace, then try again.".to_string()),
+        ),
+        "owner_required" => (
+            "Only the app's owner can do this. Nothing was changed.",
+            Some("Ask the app's owner to make the change.".to_string()),
+        ),
+        "access_policy_update_in_progress" => (
+            "Another change to who can open this app is still being applied.",
+            Some("Wait a few seconds, then try again.".to_string()),
+        ),
+        "access_policy_conflict" => (
+            "Who can open this app changed while this request was running.",
+            Some(format!("Run `bl apps get {app}` to see who can open it now, then try again if it still needs changing.")),
+        ),
+        "app_not_found" => (
+            "There's no app with that ID that you can manage here.",
+            Some("Check the app ID with `bl apps list`.".to_string()),
+        ),
+        _ => return None,
+    })
 }
 
 fn control_plane_http_failure(
@@ -2750,6 +3010,7 @@ fn control_plane_http_failure(
             access_recovery.map_or("control_plane_request_failed", |recovery| recovery.code)
         });
     let validation = manifest_validation_diagnostic(status, code, parsed.as_ref());
+    let known = known_failure_explanation(code, app_id_from_path(path));
     let code = terminal_safe_text(&credential.redact(code));
     let mut details = json!({"http_status": status.as_u16()});
     if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
@@ -2785,6 +3046,12 @@ fn control_plane_http_failure(
             })
             .and_then(|value| sanitize_recovery_field(value, credential))
             .or_else(|| {
+                known
+                    .as_ref()
+                    .and_then(|(_, next_action)| next_action.as_deref())
+                    .map(|next_action| json!(terminal_safe_text(&credential.redact(next_action))))
+            })
+            .or_else(|| {
                 (status == StatusCode::FORBIDDEN).then(|| {
                     // Only a request about one app has an owner to ask.
                     json!(if is_app_scoped_path(path) {
@@ -2796,6 +3063,10 @@ fn control_plane_http_failure(
             })
     };
     let mut message = format!("{method} {path} failed with {status} ({code})");
+    if let Some((explanation, _)) = known.as_ref() {
+        message.push('\n');
+        message.push_str(explanation);
+    }
     if let Some((diagnostic, guidance)) = validation {
         message.push_str("\nvalidation: ");
         message.push_str(diagnostic);
@@ -3149,6 +3420,206 @@ mod tests {
         assert_eq!(handoff["audience"]["status"], "unknown");
         assert_eq!(handoff["audience"]["reason"], "unavailable");
         assert!(!handoff.to_string().contains("sensitive transport detail"));
+    }
+
+    #[test]
+    fn who_can_open_reads_the_same_however_compose_shapes_the_policy() {
+        let names = BTreeMap::from([("buzz-alpha".to_string(), "Alpha Team".to_string())]);
+        for (policy, caller_is_owner, expected) in [
+            // Compose lists the owner among the viewers and drops effective_viewers.
+            (
+                json!({"visibility":"organization","owner":"me","viewers":["me"]}),
+                true,
+                "Everyone in the app's workspace.",
+            ),
+            // Workspace apps never count other people; everyone already can.
+            (
+                json!({"visibility":"organization","owner":"me","viewers":["me","a"],"shared_community_ids":["buzz-alpha"]}),
+                true,
+                "Everyone in the app's workspace. So can members of the Buzz community Alpha Team.",
+            ),
+            // A missing and a null community list both mean none.
+            (
+                json!({"visibility":"restricted","owner":"me","viewers":["me"],"effective_viewers":["me"]}),
+                true,
+                "Only you.",
+            ),
+            (
+                json!({"visibility":"restricted","owner":"me","viewers":["me"],"effective_viewers":["me"],"shared_community_ids":null}),
+                true,
+                "Only you.",
+            ),
+            // Leftover viewers and publishers are counted, without the owner.
+            (
+                json!({"visibility":"restricted","owner":"me","viewers":["me","a"],"effective_viewers":["me","a","pub"],"shared_community_ids":["buzz-alpha","buzz-beta"]}),
+                true,
+                "Only you. 2 other people can also open it. So can members of 2 Buzz communities: Alpha Team, buzz-beta.",
+            ),
+            (
+                json!({"visibility":"restricted","owner":"me","viewers":["a"],"publishers":["a"]}),
+                false,
+                "Only the app's owner. 1 other person can also open it.",
+            ),
+        ] {
+            assert_eq!(who_can_open(&policy, caller_is_owner, &names), expected, "{policy}");
+        }
+    }
+
+    #[test]
+    fn get_summary_says_who_can_open_the_app_beside_its_links() {
+        let portal = management_portal_url("https://app.builderlabstaging.xyz").unwrap();
+        let inspected = json!({"app":{"app_id":"hello","name":"Hello","role":"owner","workspace_id":"ws","host":"hello.apps.example","status":"running","active_version_id":"v1"}});
+        let access = json!({"ok":true,"app_id":"hello","owner":"me","visibility":"organization","viewers":["me"],"shared_community_ids":["buzz-alpha"],"community_grant_revision":3});
+        let names = BTreeMap::from([("buzz-alpha".to_string(), "Alpha Team".to_string())]);
+        let handoff = build_app_handoff("hello", Some(&portal), &inspected, Ok(&access)).unwrap();
+        assert_eq!(
+            app_summary_text(&inspected, &handoff, &names),
+            "Hello (hello)\n\
+             Open app: https://hello.apps.example/\n\
+             Who can open it: Everyone in the app's workspace. So can members of the Buzz community Alpha Team.\n\
+             Share & manage: https://app.builderlabstaging.xyz/hosted-apps?app=hello&workspace=ws\n\
+             Status: running, version v1\n"
+        );
+        // JSON keeps IDs; names are only looked up for people reading the text.
+        assert_eq!(
+            handoff["who_can_open"],
+            "Everyone in the app's workspace. So can members of the Buzz community buzz-alpha."
+        );
+
+        let denied = control_plane_http_failure(
+            "GET",
+            "/v1/agent/apps/hello/access",
+            StatusCode::FORBIDDEN,
+            &json!({"error":{"code":"publisher_not_approved"}}).to_string(),
+            &test_credential("credential-secret"),
+        );
+        let handoff = build_app_handoff("hello", None, &inspected, Err(&denied)).unwrap();
+        let text = app_summary_text(&inspected, &handoff, &BTreeMap::new());
+        assert!(
+            text.contains(
+                "Who can open it: Unknown, because this account can't read the app's access."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Share & manage: Open Hosted Apps in the BuilderLab portal and use Share & manage on hello."), "{text}");
+        assert!(handoff["who_can_open"].is_null());
+    }
+
+    #[test]
+    fn get_summary_is_terminal_safe() {
+        let inspected = json!({"app":{"app_id":"hello","name":"Evil\u{1b}[31m name","workspace_id":"ws","status":"idle"}});
+        let access = json!({"ok":true,"app_id":"hello","visibility":"restricted","viewers":[],"effective_viewers":[],"shared_community_ids":["c"],"community_grant_revision":1});
+        let names = BTreeMap::from([("c".to_string(), "bad\u{1b}]8;;x\u{7}".to_string())]);
+        let handoff = build_app_handoff("hello", None, &inspected, Ok(&access)).unwrap();
+        let text = app_summary_text(&inspected, &handoff, &names);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains('\u{7}'), "{text:?}");
+    }
+
+    #[test]
+    fn community_change_text_reports_what_the_server_returned() {
+        let names = BTreeMap::from([("buzz-alpha".to_string(), "Alpha Team".to_string())]);
+        let granted = json!({"ok":true,"shared_community_ids":["buzz-alpha"]});
+        let revoked = json!({"ok":true,"shared_community_ids":null});
+        for (action, response, first_line) in [
+            ("grant", &granted, "Members of the Buzz community Alpha Team can open demo now, whatever its visibility."),
+            ("revoke", &revoked, "demo is no longer shared with the Buzz community Alpha Team."),
+            ("grant", &revoked, "demo isn't shared with the Buzz community Alpha Team."),
+            ("revoke", &granted, "demo is still shared with the Buzz community Alpha Team."),
+        ] {
+            let text = community_change_text("demo", "buzz-alpha", action, response, &names);
+            assert_eq!(
+                text,
+                format!("{first_line}\nRun `bl apps get demo` to see everyone who can open it.\n")
+            );
+        }
+    }
+
+    #[test]
+    fn joined_communities_accept_both_field_casings_and_explain_a_missing_link() {
+        let communities = joined_communities(
+            StatusCode::OK,
+            &json!({"communities":[
+                {"id":"c1","name":"One","normalized_host":"one.example"},
+                {"id":"c2","name":"Two","normalizedHost":"two.example"},
+                {"id":"c3"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            joined_communities_text(&communities),
+            "c1  One (one.example)\nc2  Two (two.example)\nc3\n\
+             Share an app with one: bl apps community grant <APP_ID> <COMMUNITY_ID>\n"
+        );
+        assert_eq!(
+            joined_communities_text(&[]),
+            "You haven't joined any Buzz community yet.\n"
+        );
+
+        let error = joined_communities(
+            StatusCode::NOT_FOUND,
+            &json!({"error":{"code":"missing_mapping","message":"no buzz identity"}}).to_string(),
+        )
+        .unwrap_err();
+        let (_, payload) = failure_info(&error);
+        assert_eq!(payload["error"]["code"], "missing_mapping");
+        assert_eq!(
+            payload["next_action"],
+            "Connect your Buzz identity on the Buzz page of the BuilderLab portal, then retry."
+        );
+        let error = joined_communities(StatusCode::UNAUTHORIZED, "").unwrap_err();
+        assert_eq!(failure_info(&error).0, exit_codes::AUTH_REQUIRED);
+    }
+
+    #[test]
+    fn sharing_help_uses_workspace_and_private_and_hides_individual_viewers() {
+        let mut apps = command();
+        assert!(apps.find_subcommand("handoff").unwrap().is_hide_set());
+        let access = apps.find_subcommand("access").unwrap();
+        assert!(access.find_subcommand("set").unwrap().is_hide_set());
+        let help = |path: &[&str]| {
+            let mut command = command();
+            for name in path {
+                command = command.find_subcommand(name).unwrap().clone();
+            }
+            command.render_long_help().to_string()
+        };
+        let mut all = String::new();
+        for path in [
+            &["get"][..],
+            &["create"],
+            &["access"],
+            &["access", "get"],
+            &["community"],
+            &["community", "grant"],
+            &["community", "revoke"],
+            &["community", "list"],
+            &["visibility"],
+        ] {
+            let text = help(path);
+            all.push_str(&text);
+            // Every positional argument says what to pass.
+            let mut command = command();
+            for name in path {
+                command = command.find_subcommand(name).unwrap().clone();
+            }
+            for arg in command.get_positionals() {
+                assert!(arg.get_help().is_some(), "{path:?} {}", arg.get_id());
+            }
+        }
+        assert!(help(&["visibility"]).contains("`private` for only you"));
+        assert!(help(&["community", "grant"]).contains("bl apps community list"));
+        for gone in [
+            "people you add",
+            "--viewer",
+            "auth0|",
+            "bl apps handoff",
+            "approved ingress",
+        ] {
+            assert!(!all.contains(gone), "{gone}");
+        }
+        assert!(!apps.render_long_help().to_string().contains("handoff"));
     }
 
     #[test]
@@ -3863,8 +4334,18 @@ mod tests {
                 "active": true
             }]
         });
+        let access = json!({
+            "ok": true,
+            "app_id": "merchant/lookup app",
+            "visibility": "organization",
+            "viewers": [],
+            "community_grant_revision": 0
+        });
         let auth_server = ProcessServer::start(vec![process_auth_response()]);
-        let control_plane = ProcessServer::start(vec![ProcessResponse::json(app.clone())]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(app.clone()),
+            ProcessResponse::json(access.clone()),
+        ]);
         let mut command = process_command(
             &auth_server,
             &control_plane,
@@ -3885,11 +4366,17 @@ mod tests {
 
         let output = command.output().expect("run Apps get process command");
         assert!(output.status.success());
-        assert_eq!(
-            serde_json::from_str::<Value>(&process_stdout(&output))
-                .expect("parse get process output"),
-            app
-        );
+        let got: Value =
+            serde_json::from_str(&process_stdout(&output)).expect("parse get process output");
+        // Inspection fields are unchanged; the audience is added beside them.
+        for field in ["ok", "app", "versions"] {
+            assert_eq!(got[field], app[field], "{field}");
+        }
+        assert_eq!(got["app_id"], "merchant/lookup app");
+        assert_eq!(got["audience"]["status"], "verified");
+        assert_eq!(got["audience"]["policy"], access);
+        assert_eq!(got["who_can_open"], "Everyone in the app's workspace.");
+        assert!(got["management_url"].is_null());
         let auth_requests = auth_server.finish();
         let requests = control_plane.finish();
         assert_process_auth(&auth_requests[0], credential);
@@ -3899,6 +4386,156 @@ mod tests {
             "/v1/agent/apps/merchant%2Flookup%20app?environment=staging",
             credential,
         );
+        assert_process_control_plane(
+            &requests[1],
+            "GET",
+            "/v1/agent/apps/merchant%2Flookup%20app/access?environment=staging",
+            credential,
+        );
+    }
+
+    #[test]
+    fn bl_apps_get_and_its_handoff_alias_print_the_same_readable_summary() {
+        let credential = "apps-e2e-only.get-text.session";
+        let mut outputs = Vec::new();
+        for subcommand in ["get", "handoff"] {
+            let auth_server = ProcessServer::start(vec![
+                process_auth_response(),
+                ProcessResponse::json(
+                    json!({"communities":[{"id":"buzz-alpha","name":"Alpha Team"}]}),
+                ),
+            ]);
+            let control_plane = ProcessServer::start(vec![
+                ProcessResponse::json(json!({"ok":true,"app":{
+                    "app_id":"hello","name":"Hello","role":"owner","workspace_id":"ws",
+                    "host":"hello.apps.example","status":"running"
+                }})),
+                ProcessResponse::json(json!({
+                    "ok":true,"app_id":"hello","owner":"auth0|apps-user","visibility":"restricted",
+                    "viewers":["auth0|apps-user","auth0|old"],
+                    "effective_viewers":["auth0|apps-user","auth0|old"],
+                    "shared_community_ids":["buzz-alpha"],"community_grant_revision":2
+                })),
+            ]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    subcommand,
+                    "hello",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                ],
+                credential,
+            )
+            .env(
+                MANAGEMENT_BASE_URL_ENV_VAR,
+                "https://app.builderlabstaging.xyz",
+            )
+            .output()
+            .expect("run Apps get text process");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let auth_requests = auth_server.finish();
+            assert_eq!(auth_requests[1].method, "POST");
+            assert_eq!(
+                auth_requests[1].path,
+                format!("/api/goose{JOINED_COMMUNITIES_PATH}")
+            );
+            assert_eq!(control_plane.finish().len(), 2);
+            outputs.push(process_stdout(&output));
+        }
+        assert_eq!(
+            outputs[0],
+            "Hello (hello)\n\
+             Open app: https://hello.apps.example/\n\
+             Who can open it: Only you. 1 other person can also open it. So can members of the Buzz community Alpha Team.\n\
+             Share & manage: https://app.builderlabstaging.xyz/hosted-apps?app=hello&workspace=ws\n\
+             Status: running"
+        );
+        assert_eq!(outputs[0], outputs[1]);
+    }
+
+    #[test]
+    fn bl_apps_visibility_and_community_print_who_can_open_without_json() {
+        let credential = "apps-e2e-only.sharing-text.session";
+        // When the Kgoose name lookup fails, communities are named by ID.
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![ProcessResponse::json(json!({
+            "ok":true,"app_id":"my-app","owner":"auth0|apps-user","visibility":"organization",
+            "viewers":["auth0|apps-user"],"shared_community_ids":["buzz-alpha"]
+        }))]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "visibility",
+                "my-app",
+                "workspace",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+            ],
+            credential,
+        )
+        .output()
+        .expect("run visibility text process");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            process_stdout(&output),
+            "Who can open my-app now: Everyone in the app's workspace. So can members of the Buzz community buzz-alpha."
+        );
+        auth_server.finish();
+        control_plane.finish();
+
+        let auth_server = ProcessServer::start(vec![
+            process_auth_response(),
+            ProcessResponse::json(json!({"communities":[{"id":"buzz-alpha","name":"Alpha Team"}]})),
+        ]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(
+                json!({"ok":true,"app_id":"my-app","lifecycle_id":"life-1","community_grant_revision":4}),
+            ),
+            ProcessResponse::json(
+                json!({"ok":true,"app_id":"my-app","community_grant_revision":5,"shared_community_ids":null}),
+            ),
+        ]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "community",
+                "revoke",
+                "my-app",
+                "buzz-alpha",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+            ],
+            credential,
+        )
+        .output()
+        .expect("run community revoke text process");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            process_stdout(&output),
+            "my-app is no longer shared with the Buzz community Alpha Team.\n\
+             Run `bl apps get my-app` to see everyone who can open it."
+        );
+        auth_server.finish();
+        control_plane.finish();
     }
 
     #[test]
@@ -7114,6 +7751,90 @@ mod tests {
             );
             assert!(!payload.to_string().contains("private provider"));
         }
+    }
+
+    #[test]
+    fn known_error_codes_explain_what_happened_and_what_to_do() {
+        for (method, path, status, code, explanation, next_action) in [
+            (
+                "POST",
+                "/v1/agent/apps/example/reserve",
+                503,
+                "tier_resolution_unavailable",
+                "couldn't check your site allowance, so nothing was changed",
+                "Wait a minute, then run the same command again.",
+            ),
+            (
+                "PUT",
+                "/v1/agent/apps/example/visibility",
+                403,
+                "workspace_mismatch",
+                "belongs to a different workspace",
+                "Run `bl workspace switch`",
+            ),
+            (
+                "PUT",
+                "/v1/agent/apps/example/visibility",
+                403,
+                "owner_required",
+                "Only the app's owner can do this.",
+                "Ask the app's owner to make the change.",
+            ),
+            (
+                "PUT",
+                "/v1/agent/apps/example/access",
+                409,
+                "access_policy_conflict",
+                "changed while this request was running",
+                "Run `bl apps get example`",
+            ),
+        ] {
+            let error = control_plane_http_failure(
+                method,
+                path,
+                StatusCode::from_u16(status).unwrap(),
+                &json!({"error": {"code": code, "message": "private provider diagnostics"}})
+                    .to_string(),
+                &test_credential("credential-secret"),
+            );
+            let (_, payload) = failure_info(&error);
+            let message = payload["error"]["message"].as_str().expect("message");
+            assert!(message.contains(explanation), "{code}: {message}");
+            assert!(
+                payload["next_action"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(next_action)),
+                "{code}: {payload}"
+            );
+            assert!(
+                message.contains(&format!("next_action: {next_action}")),
+                "{code}"
+            );
+            assert!(!payload.to_string().contains("private provider"));
+        }
+    }
+
+    #[test]
+    fn server_next_action_wins_over_the_cli_explanation_step() {
+        let error = control_plane_http_failure(
+            "POST",
+            "/v1/agent/apps/example/reserve",
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({
+                "error": {"code": "tier_resolution_unavailable"},
+                "next_action": "Retry after the tier service recovers."
+            })
+            .to_string(),
+            &test_credential("credential-secret"),
+        );
+        let (_, payload) = failure_info(&error);
+        assert_eq!(
+            payload["next_action"],
+            "Retry after the tier service recovers."
+        );
+        assert!(payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("couldn't check your site allowance")));
     }
 
     #[test]
