@@ -202,7 +202,7 @@ pub fn command() -> Command {
         .subcommand(control_plane_args(
             Command::new("handoff")
                 .about("Read the app audience and build its Share & manage link")
-                .long_about("Read an existing app and its access policy without changing either. Requires the portal origin for the same environment through --management-base-url or BL_APPS_MANAGEMENT_BASE_URL. Readiness and recipient browser access must be verified separately.")
+                .long_about("Read an existing app and its access policy without changing either. The audience is reported without a portal origin. To also print the Share & manage link, pass the portal origin for the same environment through --management-base-url or BL_APPS_MANAGEMENT_BASE_URL; without it the link is omitted. Readiness and recipient browser access must be verified separately.")
                 .arg(Arg::new("app-id").value_name("APP_ID").required(true))
                 .arg(Arg::new("environment").long("environment").value_name("ENVIRONMENT"))
                 .arg(Arg::new("management-base-url").long("management-base-url").value_name("HTTPS_PORTAL_ORIGIN")),
@@ -642,9 +642,36 @@ fn management_portal_url(value: &str) -> Result<url::Url> {
     Ok(portal)
 }
 
+const MANAGEMENT_BASE_URL_ENV_VAR: &str = "BL_APPS_MANAGEMENT_BASE_URL";
+
+/// The portal origin is never inferred from a workstation or app hostname.
+fn configured_management_portal(flag: Option<&String>) -> Result<Option<url::Url>> {
+    flag.cloned()
+        .or_else(|| std::env::var(MANAGEMENT_BASE_URL_ENV_VAR).ok())
+        .map(|configured| management_portal_url(&configured))
+        .transpose()
+}
+
+/// Next step for an owner who needs the Share & manage page for an app.
+fn share_and_manage_step(portal: Option<&url::Url>, app_id: &str) -> String {
+    match portal.and_then(|portal| portal.join("/hosted-apps").ok()) {
+        Some(mut link) => {
+            link.query_pairs_mut().append_pair("app", app_id);
+            format!("Open Share & manage for this app at {link}.")
+        }
+        None => "Use the Share & manage dialog in the browser for this app.".to_string(),
+    }
+}
+
+fn community_share_and_manage_step(app_id: &str) -> String {
+    // An unusable origin only drops the link; the failure it decorates stands.
+    let portal = configured_management_portal(None).ok().flatten();
+    share_and_manage_step(portal.as_ref(), app_id)
+}
+
 fn build_app_handoff(
     app_id: &str,
-    portal: &url::Url,
+    portal: Option<&url::Url>,
     inspection: &Value,
     access: Result<&Value, &anyhow::Error>,
 ) -> Result<Value> {
@@ -657,11 +684,16 @@ fn build_app_handoff(
         required_response_string(app, "app_id", "Apps handoff")?,
     )?;
     let workspace = required_response_string(app, "workspace_id", "Apps handoff")?;
-    let mut management = portal.join("/hosted-apps")?;
-    management
-        .query_pairs_mut()
-        .append_pair("app", app_id)
-        .append_pair("workspace", workspace);
+    let management = portal
+        .map(|portal| {
+            let mut management = portal.join("/hosted-apps")?;
+            management
+                .query_pairs_mut()
+                .append_pair("app", app_id)
+                .append_pair("workspace", workspace);
+            Ok::<_, anyhow::Error>(management.to_string())
+        })
+        .transpose()?;
     let host = app.get("host").and_then(Value::as_str);
     let app_url = host.and_then(|host| {
         let candidate = url::Url::parse(&format!("https://{host}/")).ok()?;
@@ -702,12 +734,17 @@ fn build_app_handoff(
     let reason = verified
         .is_none()
         .then(|| read_failure_reason.unwrap_or("incomplete_policy"));
+    let mut next_action = if verified.is_some() {"Report the current audience beside Open app and Share & manage. Copying the link does not change access."}
+        else {"App access could not be confirmed. Report the audience as unknown and provide Share & manage; do not claim it is private or shared. Copying the link does not change access."}
+        .to_string();
+    if management.is_none() {
+        next_action.push_str(" The Share & manage link isn't configured on this machine: tell the owner to use the Share & manage dialog in the browser, or rerun with --management-base-url <HTTPS_PORTAL_ORIGIN> (or set BL_APPS_MANAGEMENT_BASE_URL) to print the link.");
+    }
     Ok(json!({
-        "ok": true, "app_id": app_id, "app_url": app_url, "management_url": management.as_str(),
+        "ok": true, "app_id": app_id, "app_url": app_url, "management_url": management,
         "workspace_id": workspace,
         "audience": {"status": if verified.is_some() {"verified"} else {"unknown"}, "policy": verified, "reason": reason},
-        "next_action": if verified.is_some() {"Report the current audience beside Open app and Share & manage. Copying the link does not change access."}
-            else {"App access could not be confirmed. Report the audience as unknown and provide Share & manage; do not claim it is private or shared. Copying the link does not change access."},
+        "next_action": next_action,
         "recipient_browser_access_verified": false
     }))
 }
@@ -733,10 +770,7 @@ fn handoff_read_failure_reason(error: &anyhow::Error) -> &'static str {
 }
 
 fn run_handoff(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
-    let configured = matches.get_one::<String>("management-base-url").cloned()
-        .or_else(|| std::env::var("BL_APPS_MANAGEMENT_BASE_URL").ok())
-        .context("Set --management-base-url or BL_APPS_MANAGEMENT_BASE_URL to the portal origin for this environment; do not infer it from a workstation or app hostname")?;
-    let portal = management_portal_url(&configured)?;
+    let portal = configured_management_portal(matches.get_one::<String>("management-base-url"))?;
     let app_id = matches
         .get_one::<String>("app-id")
         .context("expected app id")?;
@@ -747,7 +781,7 @@ fn run_handoff(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let access = client.get_access(&credential, app_id, environment);
     print_json(&build_app_handoff(
         app_id,
-        &portal,
+        portal.as_ref(),
         &inspection,
         access.as_ref(),
     )?)
@@ -1210,14 +1244,18 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     // The Blox proxy only asks Kgoose for a sharing credential on workspace
     // routes, so Compose would refuse every community request it forwards.
     if proxy_auth_for_url(base_url) {
+        let next_action = format!(
+            "{} Or run `bl apps community` with `--base-url` set to an approved BuilderLab ingress after `bl auth login`.",
+            community_share_and_manage_step(app_id)
+        );
         let mut error = CliFailure::new(
             exit_codes::GENERAL,
             "community_sharing_unavailable_through_proxy",
-            "Community sharing isn't available through the Blox workstation proxy yet.",
+            format!(
+                "Community sharing isn't available through the Blox workstation proxy yet.\nnext_action: {next_action}"
+            ),
         );
-        error.next_action = Some(json!(
-            "Share the app with the community from Share & manage, or run `bl apps community` with `--base-url` set to an approved BuilderLab ingress after `bl auth login`."
-        ));
+        error.next_action = Some(json!(next_action));
         return Err(anyhow::Error::new(error));
     }
     let (client, credential) = control_plane_context(config, action_matches)?;
@@ -1230,8 +1268,19 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         .get("lifecycle_id")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .context("app has no active sharing lifecycle")
-        .map_err(|error| correlate_response_error(error, &current))?;
+        .ok_or_else(|| {
+            let next_action = format!(
+                "{} Check that the app is shared there, then retry.",
+                community_share_and_manage_step(app_id)
+            );
+            let mut error = CliFailure::new(
+                exit_codes::GENERAL,
+                "app_sharing_lifecycle_missing",
+                format!("app has no active sharing lifecycle\nnext_action: {next_action}"),
+            );
+            error.next_action = Some(json!(next_action));
+            correlate_response_error(anyhow::Error::new(error), &current)
+        })?;
     let expected_revision = current
         .get("community_grant_revision")
         .and_then(Value::as_u64)
@@ -2760,7 +2809,8 @@ mod tests {
         let portal = management_portal_url("https://app.builderlabstaging.xyz").unwrap();
         let inspected = json!({"app":{"app_id":"reading-list","workspace_id":"workspace-owner","host":"reading-list.apps.example"}});
         let access = json!({"ok":true,"app_id":"reading-list","visibility":"restricted","viewers":["viewer"],"effective_viewers":["owner","publisher","viewer"],"publishers":["publisher"],"shared_community_ids":["community"],"community_grant_revision":3});
-        let result = build_app_handoff("reading-list", &portal, &inspected, Ok(&access)).unwrap();
+        let result =
+            build_app_handoff("reading-list", Some(&portal), &inspected, Ok(&access)).unwrap();
         assert_eq!(result["management_url"], "https://app.builderlabstaging.xyz/hosted-apps?app=reading-list&workspace=workspace-owner");
         assert_eq!(result["app_url"], "https://reading-list.apps.example/");
         assert_eq!(result["audience"]["status"], "verified");
@@ -2778,7 +2828,7 @@ mod tests {
             let complete = json!({"ok":true,"app_id":"demo","visibility":visibility,
                 "viewers":[],"effective_viewers":["owner"],
                 "community_grant_revision":0});
-            let result = build_app_handoff("demo", &portal, &app, Ok(&complete)).unwrap();
+            let result = build_app_handoff("demo", Some(&portal), &app, Ok(&complete)).unwrap();
             assert_eq!(result["audience"]["status"], "verified");
             assert_eq!(result["audience"]["policy"], complete);
 
@@ -2797,7 +2847,8 @@ mod tests {
                     } else {
                         policy.as_object_mut().unwrap().remove(field);
                     }
-                    let result = build_app_handoff("demo", &portal, &app, Ok(&policy)).unwrap();
+                    let result =
+                        build_app_handoff("demo", Some(&portal), &app, Ok(&policy)).unwrap();
                     assert_eq!(result["audience"]["status"], "unknown", "{policy}");
                     assert!(result["audience"]["policy"].is_null());
                     assert_eq!(result["audience"]["reason"], "incomplete_policy");
@@ -2817,7 +2868,8 @@ mod tests {
                 ] {
                     let mut policy = complete.clone();
                     policy[field] = value;
-                    let result = build_app_handoff("demo", &portal, &app, Ok(&policy)).unwrap();
+                    let result =
+                        build_app_handoff("demo", Some(&portal), &app, Ok(&policy)).unwrap();
                     assert_eq!(result["audience"]["status"], "unknown", "{policy}");
                     assert!(result["audience"]["policy"].is_null());
                 }
@@ -2838,13 +2890,13 @@ mod tests {
             ),
         ] {
             let access = policy.context("policy unavailable");
-            let result = build_app_handoff("demo", &portal, &app, access.as_ref()).unwrap();
+            let result = build_app_handoff("demo", Some(&portal), &app, access.as_ref()).unwrap();
             assert_eq!(result["audience"]["status"], "unknown");
             assert!(result["audience"]["policy"].is_null());
             assert!(result["app_url"].is_null());
         }
         let unavailable = anyhow::anyhow!("policy unavailable");
-        assert!(build_app_handoff("other", &portal, &app, Err(&unavailable)).is_err());
+        assert!(build_app_handoff("other", Some(&portal), &app, Err(&unavailable)).is_err());
     }
 
     #[test]
@@ -2870,7 +2922,7 @@ mod tests {
             "sensitive transport detail",
         )
         .context("policy read");
-        let handoff = build_app_handoff("demo", &portal, &app, Err(&error)).unwrap();
+        let handoff = build_app_handoff("demo", Some(&portal), &app, Err(&error)).unwrap();
         assert_eq!(handoff["audience"]["status"], "unknown");
         assert_eq!(handoff["audience"]["reason"], "unavailable");
         assert!(!handoff.to_string().contains("sensitive transport detail"));
@@ -2979,6 +3031,7 @@ mod tests {
             .env_remove("KGOOSE_PLAYPEN");
         command.env_remove("BL_APPS_E2E_PROXY");
         command.env_remove(APPS_BASE_URL_ENV_VAR);
+        command.env_remove("BL_APPS_MANAGEMENT_BASE_URL");
         command.env_remove("TRACEPARENT");
         command
     }
@@ -7480,6 +7533,78 @@ mod tests {
     }
 
     #[test]
+    fn bl_apps_handoff_process_without_portal_origin_still_reports_the_audience() {
+        let auth = ProcessServer::start(vec![]);
+        let control = ProcessServer::start(vec![
+            ProcessResponse::json(
+                json!({"ok":true,"app":{"app_id":"demo","workspace_id":"owning-workspace","host":"demo.apps.example"}}),
+            ),
+            ProcessResponse::json(
+                json!({"ok":true,"app_id":"demo","visibility":"restricted","viewers":[],"effective_viewers":["owner"],"community_grant_revision":2}),
+            ),
+        ]);
+        let output = process_command(
+            &auth,
+            &control,
+            &["apps", "handoff", "demo", "--json"],
+            "apps-e2e-only.unused",
+        )
+        .env("BL_APPS_E2E_PROXY", "true")
+        .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let handoff: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
+        assert!(handoff["management_url"].is_null());
+        assert_eq!(handoff["app_url"], "https://demo.apps.example/");
+        assert_eq!(handoff["audience"]["status"], "verified");
+        assert_eq!(handoff["audience"]["policy"]["visibility"], "restricted");
+        let next_action = handoff["next_action"].as_str().unwrap();
+        assert!(next_action.contains("Share & manage link isn't configured on this machine"));
+        assert!(next_action.contains("--management-base-url"));
+        assert!(next_action.contains("BL_APPS_MANAGEMENT_BASE_URL"));
+        assert!(auth.finish().is_empty());
+        let requests = control.finish();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/v1/agent/apps/demo");
+        assert_eq!(requests[1].path, "/v1/agent/apps/demo/access");
+    }
+
+    #[test]
+    fn bl_apps_handoff_process_still_rejects_an_invalid_portal_origin_before_any_request() {
+        for (flag, env) in [
+            (Some("https://app.example/path"), None),
+            (None, Some("http://app.example")),
+        ] {
+            let auth = ProcessServer::start(vec![]);
+            let control = ProcessServer::start(vec![]);
+            let mut args = vec!["apps", "handoff", "demo", "--json"];
+            if let Some(flag) = flag {
+                args.extend(["--management-base-url", flag]);
+            }
+            let mut command = process_command(&auth, &control, &args, "apps-e2e-only.unused");
+            command
+                .env("BL_APPS_E2E_PROXY", "true")
+                .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example");
+            if let Some(env) = env {
+                command.env("BL_APPS_MANAGEMENT_BASE_URL", env);
+            }
+            let output = command.output().unwrap();
+            assert!(!output.status.success());
+            assert!(process_error(&output)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("management base URL must be an HTTPS portal origin"));
+            assert!(auth.finish().is_empty());
+            assert!(control.finish().is_empty());
+        }
+    }
+
+    #[test]
     fn bl_apps_community_grant_reads_only_the_target_grant_before_post() {
         let credential = "apps-e2e-only.community.session";
         let auth_server = ProcessServer::start(vec![process_auth_response()]);
@@ -7564,6 +7689,125 @@ mod tests {
                 .is_some_and(|action| action.contains("Share & manage")));
             assert!(auth_server.finish().is_empty());
             assert!(control_plane.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn bl_apps_community_proxy_refusal_links_share_and_manage_when_the_portal_is_known() {
+        let auth_server = ProcessServer::start(vec![]);
+        let control_plane = ProcessServer::start(vec![]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "community",
+                "grant",
+                "my-app",
+                "buzz-alpha",
+                "--json",
+            ],
+            "apps-e2e-only.unused",
+        )
+        .env("BL_APPS_E2E_PROXY", "true")
+        .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+        .env("BL_APPS_MANAGEMENT_BASE_URL", "https://app.builderlab.xyz")
+        .output()
+        .expect("run proxied community process");
+        let error = process_error(&output);
+        assert_eq!(
+            error["error"]["code"],
+            "community_sharing_unavailable_through_proxy"
+        );
+        let next_action = error["next_action"].as_str().unwrap();
+        assert!(next_action.contains("https://app.builderlab.xyz/hosted-apps?app=my-app"));
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(next_action));
+        assert!(auth_server.finish().is_empty());
+        assert!(control_plane.finish().is_empty());
+    }
+
+    #[test]
+    fn bl_apps_community_proxy_refusal_points_to_the_browser_dialog_without_a_portal() {
+        let auth_server = ProcessServer::start(vec![]);
+        let control_plane = ProcessServer::start(vec![]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "community",
+                "grant",
+                "my-app",
+                "buzz-alpha",
+                "--json",
+            ],
+            "apps-e2e-only.unused",
+        )
+        .env("BL_APPS_E2E_PROXY", "true")
+        .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+        .output()
+        .expect("run proxied community process");
+        let error = process_error(&output);
+        let next_action = error["next_action"].as_str().unwrap();
+        assert!(next_action.contains("Share & manage dialog in the browser"));
+        assert!(!next_action.contains("https://"));
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(next_action));
+    }
+
+    #[test]
+    fn bl_apps_community_missing_lifecycle_tells_the_owner_to_open_share_and_manage() {
+        for (portal, expected) in [
+            (
+                Some("https://app.builderlab.xyz"),
+                "https://app.builderlab.xyz/hosted-apps?app=my-app",
+            ),
+            (None, "Share & manage dialog in the browser"),
+        ] {
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![ProcessResponse::json(
+                json!({"ok": true, "community_grant_revision": 7}),
+            )
+            .with_trace_id(REQUEST_TRACE_ID)]);
+            let mut command = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "community",
+                    "grant",
+                    "my-app",
+                    "buzz-alpha",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--json",
+                ],
+                "apps-e2e-only.no-lifecycle.session",
+            );
+            if let Some(portal) = portal {
+                command.env("BL_APPS_MANAGEMENT_BASE_URL", portal);
+            }
+            let output = command.output().expect("run community without lifecycle");
+            let error = process_error(&output);
+            assert!(error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("app has no active sharing lifecycle"));
+            assert_eq!(error["error"]["trace_id"], REQUEST_TRACE_ID);
+            let next_action = error["next_action"].as_str().unwrap();
+            assert!(next_action.contains("Share & manage"), "{next_action}");
+            assert!(next_action.contains(expected), "{next_action}");
+            auth_server.finish();
+            assert_eq!(
+                control_plane.finish().len(),
+                1,
+                "never mutate without a lifecycle"
+            );
         }
     }
 
