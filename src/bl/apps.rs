@@ -40,7 +40,6 @@ const APPS_CLIENT_VERSION_ENV_VAR: &str = "BL_APPS_CLIENT_VERSION";
 // Apps compatibility evolves independently of the standalone CLI release
 // numbering. Keep the beta package version in --version and User-Agent.
 const APPS_PROTOCOL_VERSION: &str = "0.2.0";
-const WORKSPACE_SHARING_RETIRED: &str = "Cross-workspace sharing was retired; use Share & manage.";
 #[cfg(test)]
 const APPS_E2E_CONTROL_PLANE_URL_ENV_VAR: &str = "BL_APPS_E2E_CONTROL_PLANE_URL";
 #[cfg(test)]
@@ -69,16 +68,8 @@ const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
 ];
 
 pub fn command() -> Command {
-    build_command(true)
-}
-
-pub(crate) fn completion_command() -> Command {
-    build_command(false)
-}
-
-fn build_command(include_retired_sharing: bool) -> Command {
-    let about = "Manage apps through the BuilderLab Apps Platform. Cross-workspace sharing is no longer supported. Use `bl apps handoff` to inspect the audience and open Share & manage for community sharing.";
-    let command = Command::new("apps")
+    let about = "Manage apps through the BuilderLab Apps Platform. Use `bl apps handoff` to inspect the audience and open Share & manage for community sharing.";
+    Command::new("apps")
         .about("Manage apps through Apps Platform")
         .long_about(about)
         .subcommand_required(true)
@@ -475,37 +466,6 @@ fn build_command(include_retired_sharing: bool) -> Command {
                                 .help("Optional Compose environment override"),
                         ),
                 )),
-        );
-    if include_retired_sharing {
-        command.subcommand(
-            Command::new("share")
-                .hide(true)
-                .about(WORKSPACE_SHARING_RETIRED)
-                .disable_help_subcommand(true)
-                .subcommand(retired_workspace_share_command("grant"))
-                .subcommand(retired_workspace_share_command("revoke")),
-        )
-    } else {
-        command
-    }
-}
-
-fn retired_workspace_share_command(action: &'static str) -> Command {
-    Command::new(action)
-        .hide(true)
-        .about(WORKSPACE_SHARING_RETIRED)
-        .arg(Arg::new("app-id").value_name("APP_ID"))
-        .arg(Arg::new("workspace-id").value_name("WORKSPACE_ID"))
-        .arg(
-            Arg::new("apps-base-url")
-                .long("base-url")
-                .visible_alias("control-plane-url")
-                .value_name("URL"),
-        )
-        .arg(
-            Arg::new("apps-client-version")
-                .long("client-version")
-                .value_name("VERSION"),
         )
 }
 
@@ -537,16 +497,6 @@ pub fn describe_commands() -> Value {
 }
 
 pub fn run(matches: &ArgMatches) -> Result<()> {
-    // Older skills can still call this path. Refuse before reading config or credentials.
-    if matches.subcommand_name() == Some("share") {
-        return runner::run_with_output(matches.get_flag("json"), || {
-            Err(failure(
-                exit_codes::GENERAL,
-                "workspace_sharing_retired",
-                WORKSPACE_SHARING_RETIRED,
-            ))
-        });
-    }
     runner::run(matches, dispatch)
 }
 
@@ -7169,69 +7119,36 @@ mod tests {
     #[test]
     fn workspace_sharing_is_absent_from_help_and_command_metadata() {
         let mut apps = command();
-        assert!(apps.find_subcommand("share").unwrap().is_hide_set());
+        assert!(apps.find_subcommand("share").is_none());
         let help = apps.render_long_help().to_string();
         assert!(!help.contains("Share a restricted app with a BuilderLab workspace"));
-        assert!(!help.contains("\n  share"));
         let described = describe_commands();
         assert!(!described.to_string().contains("WORKSPACE_ID"));
-        assert!(described["commands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|command| command["name"] != "share"));
-        let mut completion = completion_command();
-        let mut script = Vec::new();
-        clap_complete::generate(
-            clap_complete::Shell::Bash,
-            &mut completion,
-            "bl-apps",
-            &mut script,
-        );
-        assert!(!String::from_utf8(script)
-            .unwrap()
-            .contains("__subcmd__share"));
     }
 
     #[test]
     fn retired_workspace_sharing_never_authenticates_or_reaches_compose() {
-        for (action, proxy, json) in [
-            ("grant", false, true),
-            ("revoke", false, false),
-            ("grant", true, false),
-            ("revoke", true, true),
-        ] {
+        for action in ["grant", "revoke"] {
             let auth_server = ProcessServer::start(vec![]);
             let control_plane = ProcessServer::start(vec![]);
-            let mut args = vec!["apps", "share", action, "my-app", "target-workspace"];
-            if json {
-                args.extend([
-                    "--base-url",
-                    APPROVED_TEST_BASE_URL,
-                    "--client-version",
-                    "0.2.0",
-                    "--json",
-                ]);
-            }
-            let mut command = process_command(
+            let output = process_command(
                 &auth_server,
                 &control_plane,
-                &args,
+                &[
+                    "apps",
+                    "share",
+                    action,
+                    "my-app",
+                    "target-workspace",
+                    "--json",
+                ],
                 "apps-e2e-only.retired-share.session",
-            );
-            if proxy {
-                command.env("BL_APPS_E2E_PROXY", "true");
-            }
-            let output = command.output().expect("run retired sharing command");
+            )
+            .output()
+            .expect("run retired sharing command");
             assert!(!output.status.success());
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(stderr.contains(WORKSPACE_SHARING_RETIRED), "{stderr}");
-            if json {
-                assert_eq!(
-                    process_error(&output)["error"]["code"],
-                    "workspace_sharing_retired"
-                );
-            }
+            assert!(stderr.contains("share"), "{stderr}");
             assert!(auth_server.finish().is_empty());
             assert!(control_plane.finish().is_empty());
         }
