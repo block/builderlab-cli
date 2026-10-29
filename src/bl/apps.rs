@@ -2484,10 +2484,10 @@ mod tests {
     #[test]
     fn handoff_reports_verified_audience_and_exact_management_destination() {
         let portal = management_portal_url("https://app.builderlabstaging.xyz").unwrap();
-        let inspected = json!({"app":{"app_id":"reading-list","workspace_id":"workspace-personal-owner","host":"reading-list.apps.example"}});
-        let access = json!({"ok":true,"app_id":"reading-list","visibility":"restricted","viewers":["viewer"],"effective_viewers":["owner","publisher","viewer"],"publishers":["publisher"],"shared_workspace_ids":["team"],"workspace_grant_revision":2,"shared_community_ids":["community"],"community_grant_revision":3});
+        let inspected = json!({"app":{"app_id":"reading-list","workspace_id":"workspace-owner","host":"reading-list.apps.example"}});
+        let access = json!({"ok":true,"app_id":"reading-list","visibility":"restricted","viewers":["viewer"],"effective_viewers":["owner","publisher","viewer"],"publishers":["publisher"],"shared_community_ids":["community"],"community_grant_revision":3});
         let result = build_app_handoff("reading-list", &portal, &inspected, Ok(&access)).unwrap();
-        assert_eq!(result["management_url"], "https://app.builderlabstaging.xyz/hosted-apps?app=reading-list&workspace=workspace-personal-owner");
+        assert_eq!(result["management_url"], "https://app.builderlabstaging.xyz/hosted-apps?app=reading-list&workspace=workspace-owner");
         assert_eq!(result["app_url"], "https://reading-list.apps.example/");
         assert_eq!(result["audience"]["status"], "verified");
         assert_eq!(result["audience"]["policy"], access);
@@ -3138,7 +3138,7 @@ mod tests {
         for (policy, expected_status, expected_reason) in [
             (
                 ProcessResponse::json(
-                    json!({"ok":true,"app_id":"demo","visibility":"restricted","viewers":[],"effective_viewers":["owner"],"shared_workspace_ids":["team"],"workspace_grant_revision":1,"shared_community_ids":["community"],"community_grant_revision":2}),
+                    json!({"ok":true,"app_id":"demo","visibility":"restricted","viewers":[],"effective_viewers":["owner"],"shared_community_ids":["community"],"community_grant_revision":2}),
                 ),
                 "verified",
                 Value::Null,
@@ -3188,7 +3188,7 @@ mod tests {
             let auth = ProcessServer::start(vec![]);
             let control = ProcessServer::start(vec![
                 ProcessResponse::json(
-                    json!({"ok":true,"app":{"app_id":"demo","workspace_id":"owner-personal","host":"demo.apps.example"}}),
+                    json!({"ok":true,"app":{"app_id":"demo","workspace_id":"owning-workspace","host":"demo.apps.example"}}),
                 ),
                 policy,
             ]);
@@ -3217,7 +3217,7 @@ mod tests {
             let handoff: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
             assert_eq!(
                 handoff["management_url"],
-                "https://app.builderlabstaging.xyz/hosted-apps?app=demo&workspace=owner-personal"
+                "https://app.builderlabstaging.xyz/hosted-apps?app=demo&workspace=owning-workspace"
             );
             assert_eq!(handoff["recipient_browser_access_verified"], false);
             assert_eq!(handoff["audience"]["status"], expected_status);
@@ -3229,10 +3229,6 @@ mod tests {
             if expected_status == "unknown" {
                 assert!(handoff["audience"]["policy"].is_null());
             } else {
-                assert_eq!(
-                    handoff["audience"]["policy"]["shared_workspace_ids"],
-                    json!(["team"])
-                );
                 assert_eq!(
                     handoff["audience"]["policy"]["shared_community_ids"],
                     json!(["community"])
