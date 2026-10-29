@@ -14,10 +14,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-#[cfg(test)]
-use builderlab_auth::auth_login::build_auth_http_client;
-use builderlab_auth::auth_login::{auth_url, AuthMeResponse};
+use builderlab_auth::auth_login::{
+    auth_url, build_auth_http_client, playpen_baggage, AuthMeResponse, CLI_USER_AGENT,
+};
 use builderlab_auth::auth_storage::StoredSessionCredential;
+use builderlab_auth::SESSION_CREDENTIAL_HEADER;
 use clap::{Arg, ArgGroup, ArgMatches, Command};
 use reqwest::blocking::{multipart, Client, Request, RequestBuilder, Response};
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
@@ -27,13 +28,13 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use super::auth_login::verify_stored_session;
-use super::auth_storage::default_session_storage;
+use super::auth_storage::{default_session_storage, session_storage_key_from_config};
 use super::display::{print_json, terminal_safe_text, Style};
 use super::runner;
 #[cfg(test)]
 use super::skills_api::failure_info;
 use super::skills_api::{exit_codes, failure, failure_trace_id, with_failure_trace_id, CliFailure};
-use super::skills_config::SkillsConfig;
+use super::skills_config::{kgoose_service_url, SkillsConfig};
 
 const APPS_BASE_URL_ENV_VAR: &str = "BL_APPS_CONTROL_PLANE_URL";
 const APPS_CLIENT_VERSION_ENV_VAR: &str = "BL_APPS_CLIENT_VERSION";
@@ -487,7 +488,15 @@ pub fn command() -> Command {
                 .arg_required_else_help(true)
                 .disable_help_subcommand(true)
                 .subcommand(community_action_command("grant"))
-                .subcommand(community_action_command("revoke")),
+                .subcommand(community_action_command("revoke"))
+                .subcommand(
+                    Command::new("list")
+                        .about("List the Buzz communities you can share an app with")
+                        .long_about(
+                            "List the Buzz communities your linked Buzz identity has joined, with the \
+                             COMMUNITY_ID that `bl apps community grant` takes. Needs `bl auth login`.",
+                        ),
+                ),
         )
         .subcommand(control_plane_args(
             Command::new("visibility")
@@ -1197,7 +1206,10 @@ fn run_debug(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
 fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let (action, action_matches) = matches
         .subcommand()
-        .context("expected community grant or revoke")?;
+        .context("expected community grant, revoke or list")?;
+    if action == "list" {
+        return run_community_list(config);
+    }
     let app_id = action_matches
         .get_one::<String>("app-id")
         .context("expected app id")?;
@@ -1246,6 +1258,150 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         expected_revision,
     )?;
     print_json(&response)
+}
+
+const JOINED_COMMUNITIES_PATH: &str = "/v1/buzz/joined-communities/list";
+
+/// Kgoose resolves the caller's linked Buzz identity and asks the relay which
+/// communities it has joined, the same list Share & manage offers.
+fn run_community_list(config: &SkillsConfig) -> Result<()> {
+    let storage = default_session_storage(config)?;
+    let session = storage
+        .get(&session_storage_key_from_config(config))?
+        .and_then(|credential| credential.session_credential_header_value())
+        .ok_or_else(auth_required_error)?;
+    let service_url = kgoose_service_url(&config.kgoose_base_url, &config.kgoose_service_path);
+    let url = auth_url(&service_url, JOINED_COMMUNITIES_PATH)?;
+    let mut request = build_auth_http_client(Duration::from_secs(30))?
+        .post(url)
+        .header(USER_AGENT, CLI_USER_AGENT)
+        .header(ACCEPT, "application/json")
+        .header(SESSION_CREDENTIAL_HEADER, &session)
+        .json(&json!({}));
+    if let Some(baggage) = playpen_baggage(config.playpen.as_deref()) {
+        request = request.header("Baggage", baggage);
+    }
+    let response = request
+        .send()
+        .map_err(|error| network_failure("POST", JOINED_COMMUNITIES_PATH, error))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .with_context(|| format!("read {JOINED_COMMUNITIES_PATH} response"))?
+        .replace(&session, "[REDACTED]");
+    let communities = joined_communities(status, &body)?;
+    if config.json {
+        return print_json(&json!({"ok": true, "communities": communities}));
+    }
+    print!("{}", joined_communities_text(&communities));
+    Ok(())
+}
+
+fn joined_communities(status: StatusCode, body: &str) -> Result<Vec<Value>> {
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(auth_required_error());
+    }
+    let parsed: Option<Value> = serde_json::from_str(body).ok();
+    let error = parsed
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .filter(|error| !error.is_null());
+    if !status.is_success() || error.is_some() {
+        let code = error
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str)
+            .filter(|code| !code.is_empty())
+            .unwrap_or("community_list_failed");
+        let reason = error
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .map(terminal_safe_text)
+            .unwrap_or_else(|| terminal_safe_text(body));
+        let mut failure = CliFailure::new(
+            exit_codes::GENERAL,
+            code,
+            format!(
+                "POST {JOINED_COMMUNITIES_PATH} failed with {} ({code}): {reason}",
+                status.as_u16()
+            ),
+        );
+        if code == "missing_mapping" {
+            let next_action =
+                "Connect your Buzz identity on the Buzz page of the BuilderLab portal, then retry.";
+            failure.message.push_str("\nnext_action: ");
+            failure.message.push_str(next_action);
+            failure.next_action = Some(json!(next_action));
+        }
+        let correlation = parsed
+            .as_ref()
+            .and_then(|value| {
+                value
+                    .get("correlation_id")
+                    .or_else(|| value.get("correlationId"))
+            })
+            .and_then(Value::as_str);
+        return Err(with_failure_trace_id(
+            anyhow::Error::new(failure),
+            correlation,
+        ));
+    }
+    let communities = parsed
+        .as_ref()
+        .and_then(|value| value.get("communities"))
+        .map(|communities| {
+            communities
+                .as_array()
+                .cloned()
+                .context("communities is not a list")
+        })
+        .transpose()
+        .with_context(|| format!("parse {JOINED_COMMUNITIES_PATH} response"))?
+        .unwrap_or_default();
+    communities
+        .iter()
+        .map(|community| {
+            let field = |snake: &str, camel: &str| {
+                community
+                    .get(snake)
+                    .or_else(|| community.get(camel))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            };
+            let id = field("id", "id").with_context(|| {
+                format!("{JOINED_COMMUNITIES_PATH} returned a community without an id")
+            })?;
+            Ok(json!({
+                "community_id": id,
+                "name": field("name", "name"),
+                "host": field("normalized_host", "normalizedHost"),
+            }))
+        })
+        .collect()
+}
+
+fn joined_communities_text(communities: &[Value]) -> String {
+    if communities.is_empty() {
+        return "You haven't joined any Buzz community yet.\n".to_string();
+    }
+    let mut text = String::new();
+    for community in communities {
+        let text_field = |name: &str| {
+            community
+                .get(name)
+                .and_then(Value::as_str)
+                .map(terminal_safe_text)
+        };
+        let id = text_field("community_id").unwrap_or_default();
+        match (text_field("name"), text_field("host")) {
+            (Some(name), Some(host)) => text.push_str(&format!("{id}  {name} ({host})\n")),
+            (Some(name), None) => text.push_str(&format!("{id}  {name}\n")),
+            (None, Some(host)) => text.push_str(&format!("{id}  {host}\n")),
+            (None, None) => text.push_str(&format!("{id}\n")),
+        }
+    }
+    text.push_str("Share an app with one: bl apps community grant <APP_ID> <COMMUNITY_ID>\n");
+    text
 }
 
 fn run_access(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
@@ -7475,7 +7631,7 @@ mod tests {
             .iter()
             .map(|command| command["name"].as_str().unwrap())
             .collect();
-        assert_eq!(actions, ["grant", "revoke"]);
+        assert_eq!(actions, ["grant", "revoke", "list"]);
     }
 
     #[test]
