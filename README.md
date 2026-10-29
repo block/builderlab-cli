@@ -348,8 +348,9 @@ When `--management-base-url` or `BL_APPS_MANAGEMENT_BASE_URL` gives the HTTPS po
 origin for the same environment, `get` also returns an exact `management_url` into the
 app's Share & manage panel; the flag wins over the variable. Without an origin, or
 with a blank one, it still reports the audience, returns `management_url: null`,
-and points the owner to Hosted Apps in the BuilderLab portal. An origin that is set
-but invalid is an error. The CLI never guesses the portal from a workstation, app or
+and points the owner to Hosted Apps in the BuilderLab portal. An invalid
+`--management-base-url` is an error before any request; an invalid
+`BL_APPS_MANAGEMENT_BASE_URL` only drops the link and says why. The CLI never guesses the portal from a workstation, app or
 mesh hostname. Keep the configured control-plane origin for delegated authentication.
 
 The result separates verified policy from unknown access and does not claim
