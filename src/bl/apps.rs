@@ -474,7 +474,8 @@ pub fn command() -> Command {
                     "Grant or revoke viewing access for current members of a Buzz community. \
                      The app owner must be a current member of the community to grant access, but can revoke after leaving it. \
                      A grant adds viewers and never changes the app's visibility. Community viewers can view the app \
-                     but cannot use its hosted tools. Use `bl apps handoff` to confirm the resulting audience.",
+                     but cannot use its hosted tools. Use `bl apps handoff` to confirm the resulting audience. \
+                     Not yet available through the Blox workstation proxy; use Share & manage or an approved ingress.",
                 )
                 .subcommand_required(true)
                 .arg_required_else_help(true)
@@ -1152,6 +1153,22 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let community_id = action_matches
         .get_one::<String>("community-id")
         .context("expected community id")?;
+    let base_url = action_matches
+        .get_one::<String>("apps-base-url")
+        .context("expected Apps Platform control-plane URL")?;
+    // The Blox proxy only asks Kgoose for a sharing credential on workspace
+    // routes, so Compose would refuse every community request it forwards.
+    if proxy_auth_for_url(base_url) {
+        let mut error = CliFailure::new(
+            exit_codes::GENERAL,
+            "community_sharing_unavailable_through_proxy",
+            "Community sharing isn't available through the Blox workstation proxy yet.",
+        );
+        error.next_action = Some(json!(
+            "Share the app with the community from Share & manage, or run `bl apps community` with `--base-url` set to an approved BuilderLab ingress after `bl auth login`."
+        ));
+        return Err(anyhow::Error::new(error));
+    }
     let (client, credential) = control_plane_context(config, action_matches)?;
     // Kgoose replaces the session with a credential bound to the owner, app and
     // community, and checks current community membership before a grant. Read
@@ -7343,77 +7360,89 @@ mod tests {
 
     #[test]
     fn bl_apps_community_grant_reads_only_the_target_grant_before_post() {
-        for proxy in [false, true] {
-            let credential = "apps-e2e-only.community.session";
-            let auth_server = ProcessServer::start(if proxy {
-                vec![]
-            } else {
-                vec![process_auth_response()]
-            });
-            // The sharing read returns only CAS inputs, not the app's access policy.
-            let control_plane = ProcessServer::start(vec![
-                ProcessResponse::json(json!({
-                    "ok": true,
-                    "app_id": "my-app",
-                    "lifecycle_id": "life-123",
-                    "community_grant_revision": 7,
-                })),
-                ProcessResponse::json(json!({"ok": true, "community_grant_revision": 8})),
-            ]);
-            let mut command = process_command(
+        let credential = "apps-e2e-only.community.session";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        // The sharing read returns only CAS inputs, not the app's access policy.
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(json!({
+                "ok": true,
+                "app_id": "my-app",
+                "lifecycle_id": "life-123",
+                "community_grant_revision": 7,
+            })),
+            ProcessResponse::json(json!({"ok": true, "community_grant_revision": 8})),
+        ]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "community",
+                "grant",
+                "my-app",
+                "buzz-alpha",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--json",
+            ],
+            credential,
+        )
+        .output()
+        .expect("run community grant process");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let auth_requests = auth_server.finish();
+        assert_eq!(auth_requests.len(), 1);
+        assert_process_auth(&auth_requests[0], credential);
+        let requests = control_plane.finish();
+        assert_eq!(requests.len(), 2);
+        let path = "/v1/agent/apps/my-app/sharing/communities/buzz-alpha";
+        assert_process_control_plane(&requests[0], "GET", path, credential);
+        assert_process_control_plane(&requests[1], "POST", path, credential);
+        assert_eq!(
+            requests[1].body,
+            json!({"lifecycle_id": "life-123", "expected_revision": 7})
+        );
+    }
+
+    #[test]
+    fn bl_apps_community_refuses_the_blox_proxy_before_any_request() {
+        // The proxy would forward an owner credential that Compose rejects for
+        // community routes, so the CLI stops before authenticating or reading.
+        for action in ["grant", "revoke"] {
+            let auth_server = ProcessServer::start(vec![]);
+            let control_plane = ProcessServer::start(vec![]);
+            let output = process_command(
                 &auth_server,
                 &control_plane,
                 &[
                     "apps",
                     "community",
-                    "grant",
+                    action,
                     "my-app",
                     "buzz-alpha",
                     "--json",
                 ],
-                credential,
-            );
-            command.env(
-                APPS_BASE_URL_ENV_VAR,
-                if proxy {
-                    "http://compose.mesh.example"
-                } else {
-                    APPROVED_TEST_BASE_URL
-                },
-            );
-            if proxy {
-                command.env("BL_APPS_E2E_PROXY", "true");
-            }
-            let output = command.output().expect("run community grant process");
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let auth_requests = auth_server.finish();
-            assert_eq!(auth_requests.len(), usize::from(!proxy));
-            let requests = control_plane.finish();
-            assert_eq!(requests.len(), 2);
-            let path = "/v1/agent/apps/my-app/sharing/communities/buzz-alpha";
-            assert_eq!(requests[0].method, "GET");
-            assert_eq!(requests[0].path, path);
-            assert_eq!(requests[1].method, "POST");
-            assert_eq!(requests[1].path, path);
+                "apps-e2e-only.unused",
+            )
+            .env("BL_APPS_E2E_PROXY", "true")
+            .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+            .output()
+            .expect("run proxied community process");
+            assert!(!output.status.success());
+            let error = process_error(&output);
             assert_eq!(
-                requests[1].body,
-                json!({"lifecycle_id": "life-123", "expected_revision": 7})
+                error["error"]["code"],
+                "community_sharing_unavailable_through_proxy"
             );
-            if proxy {
-                for request in &requests {
-                    for header in ["authorization", "cookie", "x-bb-session-credential"] {
-                        assert!(!request.headers.contains_key(header));
-                    }
-                }
-            } else {
-                assert_process_auth(&auth_requests[0], credential);
-                assert_process_control_plane(&requests[0], "GET", path, credential);
-                assert_process_control_plane(&requests[1], "POST", path, credential);
-            }
+            assert!(error["next_action"]
+                .as_str()
+                .is_some_and(|action| action.contains("Share & manage")));
+            assert!(auth_server.finish().is_empty());
+            assert!(control_plane.finish().is_empty());
         }
     }
 
@@ -7424,7 +7453,7 @@ mod tests {
             (false, 403, "community_grant_denied"),
             (false, 409, "community_grant_conflict"),
         ] {
-            let auth_server = ProcessServer::start(vec![]);
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
             let denied = ProcessResponse::raw(status, json!({"error": {"code": code}}).to_string())
                 .with_trace_id(REQUEST_TRACE_ID);
             let mut responses = vec![];
@@ -7446,19 +7475,19 @@ mod tests {
                     "grant",
                     "my-app",
                     "buzz-alpha",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
                     "--json",
                 ],
-                "apps-e2e-only.unused",
+                "apps-e2e-only.denied-community.session",
             )
-            .env("BL_APPS_E2E_PROXY", "true")
-            .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
             .output()
             .expect("run denied community grant process");
             assert!(!output.status.success());
             let stderr = String::from_utf8(output.stderr).unwrap();
             assert!(stderr.contains(code), "{stderr}");
             assert!(stderr.contains(REQUEST_TRACE_ID), "{stderr}");
-            assert!(auth_server.finish().is_empty());
+            auth_server.finish();
             let requests = control_plane.finish();
             assert_eq!(requests.len(), if read_denied { 1 } else { 2 });
             let path = "/v1/agent/apps/my-app/sharing/communities/buzz-alpha";
