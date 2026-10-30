@@ -38,6 +38,9 @@ use super::skills_api::{exit_codes, failure, failure_trace_id, with_failure_trac
 use super::skills_config::{kgoose_service_url, SkillsConfig};
 
 const APPS_BASE_URL_ENV_VAR: &str = "BL_APPS_CONTROL_PLANE_URL";
+// Set to `enabled` by Blox workstations whose proxy asks Kgoose for a
+// community sharing credential (bb-public). bb-block leaves it unset.
+const APPS_COMMUNITY_SHARING_ENV_VAR: &str = "BL_APPS_COMMUNITY_SHARING";
 const APPS_CLIENT_VERSION_ENV_VAR: &str = "BL_APPS_CLIENT_VERSION";
 // Apps compatibility evolves independently of the standalone CLI release
 // numbering. Keep the beta package version in --version and User-Agent.
@@ -1486,9 +1489,10 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let base_url = action_matches
         .get_one::<String>("apps-base-url")
         .context("expected Apps Platform control-plane URL")?;
-    // The Blox proxy only asks Kgoose for a sharing credential on workspace
-    // routes, so Compose would refuse every community request it forwards.
-    if proxy_auth_for_url(base_url) {
+    // Only a workstation that opts in has a proxy that asks Kgoose for the
+    // community sharing credential. Elsewhere (bb-block) Compose would refuse
+    // the owner credential the proxy forwards, so stop before any request.
+    if proxy_auth_for_url(base_url) && !community_sharing_through_proxy() {
         let next_action = format!(
             "{} Or run `bl apps community` with `--base-url` set to an approved BuilderLab ingress after `bl auth login`.",
             community_share_and_manage_step(app_id)
@@ -1497,7 +1501,7 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
             exit_codes::GENERAL,
             "community_sharing_unavailable_through_proxy",
             format!(
-                "Community sharing isn't available through the Blox workstation proxy yet.\nnext_action: {next_action}"
+                "Community sharing isn't available through this Blox workstation's proxy.\nnext_action: {next_action}"
             ),
         );
         error.next_action = Some(json!(next_action));
@@ -2905,6 +2909,10 @@ fn is_blox_control_plane_url(url: &url::Url) -> bool {
             .is_some_and(|configured| configured.origin() == url.origin())
 }
 
+fn community_sharing_through_proxy() -> bool {
+    std::env::var(APPS_COMMUNITY_SHARING_ENV_VAR).as_deref() == Ok("enabled")
+}
+
 fn proxy_auth_for_url(base_url: &str) -> bool {
     url::Url::parse(base_url).is_ok_and(|url| is_blox_control_plane_url(&url))
 }
@@ -3923,6 +3931,7 @@ mod tests {
         command.env_remove("BL_APPS_E2E_PROXY");
         command.env_remove(APPS_BASE_URL_ENV_VAR);
         command.env_remove("BL_APPS_MANAGEMENT_BASE_URL");
+        command.env_remove(APPS_COMMUNITY_SHARING_ENV_VAR);
         command.env_remove("TRACEPARENT");
         command
     }
@@ -9027,6 +9036,96 @@ mod tests {
             assert!(error["next_action"]
                 .as_str()
                 .is_some_and(|action| action.contains("Share & manage")));
+            assert!(auth_server.finish().is_empty());
+            assert!(control_plane.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn bl_apps_community_goes_through_the_blox_proxy_where_the_workstation_enables_it() {
+        // bb-public workstations set the opt-in; Roxy then asks Kgoose for the
+        // community-bound credential, so the CLI sends none of its own.
+        for (action, method) in [("grant", "POST"), ("revoke", "DELETE")] {
+            let auth_server = ProcessServer::start(vec![]);
+            let control_plane = ProcessServer::start(vec![
+                ProcessResponse::json(json!({
+                    "ok": true,
+                    "app_id": "my-app",
+                    "lifecycle_id": "life-123",
+                    "community_grant_revision": 7,
+                })),
+                ProcessResponse::json(json!({"ok": true, "community_grant_revision": 8})),
+            ]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "community",
+                    action,
+                    "my-app",
+                    "buzz-alpha",
+                    "--json",
+                ],
+                "apps-e2e-only.unused",
+            )
+            .env("BL_APPS_E2E_PROXY", "true")
+            .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+            .env(APPS_COMMUNITY_SHARING_ENV_VAR, "enabled")
+            .output()
+            .expect("run proxied community process");
+            assert!(
+                output.status.success(),
+                "{action}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(auth_server.finish().is_empty());
+            let requests = control_plane.finish();
+            assert_eq!(requests.len(), 2);
+            let path = "/v1/agent/apps/my-app/sharing/communities/buzz-alpha";
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(requests[0].path, path);
+            assert_eq!(requests[1].method, method);
+            assert_eq!(requests[1].path, path);
+            for request in &requests {
+                assert!(!request.headers.contains_key("authorization"));
+            }
+            assert_eq!(
+                requests[1].body,
+                json!({"lifecycle_id": "life-123", "expected_revision": 7})
+            );
+        }
+    }
+
+    #[test]
+    fn bl_apps_community_keeps_refusing_the_blox_proxy_without_the_exact_opt_in() {
+        // bb-block has no community sharing, so its workstations leave the opt-in unset.
+        for value in ["", "true", "Enabled", "disabled"] {
+            let auth_server = ProcessServer::start(vec![]);
+            let control_plane = ProcessServer::start(vec![]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "community",
+                    "grant",
+                    "my-app",
+                    "buzz-alpha",
+                    "--json",
+                ],
+                "apps-e2e-only.unused",
+            )
+            .env("BL_APPS_E2E_PROXY", "true")
+            .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+            .env(APPS_COMMUNITY_SHARING_ENV_VAR, value)
+            .output()
+            .expect("run proxied community process");
+            let error = process_error(&output);
+            assert_eq!(
+                error["error"]["code"], "community_sharing_unavailable_through_proxy",
+                "{value:?}"
+            );
             assert!(auth_server.finish().is_empty());
             assert!(control_plane.finish().is_empty());
         }
