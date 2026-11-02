@@ -357,3 +357,27 @@ The result separates verified policy from unknown access and does not claim
 recipient browser acceptance. `get` performs no sharing, session switch, or deployment.
 If policy inspection is unavailable, the audience is reported as unknown.
 Portal deep links require the matching portal and Kgoose workspace-selection changes.
+
+### App lifetime inspection and renewal
+
+When the selected control plane advertises lifetime operations, read the exact
+app's deadline and renewal eligibility:
+
+```sh
+bl apps expiration APP_ID --base-url "$BL_APPS_CONTROL_PLANE_URL" --json
+```
+
+Use the returned incarnation, expiration revision, and an allowed day count to
+renew as the owner. Preserve all fields on a retry, including the request ID:
+
+```sh
+bl apps renew APP_ID --base-url "$BL_APPS_CONTROL_PLANE_URL" \
+  --app-incarnation-id INCARNATION --expected-revision REVISION \
+  --request-id UNIQUE_RENEWAL_ID --days DAYS --json
+```
+
+Renewal adds days to the previous deadline. The server enforces ownership and
+the renewal window. A conflict does not trigger a retry with a newer revision;
+read current expiration before choosing a new request. An identical retained
+retry returns the original receipt without another extension. These commands
+do not enroll, restore, or delete an app, and do not prove serving readiness.

@@ -109,6 +109,8 @@ pub fn command() -> Command {
                 ),
         ))
         .subcommand(control_plane_args(app_get_command("get")))
+        .subcommand(control_plane_args(expiration_command(false)))
+        .subcommand(control_plane_args(expiration_command(true)))
         .subcommand(control_plane_args(
             Command::new("versions")
                 .about("List active and rollback-candidate versions for an app")
@@ -516,6 +518,30 @@ pub fn command() -> Command {
         ))
 }
 
+fn expiration_command(renew: bool) -> Command {
+    let command = Command::new(if renew { "renew" } else { "expiration" })
+        .about(if renew {
+            "Extend an enrolled app's expiration as its owner"
+        } else {
+            "Read an app's expiration and renewal eligibility"
+        })
+        .arg(Arg::new("app-id").required(true).value_name("APP_ID"))
+        .arg(
+            Arg::new("environment")
+                .long("environment")
+                .value_name("ENVIRONMENT"),
+        );
+    if !renew {
+        return command;
+    }
+    command
+        .long_about("Renew within the server's renewal window. Read expiration first, then supply its exact incarnation and revision. Preserve every field, including request ID, on retries. A conflict requires a fresh read; this command never retries with a newer revision automatically.")
+        .arg(Arg::new("request-id").long("request-id").required(true).help("Stable ID for this renewal; reuse only for an identical retry"))
+        .arg(Arg::new("app-incarnation-id").long("app-incarnation-id").required(true).help("Exact incarnation from apps expiration"))
+        .arg(Arg::new("expected-revision").long("expected-revision").required(true).value_parser(clap::value_parser!(u64).range(1..=9_007_199_254_740_990)))
+        .arg(Arg::new("days").long("days").required(true).value_parser(clap::value_parser!(u32).range(1..)).help("Extension from the previous deadline, chosen from server renewal options"))
+}
+
 fn app_get_command(name: &'static str) -> Command {
     Command::new(name)
         .about("Show an app, who can open it, and its Share & manage link")
@@ -609,6 +635,8 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("contract", contract_matches)) => run_contract(config, contract_matches),
         Some(("list", list_matches)) => run_list(config, list_matches),
         Some(("get", get_matches)) => run_get(config, get_matches),
+        Some(("expiration", args)) => run_expiration(config, args, false),
+        Some(("renew", args)) => run_expiration(config, args, true),
         Some(("handoff", handoff_matches)) => run_get(config, handoff_matches),
         Some(("versions", versions_matches)) => run_versions(config, versions_matches),
         Some(("create", create_matches)) => run_create(config, create_matches),
@@ -644,6 +672,32 @@ fn run_list(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let include_deleted = matches.get_flag("include-deleted");
     let (client, credential) = control_plane_context(config, matches)?;
     let response = client.list_apps(&credential, scope, include_deleted)?;
+    print_json(&response)
+}
+
+fn run_expiration(config: &SkillsConfig, matches: &ArgMatches, renew: bool) -> Result<()> {
+    let app_id = matches
+        .get_one::<String>("app-id")
+        .context("expected app id")?;
+    let environment = matches.get_one::<String>("environment");
+    let (client, credential) = control_plane_context(config, matches)?;
+    let response = if renew {
+        let mut body = json!({
+            "request_id": matches.get_one::<String>("request-id").context("expected request id")?,
+            "app_incarnation_id": matches.get_one::<String>("app-incarnation-id").context("expected incarnation")?,
+            "expected_revision": matches.get_one::<u64>("expected-revision").context("expected revision")?,
+            "days": matches.get_one::<u32>("days").context("expected days")?,
+        });
+        if let Some(environment) = environment {
+            body["environment"] = json!(environment);
+        }
+        client.renew_expiration(&credential, app_id, &body)?
+    } else {
+        let query = environment
+            .map(|e| vec![("environment", e.clone())])
+            .unwrap_or_default();
+        client.get_app_resource(&credential, app_id, "expiration", &query)?
+    };
     print_json(&response)
 }
 
@@ -2552,6 +2606,25 @@ impl ControlPlaneClient {
             })?
             .extend(["sharing", "communities", community_id]);
         Ok(url)
+    }
+
+    fn renew_expiration(
+        &self,
+        credential: &ComposeSessionCredential,
+        app_id: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        let mut url = self.app_resource_url(app_id, "expiration", &[])?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid Apps URL"))?
+            .push("renew");
+        let path = request_path(&url);
+        self.authorized_json_request(credential, "POST", &path, |authorization| {
+            self.standard_request(self.client.post(url.clone()), authorization)
+                .json(body)
+                .build()
+                .context("build app renewal request")
+        })
     }
 
     fn get_app_resource(
@@ -4511,6 +4584,114 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn lifetime_commands_preserve_owner_request_and_server_response() {
+        let credential = "apps-e2e-only.lifetime.session+credential";
+        for environment in [None, Some("staging/west")] {
+            let view = json!({"ok": true, "app_incarnation_id": "inc-1", "expiration": {"expiration_revision": 7}, "renewal": {"eligible": true, "days": [2]}});
+            let receipt = json!({"ok": true, "replayed": true, "receipt": {"previous_expires_at": "2026-11-04T12:00:00Z", "expires_at": "2026-11-06T12:00:00Z"}});
+            let auth = ProcessServer::start(vec![process_auth_response(), process_auth_response()]);
+            let server = ProcessServer::start(vec![
+                ProcessResponse::json(view.clone()),
+                ProcessResponse::json(receipt.clone()),
+            ]);
+            for (action, expected) in [("expiration", &view), ("renew", &receipt)] {
+                let mut args = vec![
+                    "apps",
+                    action,
+                    "test/app",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                    "--json",
+                ];
+                if let Some(env) = environment {
+                    args.extend(["--environment", env]);
+                }
+                if action == "renew" {
+                    args.extend([
+                        "--request-id",
+                        "renew-1",
+                        "--app-incarnation-id",
+                        "inc-1",
+                        "--expected-revision",
+                        "7",
+                        "--days",
+                        "2",
+                    ]);
+                }
+                let output = process_command(&auth, &server, &args, credential)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    &serde_json::from_str::<Value>(&process_stdout(&output)).unwrap(),
+                    expected
+                );
+            }
+            for request in auth.finish() {
+                assert_process_auth(&request, credential);
+            }
+            let requests = server.finish();
+            assert_eq!(requests.len(), 2);
+            let path = if environment.is_some() {
+                "/v1/agent/apps/test%2Fapp/expiration?environment=staging%2Fwest"
+            } else {
+                "/v1/agent/apps/test%2Fapp/expiration"
+            };
+            assert_process_control_plane(&requests[0], "GET", path, credential);
+            assert_process_control_plane(
+                &requests[1],
+                "POST",
+                "/v1/agent/apps/test%2Fapp/expiration/renew",
+                credential,
+            );
+            let mut body = json!({"request_id":"renew-1","app_incarnation_id":"inc-1","expected_revision":7,"days":2});
+            if let Some(env) = environment {
+                body["environment"] = json!(env);
+            }
+            assert_eq!(requests[1].body, body);
+        }
+    }
+
+    #[test]
+    fn lifetime_renewal_conflict_does_not_retry_or_change_revision() {
+        let credential = "apps-e2e-only.lifetime.conflict";
+        let auth = ProcessServer::start(vec![process_auth_response()]);
+        let server = ProcessServer::start(vec![ProcessResponse::json_status(
+            409,
+            json!({"ok":false,"error":{"code":"outside_renewal_window","message":"Not yet eligible"},"next_action":"Read expiration before retrying."}),
+        )]);
+        let args = [
+            "apps",
+            "renew",
+            "test-app",
+            "--base-url",
+            APPROVED_TEST_BASE_URL,
+            "--request-id",
+            "early-1",
+            "--app-incarnation-id",
+            "inc-1",
+            "--expected-revision",
+            "7",
+            "--days",
+            "2",
+            "--json",
+        ];
+        let output = process_command(&auth, &server, &args, credential)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("outside_renewal_window"));
+        auth.finish();
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body["expected_revision"], 7);
     }
 
     #[test]
