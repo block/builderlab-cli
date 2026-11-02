@@ -282,8 +282,9 @@ pub fn command() -> Command {
                 .long_about(
                     "Request one owner-only Apps Platform logical deletion. The active route is \
                      retired while artifacts may be retained. Capacity remains held when \
-                     quota_cleanup_pending is true; explicitly retry cleanup and verify \
-                     authoritative usage instead of subtracting a slot locally. \
+                     quota_cleanup_pending is true; the server retries that cleanup on its \
+                     own, and there is no client command to force it. Verify authoritative \
+                     usage instead of subtracting a slot locally. \
                      --confirm-app-id and --confirm-environment must exactly match APP_ID and \
                      --environment. After deletion or an uncertain result, inspect the same \
                      app/environment and refresh `bl apps list --scope owned --include-deleted` \
@@ -3124,6 +3125,10 @@ fn known_failure_explanation(
         "tier_resolution_unavailable" => (
             "Apps Platform couldn't check your site allowance, so nothing was changed.",
             Some("Wait a minute, then run the same command again.".to_string()),
+        ),
+        "owner_site_limit_reached" => (
+            "You already have as many apps as your plan allows, so nothing was changed. Existing apps keep working.",
+            Some("Run `bl apps list --scope owned --include-deleted` to see which apps use your allowance. Deleting an app you no longer need frees its place once the server finishes cleaning it up; check that list again before retrying.".to_string()),
         ),
         "owner_site_quota_unavailable" => (
             "Apps Platform isn't accepting new deployments right now, so nothing was changed.",
@@ -8152,6 +8157,14 @@ mod tests {
                 "Wait a minute, then run the same command again.",
             ),
             (
+                "POST",
+                "/v1/agent/apps/example/reserve",
+                409,
+                "owner_site_limit_reached",
+                "as many apps as your plan allows, so nothing was changed",
+                "Run `bl apps list --scope owned --include-deleted`",
+            ),
+            (
                 "PUT",
                 "/v1/agent/apps/example/visibility",
                 403,
@@ -8258,7 +8271,9 @@ mod tests {
             let (_, payload) = failure_info(&error);
             assert_eq!(payload["error"]["code"], "owner_site_limit_reached");
             assert_eq!(payload["error"]["details"], json!({"http_status":409}));
-            assert!(payload.get("next_action").is_none());
+            assert!(payload["next_action"]
+                .as_str()
+                .is_some_and(|step| step.starts_with("Run `bl apps list --scope owned")));
             assert!(!payload.to_string().contains("hidden"));
         }
     }
