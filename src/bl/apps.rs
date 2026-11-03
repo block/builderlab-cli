@@ -3089,6 +3089,57 @@ fn sanitize_recovery_field(value: &Value, credential: &ComposeSessionCredential)
     Some(value)
 }
 
+/// Names the apps outside this workspace that hold the owner's slots, which
+/// `bl apps list --scope owned` here doesn't show. The server sends
+/// `slot_holders` only to the owner, and they were sanitized with the rest of
+/// `details`.
+fn limit_slot_holder_summary(details: &Value) -> Option<String> {
+    let holders = details.get("slot_holders")?.as_array()?;
+    let elsewhere: Vec<String> = holders
+        .iter()
+        .filter(|holder| holder.get("other_workspace").and_then(Value::as_bool) == Some(true))
+        .filter_map(|holder| {
+            let app = holder.get("app_id")?.as_str()?;
+            let workspaces: Vec<&str> = holder
+                .get("workspace_ids")
+                .and_then(Value::as_array)
+                .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            Some(if workspaces.is_empty() {
+                app.to_string()
+            } else {
+                format!("{app} (workspace {})", workspaces.join(", "))
+            })
+        })
+        .collect();
+    let unclassified = details.get("bucket").and_then(Value::as_str).is_some()
+        && holders.iter().any(|holder| {
+            holder
+                .get("site_types")
+                .and_then(Value::as_array)
+                .is_some_and(|types| types.iter().any(|kind| kind == "unclassified"))
+        });
+    let mut lines = Vec::new();
+    match elsewhere.len() {
+        0 => {}
+        1 => lines.push(format!(
+            "1 app using it is in another workspace, so it isn't listed here: {}. Run `bl workspace switch` to manage it.",
+            elsewhere[0]
+        )),
+        count => lines.push(format!(
+            "{count} apps using it are in other workspaces, so they aren't listed here: {}. Run `bl workspace switch` to manage them.",
+            elsewhere.join(", ")
+        )),
+    }
+    if unclassified {
+        lines.push(
+            "Apps without a recorded site type, usually ones from before static and dynamic limits were split, count against both."
+                .to_string(),
+        );
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 fn app_id_from_path(path: &str) -> Option<&str> {
     let path = path.split('?').next().unwrap_or(path);
     path.strip_prefix("/v1/agent/apps/")
@@ -3241,6 +3292,12 @@ fn control_plane_http_failure(
     if let Some((explanation, _)) = known.as_ref() {
         message.push('\n');
         message.push_str(explanation);
+    }
+    if code == "owner_site_limit_reached" {
+        if let Some(summary) = limit_slot_holder_summary(&details) {
+            message.push('\n');
+            message.push_str(&summary);
+        }
     }
     if let Some((diagnostic, guidance)) = validation {
         message.push_str("\nvalidation: ");
@@ -8252,6 +8309,57 @@ mod tests {
         assert!(payload["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("couldn't check your site allowance")));
+    }
+
+    #[test]
+    fn app_limit_names_slot_holders_in_other_workspaces() {
+        let error = control_plane_http_failure(
+            "POST",
+            "/v1/agent/apps/example/reserve",
+            StatusCode::CONFLICT,
+            &json!({
+                "error": {"code": "owner_site_limit_reached", "details": {
+                    "tier": "free", "bucket": "dynamic", "current_count": 3, "max_sites": 3,
+                    "slot_holders": [
+                        {"app_id": "here", "workspace_ids": ["personal"], "site_types": ["dynamic"], "other_workspace": false},
+                        {"app_id": "old-board", "workspace_ids": ["team"], "site_types": ["unclassified"], "other_workspace": true},
+                        {"app_id": "team-tool", "workspace_ids": ["team"], "site_types": ["dynamic"], "other_workspace": true}
+                    ]
+                }},
+                "next_action": "Review your owned sites and delete one you no longer need, then retry."
+            })
+            .to_string(),
+            &test_credential("credential-secret"),
+        );
+        let (_, payload) = failure_info(&error);
+        let message = payload["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains("2 apps using it are in other workspaces, so they aren't listed here: old-board (workspace team), team-tool (workspace team)."),
+            "{message}"
+        );
+        assert!(message.contains("count against both"), "{message}");
+        assert!(!message.contains("here (workspace"), "{message}");
+        assert_eq!(
+            payload["error"]["details"]["slot_holders"][1]["app_id"],
+            "old-board"
+        );
+
+        // Without holders (an older server, or a caller who isn't the owner)
+        // the message stays as before.
+        let error = control_plane_http_failure(
+            "POST",
+            "/v1/agent/apps/example/reserve",
+            StatusCode::CONFLICT,
+            &json!({"error": {"code": "owner_site_limit_reached", "details": {"tier": "free", "current_count": 3, "max_sites": 3}}})
+                .to_string(),
+            &test_credential("credential-secret"),
+        );
+        let (_, payload) = failure_info(&error);
+        let message = payload["error"]["message"].as_str().expect("message");
+        assert!(
+            !message.contains("other workspace") && !message.contains("another workspace"),
+            "{message}"
+        );
     }
 
     #[test]
