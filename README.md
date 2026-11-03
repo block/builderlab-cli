@@ -263,9 +263,10 @@ KGOOSE_BASE_URL=http://localhost:8080 \
   ./target/debug/bl --local-dev skills list
 ```
 
-Authentication storage defaults to the operating-system keyring where
-supported. The local auth guide documents file-backed storage for tests and
-development without modifying keyring state.
+Authentication storage defaults to the operating-system keyring on macOS and
+to a private file, `<bl home>/auth-sessions.json`, on Linux and Windows. The
+local auth guide documents file-backed storage for tests and development
+without modifying the default store.
 
 ## Project layout
 
@@ -314,8 +315,9 @@ Do not use `--force` just to adopt an existing installation.
 The backend `X-BB-Session-Credential` header, `BBIdentity` authorization scheme,
 `builderbot` extension ID, and
 Playpen routing key are protocol identifiers and retain their existing names.
-On Linux and Windows, keyring login storage is not implemented; the explicit
-`BL_AUTH_STORAGE=file` option is available as described in the local auth guide.
+On Linux and Windows, keyring login storage is not implemented, so login
+sessions are stored in `<bl home>/auth-sessions.json` without any setup;
+`BL_AUTH_STORAGE=file:<path>` selects another file.
 
 On managed bb-public Blox workstations, `bl workspace list` uses the same
 operator-configured Kgoose endpoint and Roxy owner identity as `bl tools`.
