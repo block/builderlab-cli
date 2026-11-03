@@ -3126,9 +3126,10 @@ fn known_failure_explanation(
             Some("Wait a minute, then run the same command again.".to_string()),
         ),
         // The server always sends its own next step for this code, so what the
-        // user must know about other workspaces goes in the explanation.
+        // user must know about apps from a previous workspace goes in the
+        // explanation.
         "owner_site_limit_reached" => (
-            "You already have as many apps as your plan allows, so nothing was changed. Existing apps keep working. The allowance counts the apps you own in every workspace, not just this one; `bl apps list --scope owned` shows the ones in this workspace and your current usage.",
+            "You already have as many apps as your plan allows, so nothing was changed. Existing apps keep working. Your limit counts every app you own, including any from a previous workspace that `bl apps list --scope owned` doesn't show. That listing shows your current usage.",
             Some("Delete every environment of an app you no longer need. Its place frees once the server finishes cleaning it up, so check the usage in `bl apps list --scope owned` again before retrying.".to_string()),
         ),
         "owner_site_quota_unavailable" => (
@@ -8255,7 +8256,7 @@ mod tests {
     }
 
     #[test]
-    fn app_limit_says_every_workspace_counts_even_with_the_server_step() {
+    fn app_limit_says_every_owned_app_counts_even_with_the_server_step() {
         let error = control_plane_http_failure(
             "POST",
             "/v1/agent/apps/example/reserve",
@@ -8274,7 +8275,8 @@ mod tests {
         );
         assert!(payload["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("counts the apps you own in every workspace")));
+            .is_some_and(|message| message
+                .contains("counts every app you own, including any from a previous workspace")));
     }
 
     #[test]
