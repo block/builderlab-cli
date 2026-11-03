@@ -282,7 +282,8 @@ pub fn command() -> Command {
                 .long_about(
                     "Request one owner-only Apps Platform logical deletion. The active route is \
                      retired while artifacts may be retained. Capacity remains held when \
-                     quota_cleanup_pending is true; explicitly retry cleanup and verify \
+                     quota_cleanup_pending is true; the server retries that cleanup on its \
+                     own, and the BuilderLab team can help if it stays pending. Verify \
                      authoritative usage instead of subtracting a slot locally. \
                      --confirm-app-id and --confirm-environment must exactly match APP_ID and \
                      --environment. After deletion or an uncertain result, inspect the same \
@@ -3124,6 +3125,12 @@ fn known_failure_explanation(
         "tier_resolution_unavailable" => (
             "Apps Platform couldn't check your site allowance, so nothing was changed.",
             Some("Wait a minute, then run the same command again.".to_string()),
+        ),
+        // The server always sends its own next step for this code, so the
+        // explanation carries what the user must know.
+        "owner_site_limit_reached" => (
+            "You already have as many apps as your plan allows, so nothing was changed. Existing apps keep working. `bl apps list --scope owned` shows your apps and, when available, your usage.",
+            Some("Delete every environment of an app you no longer need. Its place frees once the server finishes cleaning it up, so check the usage in `bl apps list --scope owned --include-deleted` again before retrying.".to_string()),
         ),
         "owner_site_quota_unavailable" => (
             "Apps Platform isn't accepting new deployments right now, so nothing was changed.",
@@ -8152,6 +8159,14 @@ mod tests {
                 "Wait a minute, then run the same command again.",
             ),
             (
+                "POST",
+                "/v1/agent/apps/example/reserve",
+                409,
+                "owner_site_limit_reached",
+                "as many apps as your plan allows, so nothing was changed",
+                "Delete every environment of an app you no longer need.",
+            ),
+            (
                 "PUT",
                 "/v1/agent/apps/example/visibility",
                 403,
@@ -8241,6 +8256,31 @@ mod tests {
     }
 
     #[test]
+    fn app_limit_explains_itself_even_with_the_server_step() {
+        let error = control_plane_http_failure(
+            "POST",
+            "/v1/agent/apps/example/reserve",
+            StatusCode::CONFLICT,
+            &json!({
+                "error": {"code": "owner_site_limit_reached"},
+                "next_action": "Review your owned sites and delete one you no longer need, then retry."
+            })
+            .to_string(),
+            &test_credential("credential-secret"),
+        );
+        let (_, payload) = failure_info(&error);
+        assert_eq!(
+            payload["next_action"],
+            "Review your owned sites and delete one you no longer need, then retry."
+        );
+        assert!(payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message
+                .contains("nothing was changed. Existing apps keep working.")
+                && !message.contains("workspace")));
+    }
+
+    #[test]
     fn unsafe_error_field_keys_do_not_leak_or_replace_typed_errors() {
         for key in ["credential-secret", "unsafe\u{1b}key", "unsafe\u{202e}key"] {
             let field = json!({key: "hidden", "[REDACTED]": "existing"});
@@ -8258,7 +8298,10 @@ mod tests {
             let (_, payload) = failure_info(&error);
             assert_eq!(payload["error"]["code"], "owner_site_limit_reached");
             assert_eq!(payload["error"]["details"], json!({"http_status":409}));
-            assert!(payload.get("next_action").is_none());
+            assert!(payload["next_action"].as_str().is_some_and(|step| step
+                .starts_with("Delete every environment of an app")
+                && step.contains("--include-deleted")
+                && !step.contains("workspace")));
             assert!(!payload.to_string().contains("hidden"));
         }
     }
