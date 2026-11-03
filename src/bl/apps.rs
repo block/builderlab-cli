@@ -3126,9 +3126,11 @@ fn known_failure_explanation(
             "Apps Platform couldn't check your site allowance, so nothing was changed.",
             Some("Wait a minute, then run the same command again.".to_string()),
         ),
+        // The server always sends its own next step for this code, so what the
+        // user must know about other workspaces goes in the explanation.
         "owner_site_limit_reached" => (
-            "You already have as many apps as your plan allows, so nothing was changed. Existing apps keep working.",
-            Some("Run `bl apps list --scope owned --include-deleted` to see the apps you own in this workspace. The allowance counts apps you own in every workspace, so apps elsewhere use it too. Deleting an app you no longer need frees its place once the server finishes cleaning it up; check again before retrying.".to_string()),
+            "You already have as many apps as your plan allows, so nothing was changed. Existing apps keep working. The allowance counts the apps you own in every workspace, not just this one.",
+            Some("Run `bl apps list --scope owned --include-deleted` to see the apps you own in this workspace. Deleting an app you no longer need frees its place once the server finishes cleaning it up; check again before retrying.".to_string()),
         ),
         "owner_site_quota_unavailable" => (
             "Apps Platform isn't accepting new deployments right now, so nothing was changed.",
@@ -8251,6 +8253,29 @@ mod tests {
         assert!(payload["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("couldn't check your site allowance")));
+    }
+
+    #[test]
+    fn app_limit_says_every_workspace_counts_even_with_the_server_step() {
+        let error = control_plane_http_failure(
+            "POST",
+            "/v1/agent/apps/example/reserve",
+            StatusCode::CONFLICT,
+            &json!({
+                "error": {"code": "owner_site_limit_reached"},
+                "next_action": "Review your owned sites and delete one you no longer need, then retry."
+            })
+            .to_string(),
+            &test_credential("credential-secret"),
+        );
+        let (_, payload) = failure_info(&error);
+        assert_eq!(
+            payload["next_action"],
+            "Review your owned sites and delete one you no longer need, then retry."
+        );
+        assert!(payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("counts the apps you own in every workspace")));
     }
 
     #[test]
