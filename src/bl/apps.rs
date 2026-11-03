@@ -3128,7 +3128,7 @@ fn known_failure_explanation(
         ),
         "owner_site_limit_reached" => (
             "You already have as many apps as your plan allows, so nothing was changed. Existing apps keep working.",
-            Some("Run `bl apps list --scope owned --include-deleted` to see which apps use your allowance. Deleting an app you no longer need frees its place once the server finishes cleaning it up; check that list again before retrying.".to_string()),
+            Some("Run `bl apps list --scope owned --include-deleted` to see the apps you own in this workspace. The allowance counts apps you own in every workspace, so apps elsewhere use it too. Deleting an app you no longer need frees its place once the server finishes cleaning it up; check again before retrying.".to_string()),
         ),
         "owner_site_quota_unavailable" => (
             "Apps Platform isn't accepting new deployments right now, so nothing was changed.",
