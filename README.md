@@ -205,11 +205,13 @@ admission can retain that reservation until retry or owner deletion.
 
 Deletion requires the exact app and environment confirmations. A retired route
 does not prove capacity was released: `quota_cleanup_pending: true` means the
-slot remains held. Inspect the same app/environment and refresh
-`bl apps list --scope owned --include-deleted --json`; explicitly retry cleanup
-until the server confirms release. Owner reconciliation and unavailable quota
-or tier services require recovery before another mutation. The CLI does not
-automatically delete apps or retry failed mutations.
+slot remains held. The server retries that cleanup on its own, so there is
+nothing to rerun: inspect the same app/environment and recheck usage with
+`bl apps list --scope owned --include-deleted --json`. If cleanup stays pending,
+ask the BuilderLab team, because some cases need an operator to resolve. Owner
+reconciliation and unavailable quota or tier services require recovery before
+another mutation. The CLI does not automatically delete apps or retry failed
+mutations.
 
 ## Local development
 

@@ -283,7 +283,7 @@ pub fn command() -> Command {
                     "Request one owner-only Apps Platform logical deletion. The active route is \
                      retired while artifacts may be retained. Capacity remains held when \
                      quota_cleanup_pending is true; the server retries that cleanup on its \
-                     own. Verify authoritative usage instead of subtracting a slot locally. \
+                     own, and the BuilderLab team can help if it stays pending. Verify authoritative usage instead of subtracting a slot locally. \
                      --confirm-app-id and --confirm-environment must exactly match APP_ID and \
                      --environment. After deletion or an uncertain result, inspect the same \
                      app/environment and refresh `bl apps list --scope owned --include-deleted` \
@@ -3125,11 +3125,10 @@ fn known_failure_explanation(
             "Apps Platform couldn't check your site allowance, so nothing was changed.",
             Some("Wait a minute, then run the same command again.".to_string()),
         ),
-        // The server always sends its own next step for this code, so what the
-        // user must know about apps from a previous workspace goes in the
-        // explanation.
+        // The server always sends its own next step for this code, so the
+        // explanation carries what the user must know.
         "owner_site_limit_reached" => (
-            "You already have as many apps as your plan allows, so nothing was changed. Existing apps keep working. Your limit counts every app you own, including any from a previous workspace that `bl apps list --scope owned` doesn't show. That listing shows your current usage.",
+            "You already have as many apps as your plan allows, so nothing was changed. Existing apps keep working. `bl apps list --scope owned` shows your apps and current usage.",
             Some("Delete every environment of an app you no longer need. Its place frees once the server finishes cleaning it up, so check the usage in `bl apps list --scope owned` again before retrying.".to_string()),
         ),
         "owner_site_quota_unavailable" => (
@@ -8256,7 +8255,7 @@ mod tests {
     }
 
     #[test]
-    fn app_limit_says_every_owned_app_counts_even_with_the_server_step() {
+    fn app_limit_explains_itself_even_with_the_server_step() {
         let error = control_plane_http_failure(
             "POST",
             "/v1/agent/apps/example/reserve",
@@ -8276,7 +8275,8 @@ mod tests {
         assert!(payload["error"]["message"]
             .as_str()
             .is_some_and(|message| message
-                .contains("counts every app you own, including any from a previous workspace")));
+                .contains("nothing was changed. Existing apps keep working.")
+                && !message.contains("workspace")));
     }
 
     #[test]
