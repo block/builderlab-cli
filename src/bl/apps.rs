@@ -3091,11 +3091,13 @@ fn sanitize_recovery_field(value: &Value, credential: &ComposeSessionCredential)
 
 /// Names the apps outside this workspace that hold the owner's slots, which
 /// `bl apps list --scope owned` here doesn't show. The server sends
-/// `slot_holders` only to the owner, and they were sanitized with the rest of
-/// `details`.
+/// `slot_holders` only to the owner. Like the known-code text, the sentence is
+/// CLI-owned; it only interpolates app and workspace IDs, which were sanitized
+/// with the rest of `details`, and it names at most a few of them.
 fn limit_slot_holder_summary(details: &Value) -> Option<String> {
+    const MAX_NAMED: usize = 10;
     let holders = details.get("slot_holders")?.as_array()?;
-    let elsewhere: Vec<String> = holders
+    let mut elsewhere: Vec<String> = holders
         .iter()
         .filter(|holder| holder.get("other_workspace").and_then(Value::as_bool) == Some(true))
         .filter_map(|holder| {
@@ -3119,15 +3121,20 @@ fn limit_slot_holder_summary(details: &Value) -> Option<String> {
                 .and_then(Value::as_array)
                 .is_some_and(|types| types.iter().any(|kind| kind == "unclassified"))
         });
+    let count = elsewhere.len();
+    if count > MAX_NAMED {
+        elsewhere.truncate(MAX_NAMED);
+        elsewhere.push(format!("and {} more", count - MAX_NAMED));
+    }
     let mut lines = Vec::new();
-    match elsewhere.len() {
+    match count {
         0 => {}
         1 => lines.push(format!(
-            "1 app using it is in another workspace, so it isn't listed here: {}. Run `bl workspace switch` to manage it.",
+            "1 app that counts against your limit is in another workspace, so it isn't listed here: {}. Run `bl workspace switch` to manage it.",
             elsewhere[0]
         )),
         count => lines.push(format!(
-            "{count} apps using it are in other workspaces, so they aren't listed here: {}. Run `bl workspace switch` to manage them.",
+            "{count} apps that count against your limit are in other workspaces, so they aren't listed here: {}. Run `bl workspace switch` to manage them.",
             elsewhere.join(", ")
         )),
     }
@@ -3293,7 +3300,7 @@ fn control_plane_http_failure(
         message.push('\n');
         message.push_str(explanation);
     }
-    if code == "owner_site_limit_reached" {
+    if status == StatusCode::CONFLICT && code == "owner_site_limit_reached" {
         if let Some(summary) = limit_slot_holder_summary(&details) {
             message.push('\n');
             message.push_str(&summary);
@@ -8334,7 +8341,7 @@ mod tests {
         let (_, payload) = failure_info(&error);
         let message = payload["error"]["message"].as_str().expect("message");
         assert!(
-            message.contains("2 apps using it are in other workspaces, so they aren't listed here: old-board (workspace team), team-tool (workspace team)."),
+            message.contains("2 apps that count against your limit are in other workspaces, so they aren't listed here: old-board (workspace team), team-tool (workspace team)."),
             "{message}"
         );
         assert!(message.contains("count against both"), "{message}");
@@ -8359,6 +8366,43 @@ mod tests {
         assert!(
             !message.contains("other workspace") && !message.contains("another workspace"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn app_limit_slot_holder_summary_edge_cases() {
+        let holder = |app: &str, other: bool, kind: &str| json!({"app_id": app, "workspace_ids": ["team"], "site_types": [kind], "other_workspace": other});
+        // One app elsewhere; an unclassified app under the overall limit gets no note.
+        let one = json!({"slot_holders": [holder("team-tool", true, "unclassified"), holder("here", false, "static")]});
+        assert_eq!(
+            limit_slot_holder_summary(&one).as_deref(),
+            Some("1 app that counts against your limit is in another workspace, so it isn't listed here: team-tool (workspace team). Run `bl workspace switch` to manage it.")
+        );
+        // Only the both-limits note when nothing is elsewhere.
+        let note =
+            json!({"bucket": "static", "slot_holders": [holder("old", false, "unclassified")]});
+        assert!(limit_slot_holder_summary(&note)
+            .is_some_and(|text| text.starts_with("Apps without a recorded site type")));
+        // Malformed entries are skipped, and long lists are capped.
+        let mut many: Vec<Value> = (0..12)
+            .map(|i| holder(&format!("app-{i}"), true, "static"))
+            .collect();
+        many.push(json!({"app_id": 7, "other_workspace": true}));
+        many.push(json!("not an object"));
+        let summary = limit_slot_holder_summary(&json!({"slot_holders": many})).expect("summary");
+        assert!(summary.starts_with("12 apps that count"), "{summary}");
+        assert!(
+            summary.contains("app-9 (workspace team), and 2 more."),
+            "{summary}"
+        );
+        assert!(!summary.contains("app-10"), "{summary}");
+        assert_eq!(
+            limit_slot_holder_summary(&json!({"slot_holders": "nope"})),
+            None
+        );
+        assert_eq!(
+            limit_slot_holder_summary(&json!({"slot_holders": []})),
+            None
         );
     }
 
