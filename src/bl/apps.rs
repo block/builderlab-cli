@@ -283,7 +283,8 @@ pub fn command() -> Command {
                     "Request one owner-only Apps Platform logical deletion. The active route is \
                      retired while artifacts may be retained. Capacity remains held when \
                      quota_cleanup_pending is true; the server retries that cleanup on its \
-                     own, and the BuilderLab team can help if it stays pending. Verify authoritative usage instead of subtracting a slot locally. \
+                     own, and the BuilderLab team can help if it stays pending. Verify \
+                     authoritative usage instead of subtracting a slot locally. \
                      --confirm-app-id and --confirm-environment must exactly match APP_ID and \
                      --environment. After deletion or an uncertain result, inspect the same \
                      app/environment and refresh `bl apps list --scope owned --include-deleted` \
@@ -3128,8 +3129,8 @@ fn known_failure_explanation(
         // The server always sends its own next step for this code, so the
         // explanation carries what the user must know.
         "owner_site_limit_reached" => (
-            "You already have as many apps as your plan allows, so nothing was changed. Existing apps keep working. `bl apps list --scope owned` shows your apps and current usage.",
-            Some("Delete every environment of an app you no longer need. Its place frees once the server finishes cleaning it up, so check the usage in `bl apps list --scope owned` again before retrying.".to_string()),
+            "You already have as many apps as your plan allows, so nothing was changed. Existing apps keep working. `bl apps list --scope owned` shows your apps and, when available, your usage.",
+            Some("Delete every environment of an app you no longer need. Its place frees once the server finishes cleaning it up, so check the usage in `bl apps list --scope owned --include-deleted` again before retrying.".to_string()),
         ),
         "owner_site_quota_unavailable" => (
             "Apps Platform isn't accepting new deployments right now, so nothing was changed.",
@@ -8297,9 +8298,10 @@ mod tests {
             let (_, payload) = failure_info(&error);
             assert_eq!(payload["error"]["code"], "owner_site_limit_reached");
             assert_eq!(payload["error"]["details"], json!({"http_status":409}));
-            assert!(payload["next_action"]
-                .as_str()
-                .is_some_and(|step| step.starts_with("Delete every environment of an app")));
+            assert!(payload["next_action"].as_str().is_some_and(|step| step
+                .starts_with("Delete every environment of an app")
+                && step.contains("--include-deleted")
+                && !step.contains("workspace")));
             assert!(!payload.to_string().contains("hidden"));
         }
     }
