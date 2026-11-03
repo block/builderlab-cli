@@ -657,3 +657,151 @@ fn inaccessible_extension_errors_are_humanized_in_e2e_flow() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].path, LIST_TOOLS_PATH);
 }
+
+fn blox_agent_tools_command(tools_base_url: Option<&str>) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_agent-tools"));
+    for name in [
+        "KGOOSE_BASE_URL",
+        "KGOOSE_DEBUG",
+        "KGOOSE_PLAYPEN",
+        "KGOOSE_SERVICE_PATH",
+        "KGOOSE_TIMEOUT",
+        "BL_TOOLS_BASE_URL",
+    ] {
+        command.env_remove(name);
+    }
+    command
+        .env("IS_BLOX", "true")
+        .env("BLOX_WORKSTATION_ID", "agent-tools-test-workstation")
+        .env("BLOX_ENVIRONMENT", "production")
+        .env("STS_ACCESS_TOKEN", "internal-sts-token");
+    if let Some(base_url) = tools_base_url {
+        command.env("BL_TOOLS_BASE_URL", base_url);
+    }
+    command
+}
+
+#[test]
+fn agent_tools_blox_proxy_defaults_to_tools_base_url_without_identity_token() {
+    let server = MockServer::start(vec![
+        list_tools_response("utils", calculate_tool_schema(false)),
+        MockResponse::json(json!({
+            "content": [{"text": {"text": "{\"sum\":5}"}}],
+            "is_error": false
+        })),
+    ]);
+    let catalog_path = write_extensions_catalog(
+        "blox-proxy",
+        r#"
+- name: utils
+  about: Utility helpers
+"#,
+    );
+
+    let help = blox_agent_tools_command(Some(&server.base_url))
+        .env("KGOOSE_EXTENSIONS_CATALOG", &catalog_path)
+        .arg("--help")
+        .output()
+        .expect("run root help");
+    let output = blox_agent_tools_command(Some(&server.base_url))
+        .args([
+            "utils",
+            "calculate",
+            "--numbers",
+            "2",
+            "3",
+            "--operation",
+            "add",
+        ])
+        .output()
+        .expect("run proxied tool");
+    let requests = server.finish();
+    fs::remove_file(&catalog_path).expect("remove extensions catalog");
+    let (help_stdout, help_stderr) = output_text(&help);
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(help.status.success(), "stderr was: {help_stderr}");
+    assert!(help_stdout.contains("Utility helpers"));
+    assert!(output.status.success(), "stderr was: {stderr}");
+    assert!(stdout.contains("sum"), "stdout was: {stdout}");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, LIST_TOOLS_PATH);
+    assert_eq!(requests[1].path, CALL_TOOL_PATH);
+    for request in &requests {
+        for header in [
+            "authorization",
+            "cookie",
+            "x-bb-session-credential",
+            "x-forwarded-identity-token",
+        ] {
+            assert!(!request.headers.contains_key(header), "unexpected {header}");
+        }
+    }
+}
+
+#[test]
+fn agent_tools_blox_keeps_identity_token_without_the_full_proxy_gate() {
+    let server = MockServer::start(
+        (0..5)
+            .map(|_| list_tools_response("utils", calculate_tool_schema(false)))
+            .collect(),
+    );
+    let mut commands = Vec::new();
+    commands.push(blox_agent_tools_command(None));
+    commands.push(blox_agent_tools_command(Some("http://other.example.test")));
+    let mut not_blox = blox_agent_tools_command(Some(&server.base_url));
+    not_blox.env("IS_BLOX", "false");
+    commands.push(not_blox);
+    let mut no_workstation = blox_agent_tools_command(Some(&server.base_url));
+    no_workstation.env_remove("BLOX_WORKSTATION_ID");
+    commands.push(no_workstation);
+    let mut empty_workstation = blox_agent_tools_command(Some(&server.base_url));
+    empty_workstation.env("BLOX_WORKSTATION_ID", "");
+    commands.push(empty_workstation);
+
+    for mut command in commands {
+        let output = command
+            .args(["--base-url", &server.base_url, "utils", "--help"])
+            .output()
+            .expect("run agent-tools without the proxy gate");
+        let (_, stderr) = output_text(&output);
+        assert!(output.status.success(), "stderr was: {stderr}");
+    }
+    let requests = server.finish();
+
+    assert_eq!(requests.len(), 5);
+    for request in &requests {
+        assert_eq!(request.path, LIST_TOOLS_PATH);
+        assert_eq!(
+            request
+                .headers
+                .get("x-forwarded-identity-token")
+                .map(String::as_str),
+            Some("internal-sts-token")
+        );
+    }
+}
+
+#[test]
+fn agent_tools_blox_proxy_points_inaccessible_extensions_at_builderlab_connections() {
+    let server = MockServer::start(vec![MockResponse::text(
+        403,
+        "Extension 'notion' not authorized",
+    )]);
+
+    let output = blox_agent_tools_command(Some(&server.base_url))
+        .args(["notion", "--help"])
+        .output()
+        .expect("run help for inaccessible extension");
+    let requests = server.finish();
+    let (_, stderr) = output_text(&output);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("Can't inspect `notion`"),
+        "stderr was: {stderr}"
+    );
+    assert!(stderr.contains("Connections page of your BuilderLab portal"));
+    assert!(!stderr.contains("g2.sqprod.co"));
+    assert_eq!(requests.len(), 1);
+}

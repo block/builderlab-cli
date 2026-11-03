@@ -4891,34 +4891,6 @@ fn bl_tools_blox_other_origins_keep_local_session_authentication() {
 }
 
 #[test]
-fn agent_tools_keeps_internal_identity_authentication_on_blox() {
-    let server = MockServer::start(vec![list_tools_response(
-        "utils",
-        calculate_tool_schema(false),
-    )]);
-    let output = server
-        .command()
-        .env("IS_BLOX", "true")
-        .env("BLOX_WORKSTATION_ID", "tools-test-workstation")
-        .env("BL_TOOLS_BASE_URL", &server.base_url)
-        .env("STS_ACCESS_TOKEN", "internal-sts-token")
-        .args(["utils", "--help"])
-        .output()
-        .expect("run internal agent-tools");
-    let (_, stderr) = output_text(&output);
-    assert!(output.status.success(), "stderr was: {stderr}");
-    let requests = server.finish();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(
-        requests[0]
-            .headers
-            .get("x-forwarded-identity-token")
-            .map(String::as_str),
-        Some("internal-sts-token")
-    );
-}
-
-#[test]
 fn bl_tools_help_surfaces_schema_derived_flags() {
     let server = MockServer::start(vec![list_tools_response(
         "utils",

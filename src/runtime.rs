@@ -123,6 +123,7 @@ pub fn load_extension(
     client: &impl KgooseClient,
     config: &KgooseConfig,
     extension_name: &str,
+    builderlab_backend: bool,
     load_known_extensions: impl FnOnce() -> Result<Option<Vec<ExtensionSummary>>>,
 ) -> Result<LoadedExtension> {
     let response = match client.list_tools(config, extension_name) {
@@ -136,6 +137,7 @@ pub fn load_extension(
                 return Err(humanize_list_tools_error(
                     extension_name,
                     config.playpen.as_deref(),
+                    builderlab_backend,
                     &err,
                 ));
             };
@@ -147,6 +149,7 @@ pub fn load_extension(
                 return Err(humanize_list_tools_error(
                     extension_name,
                     config.playpen.as_deref(),
+                    builderlab_backend,
                     &err,
                 ));
             }
@@ -189,6 +192,7 @@ pub fn load_extension(
 fn humanize_list_tools_error(
     extension_name: &str,
     playpen: Option<&str>,
+    builderlab_backend: bool,
     err: &anyhow::Error,
 ) -> anyhow::Error {
     // `{err:#}` prints the full context chain (e.g. "POST <path>: error sending
@@ -204,11 +208,18 @@ fn humanize_list_tools_error(
         || raw_lower.contains("not authorized")
         || raw_lower.contains("403 forbidden")
     {
+        let connect_hint = if raw_lower.contains("http://") || raw_lower.contains("https://") {
+            "Connect it at the link in the server response below."
+        } else if builderlab_backend {
+            "Connect it on the Connections page of your BuilderLab portal."
+        } else {
+            "Check your G2 Connections settings to verify the extension is connected: https://g2.sqprod.co/settings"
+        };
         format!(
             "Can't inspect `{extension_name}`{playpen_suffix}.\n\
              `{extension_name}` is visible in the extension list, but the backend service wouldn't return its tools.\n\
              This usually means the extension is not connected in your account.\n\
-             Check your G2 Connections settings to verify the extension is connected: https://g2.sqprod.co/settings\n\
+             {connect_hint}\n\
              Server response: {raw}"
         )
     } else if raw_lower.contains("error sending request") {
@@ -531,8 +542,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        load_extension, load_extensions, normalize_cli_name, ExtensionSummary, ParameterKind,
-        ScalarKind, ToolParameter,
+        humanize_list_tools_error, load_extension, load_extensions, normalize_cli_name,
+        ExtensionSummary, ParameterKind, ScalarKind, ToolParameter,
     };
     use crate::kgoose::{
         CallToolResponse, ExtensionInfo, KgooseClient, KgooseConfig, ListExtensionsResponse,
@@ -700,7 +711,7 @@ mod tests {
 
     #[test]
     fn load_extension_discovers_tools_and_schema_parameters() {
-        let extension = load_extension(&TestKgooseClient, &kgoose_config(), "utils", || {
+        let extension = load_extension(&TestKgooseClient, &kgoose_config(), "utils", false, || {
             panic!("successful ListTools must not load extension discovery")
         })
         .expect("extension");
@@ -734,6 +745,7 @@ mod tests {
             &UnauthorizedKgooseClient,
             &kgoose_config(),
             "airtable",
+            false,
             || Ok(Some(known)),
         )
         .expect_err("expected inaccessible extension");
@@ -755,6 +767,7 @@ mod tests {
             &ConnectFailureKgooseClient,
             &kgoose_config(),
             "sourcegraph",
+            false,
             || Ok(Some(known)),
         )
         .expect_err("expected connect failure");
@@ -772,17 +785,46 @@ mod tests {
 
     #[test]
     fn load_extension_rewrites_catalog_known_inaccessible_errors_for_humans() {
-        let error = load_extension(&UnauthorizedKgooseClient, &kgoose_config(), "asana", || {
-            Ok(Some(vec![ExtensionSummary {
-                name: "asana".to_string(),
-                about: "Asana tools".to_string(),
-            }]))
-        })
+        let error = load_extension(
+            &UnauthorizedKgooseClient,
+            &kgoose_config(),
+            "asana",
+            false,
+            || {
+                Ok(Some(vec![ExtensionSummary {
+                    name: "asana".to_string(),
+                    about: "Asana tools".to_string(),
+                }]))
+            },
+        )
         .expect_err("expected inaccessible extension");
 
         let message = error.to_string();
         assert!(message.contains("Can't inspect `asana`"));
         assert!(message.contains("wouldn't return its tools"));
         assert!(message.contains("G2 Connections settings"));
+    }
+
+    #[test]
+    fn inaccessible_errors_point_builderlab_backends_at_their_connections_page() {
+        let err = anyhow::anyhow!("POST /v3/list-tools failed with 403 Forbidden: denied");
+        let message = humanize_list_tools_error("slack", None, true, &err).to_string();
+        assert!(message.contains("Connections page of your BuilderLab portal"));
+        assert!(!message.contains("g2.sqprod.co"));
+    }
+
+    #[test]
+    fn inaccessible_errors_defer_to_a_link_in_the_server_response() {
+        let err = anyhow::anyhow!(
+            "POST /v3/list-tools failed with 403 Forbidden: connect at https://portal.example.test/connections"
+        );
+        for builderlab_backend in [false, true] {
+            let message =
+                humanize_list_tools_error("slack", None, builderlab_backend, &err).to_string();
+            assert!(message.contains("link in the server response"));
+            assert!(message.contains("https://portal.example.test/connections"));
+            assert!(!message.contains("g2.sqprod.co"));
+            assert!(!message.contains("BuilderLab portal"));
+        }
     }
 }

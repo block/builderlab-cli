@@ -68,6 +68,9 @@ to distinguish an unknown name from a configured extension that is not connected
 
 The separately packaged `sq agent-tools` command uses the embedded
 `extensions.yaml` catalog for its top-level help and command discovery.
+On a BuilderLab Blox workstation where the operator sets `BL_TOOLS_BASE_URL`,
+it sends tool requests to that endpoint and delegates authentication to Roxy,
+like `bl tools`; elsewhere it keeps its existing backend selection.
 
 Use `--json` for machine-readable output and `--verbose` for request
 diagnostics. Do not include credentials or other sensitive data when sharing

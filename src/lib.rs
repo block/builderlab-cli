@@ -203,11 +203,7 @@ fn build_bl_command() -> Command {
 }
 
 fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Result<()> {
-    let proxy_base_url = if config.builderlab_mode {
-        blox_tools_base_url()?
-    } else {
-        None
-    };
+    let proxy_base_url = blox_tools_base_url()?;
     let bootstrap = if let Some(base_url) = proxy_base_url.as_deref() {
         bootstrap_args_with_default_base_url(raw_args.iter().cloned(), Some(base_url))?
     } else {
@@ -236,7 +232,7 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
             anyhow::bail!("`--write-extensions` does not accept command arguments");
         }
 
-        apply_builderlab_mode_if_needed(&mut kgoose_config, config.builderlab_mode)?;
+        apply_tools_backend(&mut kgoose_config, config.builderlab_mode)?;
         let extensions = load_extensions(&client, &kgoose_config)?;
         write_extensions_catalog(path, &extensions)?;
         return Ok(());
@@ -244,7 +240,7 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
 
     if bootstrap.describe_commands {
         if config.builderlab_mode || !bootstrap.command_tokens.is_empty() {
-            apply_builderlab_mode_if_needed(&mut kgoose_config, config.builderlab_mode)?;
+            apply_tools_backend(&mut kgoose_config, config.builderlab_mode)?;
         }
         let description =
             load_command_description(&client, &kgoose_config, &bootstrap.command_tokens, config)?;
@@ -260,7 +256,7 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
         let summary = if bootstrap.command_tokens.is_empty() {
             ROOT_SUMMARY.to_string()
         } else {
-            apply_builderlab_mode_if_needed(&mut kgoose_config, config.builderlab_mode)?;
+            apply_tools_backend(&mut kgoose_config, config.builderlab_mode)?;
             load_command_description(&client, &kgoose_config, &bootstrap.command_tokens, config)?
                 .summary
         };
@@ -282,7 +278,7 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
     let (extensions, loaded_extension) = if let Some(extension_name) =
         selected_extension_name.as_deref()
     {
-        apply_builderlab_mode_if_needed(&mut kgoose_config, config.builderlab_mode)?;
+        apply_tools_backend(&mut kgoose_config, config.builderlab_mode)?;
         let loaded = load_tools_extension(
             &client,
             &kgoose_config,
@@ -295,7 +291,7 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
         }];
         (extensions, Some(loaded))
     } else {
-        apply_builderlab_mode_if_needed(&mut kgoose_config, config.builderlab_mode)?;
+        apply_tools_backend(&mut kgoose_config, config.builderlab_mode)?;
         let extensions = load_tools_extensions(&client, &kgoose_config, config.builderlab_mode)?;
         (extensions, None)
     };
@@ -350,13 +346,13 @@ fn run_tools_cli(argv0: &str, raw_args: &[String], config: ToolsCliConfig) -> Re
     Ok(())
 }
 
-fn apply_builderlab_mode_if_needed(config: &mut KgooseConfig, builderlab_mode: bool) -> Result<()> {
-    if !builderlab_mode {
-        return Ok(());
-    }
+fn apply_tools_backend(config: &mut KgooseConfig, builderlab_mode: bool) -> Result<()> {
     if tools_proxy_auth_for_url(&config.base_url) {
         config.proxy_auth = true;
         config.session_credential = None;
+        return Ok(());
+    }
+    if !builderlab_mode {
         return Ok(());
     }
     let bl_home = read_optional_env(BL_HOME_ENV_VAR)?
@@ -516,13 +512,14 @@ fn load_tools_extension(
     extension_name: &str,
     builderlab_mode: bool,
 ) -> Result<LoadedExtension> {
+    let builderlab_backend = builderlab_mode || config.proxy_auth;
     if builderlab_mode {
-        load_extension(client, config, extension_name, || {
+        load_extension(client, config, extension_name, builderlab_backend, || {
             load_extensions(client, config).map(Some)
         })
     } else {
         let known_extensions = load_extensions_catalog()?;
-        load_extension(client, config, extension_name, || {
+        load_extension(client, config, extension_name, builderlab_backend, || {
             Ok((!known_extensions.is_empty()).then_some(known_extensions))
         })
     }
