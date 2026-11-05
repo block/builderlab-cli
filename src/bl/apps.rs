@@ -1677,10 +1677,9 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     // community sharing credential. Elsewhere (bb-block) Compose would refuse
     // the owner credential the proxy forwards, so stop before any request.
     if proxy_auth_for_url(base_url) && !community_sharing_through_proxy() {
-        let next_action = format!(
-            "{} Or run `bl apps community` with `--base-url` set to an approved BuilderLab ingress after `bl auth login`.",
-            community_share_and_manage_step(app_id)
-        );
+        // This only runs on a Blox workstation, where the agent can't log in or
+        // pick another ingress, so the owner's way forward is the browser.
+        let next_action = community_share_and_manage_step(app_id);
         let mut error = CliFailure::new(
             exit_codes::GENERAL,
             "community_sharing_unavailable_through_proxy",
@@ -9985,9 +9984,16 @@ mod tests {
                 error["error"]["code"],
                 "community_sharing_unavailable_through_proxy"
             );
-            assert!(error["next_action"]
-                .as_str()
-                .is_some_and(|action| action.contains("Share & manage")));
+            let next_action = error["next_action"].as_str().unwrap();
+            assert!(next_action.contains("Share & manage"), "{next_action}");
+            // A workstation agent can't log in or choose another base URL.
+            for advice in ["bl auth login", "--base-url"] {
+                assert!(!next_action.contains(advice), "{next_action}");
+                assert!(
+                    !error["error"]["message"].as_str().unwrap().contains(advice),
+                    "{error}"
+                );
+            }
             assert!(auth_server.finish().is_empty());
             assert!(control_plane.finish().is_empty());
         }
