@@ -118,7 +118,7 @@ fn run_workstation_list(matches: &ArgMatches, base_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn workstation_base_url() -> Result<Option<String>> {
+pub(super) fn workstation_base_url() -> Result<Option<String>> {
     let Some(default_base_url) = crate::blox_tools_base_url()? else {
         return Ok(None);
     };
