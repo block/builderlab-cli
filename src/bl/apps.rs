@@ -59,6 +59,9 @@ const HOTPOD_TRACE_ID_HEADER: &str = "X-Hotpod-Trace-Id";
 // Compose may synchronously wait up to two minutes for an initialize or
 // deploy rollout. Leave enough headroom for the response to traverse ingress.
 const CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+// Extra reads that only decorate an answer, such as community names or quota,
+// must not hold the answer up for long.
+const SUPPLEMENTARY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_PLANE_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const TRUSTED_CONTROL_PLANE_HOSTS: &[&str] = &[
     "compose-ctrl.test.blockstaging.build",
@@ -762,10 +765,12 @@ fn run_list(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let mut response = client.list_apps(&credential, scope, include_deleted)?;
     // Only the owned listing carries quota. Without a scope the server lists
     // everything manageable and leaves it out, so borrow it from the owned
-    // listing. The quota is extra, so a failure there must not fail the list.
+    // listing. The quota is extra, so a failure or timeout there must not fail
+    // the list.
     if matches!(scope, None | Some("manageable")) && response.get("quota").is_none() {
-        let quota = client
-            .list_apps(&credential, Some("owned"), false)
+        // A short timeout keeps a hung quota read from stalling the list.
+        let quota = supplementary_control_plane_client(matches, config)
+            .and_then(|quota_client| quota_client.list_apps(&credential, Some("owned"), false))
             .ok()
             .and_then(|owned| owned.get("quota").cloned());
         if let (Some(quota), Some(fields)) = (quota, response.as_object_mut()) {
@@ -773,6 +778,24 @@ fn run_list(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         }
     }
     print_json(&response)
+}
+
+fn supplementary_control_plane_client(
+    matches: &ArgMatches,
+    config: &SkillsConfig,
+) -> Result<ControlPlaneClient> {
+    let base_url = matches
+        .get_one::<String>("apps-base-url")
+        .context("expected Apps Platform control-plane URL")?;
+    let client_version = matches
+        .get_one::<String>("apps-client-version")
+        .context("expected Apps Platform client version")?;
+    ControlPlaneClient::new_with_timeout(
+        base_url,
+        client_version,
+        config.style,
+        SUPPLEMENTARY_READ_TIMEOUT,
+    )
 }
 
 fn run_expiration(config: &SkillsConfig, matches: &ArgMatches, renew: bool) -> Result<()> {
@@ -926,7 +949,7 @@ fn community_label(id: &str, names: &BTreeMap<String, String>) -> String {
 fn community_names(config: &SkillsConfig, ids: Option<&Value>) -> BTreeMap<String, String> {
     // Only decoration: don't hold up the answer for long if Kgoose is slow.
     community_names_with(ids, || {
-        joined_communities_for(config, Duration::from_secs(5))
+        joined_communities_for(config, SUPPLEMENTARY_READ_TIMEOUT)
     })
 }
 
@@ -3574,14 +3597,21 @@ mod tests {
         status: u16,
         body: String,
         trace_id: Option<String>,
+        delay: Option<Duration>,
     }
 
     impl ProcessResponse {
+        fn delayed(mut self, delay: Duration) -> Self {
+            self.delay = Some(delay);
+            self
+        }
+
         fn json(body: Value) -> Self {
             Self {
                 status: 200,
                 body: body.to_string(),
                 trace_id: None,
+                delay: None,
             }
         }
 
@@ -3590,6 +3620,7 @@ mod tests {
                 status,
                 body: body.to_string(),
                 trace_id: None,
+                delay: None,
             }
         }
 
@@ -3598,6 +3629,7 @@ mod tests {
                 status,
                 body: body.into(),
                 trace_id: None,
+                delay: None,
             }
         }
 
@@ -3680,6 +3712,12 @@ mod tests {
                             Header::from_bytes(HOTPOD_TRACE_ID_HEADER, trace_id)
                                 .expect("build Apps process trace header"),
                         );
+                    }
+                    if let Some(delay) = response.delay {
+                        // The client is expected to have given up by now.
+                        thread::sleep(delay);
+                        let _ = request.respond(http_response);
+                        continue;
                     }
                     request
                         .respond(http_response)
@@ -4871,6 +4909,77 @@ mod tests {
         assert!(output.status.success(), "{:?}", output);
         let listed: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
         assert_eq!(listed["count"], 1);
+        assert!(listed.get("quota").is_none());
+        auth_server.finish();
+        assert_eq!(control_plane.finish().len(), 2);
+    }
+
+    #[test]
+    fn bl_apps_plain_list_does_not_wait_on_a_hung_quota_read() {
+        let credential = "apps-e2e-only.plain-list-hung-quota.session";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        // The owned read answers only after the quota timeout has passed.
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(json!({"ok": true, "count": 1, "apps": [{"app_id": "mine"}]})),
+            ProcessResponse::json(json!({"ok": true, "quota": {"current_count": 1}}))
+                .delayed(SUPPLEMENTARY_READ_TIMEOUT + Duration::from_secs(1)),
+        ]);
+        let started = std::time::Instant::now();
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "list",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--json",
+            ],
+            credential,
+        )
+        .output()
+        .expect("run plain list process");
+        let elapsed = started.elapsed();
+        assert!(output.status.success(), "{:?}", output);
+        // Well under the control plane's own three minute timeout.
+        assert!(
+            elapsed < SUPPLEMENTARY_READ_TIMEOUT + Duration::from_secs(10),
+            "{elapsed:?}"
+        );
+        let listed: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
+        assert_eq!(listed["count"], 1);
+        assert!(listed.get("quota").is_none());
+        assert!(output.stderr.is_empty(), "{:?}", output);
+        auth_server.finish();
+        assert_eq!(control_plane.finish().len(), 2);
+    }
+
+    #[test]
+    fn bl_apps_plain_list_prints_when_the_owned_read_has_no_quota() {
+        let credential = "apps-e2e-only.plain-list-missing-quota.session";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(json!({"ok": true, "count": 1, "apps": [{"app_id": "mine"}]})),
+            ProcessResponse::json(json!({"ok": true, "scope": "owned", "count": 1, "apps": []})),
+        ]);
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "list",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--json",
+            ],
+            credential,
+        )
+        .output()
+        .expect("run plain list process");
+        assert!(output.status.success(), "{:?}", output);
+        assert!(output.stderr.is_empty(), "{:?}", output);
+        let listed: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
+        assert_eq!(listed["apps"][0]["app_id"], "mine");
         assert!(listed.get("quota").is_none());
         auth_server.finish();
         assert_eq!(control_plane.finish().len(), 2);
@@ -10019,7 +10128,9 @@ mod tests {
                 requests[0].path,
                 format!("/api/goose{JOINED_COMMUNITIES_PATH}")
             );
-            assert!(!requests[0].headers.contains_key("x-bb-session-credential"));
+            for header in ["authorization", "cookie", "x-bb-session-credential"] {
+                assert!(!requests[0].headers.contains_key(header), "{header}");
+            }
             assert!(control_plane.finish().is_empty());
         }
     }
@@ -10042,9 +10153,99 @@ mod tests {
                 command.env(APPS_COMMUNITY_SHARING_ENV_VAR, value);
             }
             let output = command.output().expect("run community list process");
-            assert!(!output.status.success(), "{value:?}");
+            // Off the proxy path, a workstation has no local org or login, so
+            // the command stops on the org check before any request.
+            assert_eq!(
+                output.status.code(),
+                Some(exit_codes::AUTH_REQUIRED),
+                "{value:?}"
+            );
+            assert_eq!(process_error(&output)["error"]["code"], "org_required");
             assert!(kgoose.finish().is_empty(), "{value:?}");
             assert!(control_plane.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn bl_apps_community_list_falls_back_when_kgoose_is_not_the_workstation_proxy() {
+        // Opted in, but KGOOSE_BASE_URL points somewhere other than the proxy
+        // origin the workstation advertises, so the proxy's trust doesn't apply.
+        let kgoose = ProcessServer::start(vec![]);
+        let control_plane = ProcessServer::start(vec![]);
+        let output = process_command(
+            &kgoose,
+            &control_plane,
+            &["apps", "community", "list", "--json"],
+            "apps-e2e-only.unused",
+        )
+        .env("BL_APPS_E2E_PROXY", "true")
+        .env(APPS_COMMUNITY_SHARING_ENV_VAR, "enabled")
+        .env("BL_TOOLS_BASE_URL", "http://proxy.mesh.example")
+        .output()
+        .expect("run community list process");
+        assert_eq!(output.status.code(), Some(exit_codes::AUTH_REQUIRED));
+        assert_eq!(process_error(&output)["error"]["code"], "org_required");
+        assert!(kgoose.finish().is_empty());
+        assert!(control_plane.finish().is_empty());
+    }
+
+    #[test]
+    fn bl_apps_get_names_communities_through_the_proxy_where_the_workstation_enables_it() {
+        for opted_in in [true, false] {
+            let kgoose = ProcessServer::start(if opted_in {
+                vec![ProcessResponse::json(
+                    json!({"communities":[{"id":"buzz-alpha","name":"Alpha Team"}]}),
+                )]
+            } else {
+                vec![]
+            });
+            let control_plane = ProcessServer::start(vec![
+                ProcessResponse::json(
+                    json!({"ok":true,"app":{"app_id":"demo","role":"owner","workspace_id":"ws"}}),
+                ),
+                ProcessResponse::json(json!({
+                    "ok":true,"app_id":"demo","owner":"auth0|me","visibility":"organization",
+                    "viewers":["auth0|me"],"shared_community_ids":["buzz-alpha"],
+                    "community_grant_revision":2
+                })),
+            ]);
+            let mut command = process_command(
+                &kgoose,
+                &control_plane,
+                &["apps", "get", "demo"],
+                "apps-e2e-only.unused",
+            );
+            command
+                .env("BL_APPS_E2E_PROXY", "true")
+                .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+                .env("BL_TOOLS_BASE_URL", &kgoose.base_url);
+            if opted_in {
+                command.env(APPS_COMMUNITY_SHARING_ENV_VAR, "enabled");
+            }
+            let output = command.output().expect("run proxied get process");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = process_stdout(&output);
+            let requests = kgoose.finish();
+            if opted_in {
+                assert!(stdout.contains("Buzz community Alpha Team."), "{stdout}");
+                assert_eq!(requests.len(), 1);
+                assert_eq!(
+                    requests[0].path,
+                    format!("/api/goose{JOINED_COMMUNITIES_PATH}")
+                );
+                for header in ["authorization", "cookie", "x-bb-session-credential"] {
+                    assert!(!requests[0].headers.contains_key(header), "{header}");
+                }
+            } else {
+                // Without the opt-in the names fall back to IDs, as before.
+                assert!(stdout.contains("Buzz community buzz-alpha."), "{stdout}");
+                assert!(requests.is_empty());
+            }
+            assert_eq!(control_plane.finish().len(), 2);
         }
     }
 
