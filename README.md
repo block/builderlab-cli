@@ -182,9 +182,11 @@ credential-redacted and terminal-safe. This does not retry failed mutations.
 ## Apps quota and recovery
 
 `bl apps list --scope owned --json` preserves the server's optional `quota`
-metadata. `quota.current_count` is authoritative owner usage, including held
-deploy reservations. The list's `count` describes visible apps and can differ.
-Check `accounting_enabled`, `enforcement_enabled` and `tier_status` before using
+metadata. A list without `--scope`, or with `--scope manageable`, includes it
+too, read from the owned listing; it is left out if that read fails or takes
+more than 5 seconds. `quota.current_count` is authoritative owner usage,
+including held deploy reservations. The list's `count` describes visible apps
+and can differ. Check `accounting_enabled`, `enforcement_enabled` and `tier_status` before using
 the current allowance. Missing quota metadata does not mean zero or unlimited
 usage; an unavailable tier has no reliable tier-derived limit.
 
