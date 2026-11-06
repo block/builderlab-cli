@@ -116,6 +116,17 @@ pub fn command() -> Command {
                 ),
         ))
         .subcommand(control_plane_args(app_get_command("get")))
+        .subcommand(
+            Command::new("scale-to-zero")
+                .about("Inspect or change an app's idle scaling policy")
+                .long_about("Inspect scale-to-zero eligibility or request owner opt-in/opt-out. Enabling allows an eligible dynamic app to sleep after idle time and adds cold-start latency. The server reports requested, enabled, reason, fleet_mode and applied separately; a saved request does not prove runtime convergence.")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .disable_help_subcommand(true)
+                .subcommand(scale_to_zero_command("get"))
+                .subcommand(scale_to_zero_command("enable"))
+                .subcommand(scale_to_zero_command("disable")),
+        )
         .subcommand(control_plane_args(expiration_command(false)))
         .subcommand(control_plane_args(expiration_command(true)))
         .subcommand(control_plane_args(
@@ -561,6 +572,29 @@ pub fn command() -> Command {
         )
 }
 
+fn scale_to_zero_command(action: &'static str) -> Command {
+    control_plane_args(
+        Command::new(action)
+            .about(match action {
+                "enable" => "Request idle sleep for an app you own",
+                "disable" => "Restore always-on serving for an app you own",
+                _ => "Read the app's scaling request and current eligibility",
+            })
+            .arg(
+                Arg::new("app-id")
+                    .value_name("APP_ID")
+                    .required(true)
+                    .help("Exact app identifier"),
+            )
+            .arg(
+                Arg::new("environment")
+                    .long("environment")
+                    .value_name("ENVIRONMENT")
+                    .help("Optional Compose environment override"),
+            ),
+    )
+}
+
 fn expiration_command(renew: bool) -> Command {
     let command = Command::new(if renew { "renew" } else { "expiration" })
         .about(if renew {
@@ -725,6 +759,7 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("contract", contract_matches)) => run_contract(config, contract_matches),
         Some(("list", list_matches)) => run_list(config, list_matches),
         Some(("get", get_matches)) => run_get(config, get_matches),
+        Some(("scale-to-zero", args)) => run_scale_to_zero(config, args),
         Some(("expiration", args)) => run_expiration(config, args, false),
         Some(("renew", args)) => run_expiration(config, args, true),
         Some(("handoff", handoff_matches)) => run_get(config, handoff_matches),
@@ -796,6 +831,28 @@ fn supplementary_control_plane_client(
         config.style,
         SUPPLEMENTARY_READ_TIMEOUT,
     )
+}
+
+fn run_scale_to_zero(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let (action, args) = matches.subcommand().context("expected scaling action")?;
+    let app_id = args
+        .get_one::<String>("app-id")
+        .context("expected app id")?;
+    let environment = args.get_one::<String>("environment");
+    let (client, credential) = control_plane_context(config, args)?;
+    let response = if action == "get" {
+        let query = environment
+            .map(|e| vec![("environment", e.clone())])
+            .unwrap_or_default();
+        client.get_app_resource(&credential, app_id, "scale-to-zero", &query)?
+    } else {
+        let mut body = json!({"enabled": action == "enable"});
+        if let Some(environment) = environment {
+            body["environment"] = json!(environment);
+        }
+        client.set_scale_to_zero(&credential, app_id, &body)?
+    };
+    print_json(&response)
 }
 
 fn run_expiration(config: &SkillsConfig, matches: &ArgMatches, renew: bool) -> Result<()> {
@@ -2885,6 +2942,22 @@ impl ControlPlaneClient {
             })?
             .extend(["sharing", "communities", community_id]);
         Ok(url)
+    }
+
+    fn set_scale_to_zero(
+        &self,
+        credential: &ComposeSessionCredential,
+        app_id: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        let url = self.app_resource_url(app_id, "scale-to-zero", &[])?;
+        let path = request_path(&url);
+        self.authorized_json_request(credential, "PUT", &path, |authorization| {
+            self.standard_request(self.client.put(url.clone()), authorization)
+                .json(body)
+                .build()
+                .context("build app scaling policy request")
+        })
     }
 
     fn renew_expiration(
@@ -5621,6 +5694,72 @@ mod tests {
             requests[0].body,
             json!({"visibility": "restricted", "viewers": []})
         );
+    }
+
+    #[test]
+    fn bl_apps_scale_to_zero_process_preserves_policy_and_eligibility() {
+        let credential = "apps-e2e-only.scaling.session+credential";
+        let responses = [
+            json!({"ok": true, "requested": false, "enabled": false, "fleet_mode": "opt-in", "applied": true}),
+            json!({"ok": true, "requested": true, "enabled": false, "reason": "requires_isolated_runtime", "fleet_mode": "opt-in", "applied": false}),
+            json!({"ok": true, "requested": false, "enabled": false, "fleet_mode": "off", "applied": true}),
+        ];
+        let auth_server = ProcessServer::start(vec![process_auth_response(); 3]);
+        let control_plane = ProcessServer::start(
+            responses
+                .iter()
+                .cloned()
+                .map(ProcessResponse::json)
+                .collect(),
+        );
+        for (index, action) in ["get", "enable", "disable"].into_iter().enumerate() {
+            let mut args = vec![
+                "apps",
+                "scale-to-zero",
+                action,
+                "merchant/lookup app",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--json",
+            ];
+            if index != 2 {
+                args.extend(["--environment", "staging/west"]);
+            }
+            let output = process_command(&auth_server, &control_plane, &args, credential)
+                .output()
+                .expect("run scaling command");
+            assert!(
+                output.status.success(),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&process_stdout(&output)).unwrap(),
+                responses[index]
+            );
+        }
+        for request in auth_server.finish() {
+            assert_process_auth(&request, credential);
+        }
+        let requests = control_plane.finish();
+        for (index, request) in requests.iter().enumerate() {
+            assert_process_control_plane(
+                request,
+                if index == 0 { "GET" } else { "PUT" },
+                if index == 0 {
+                    "/v1/agent/apps/merchant%2Flookup%20app/scale-to-zero?environment=staging%2Fwest"
+                } else {
+                    "/v1/agent/apps/merchant%2Flookup%20app/scale-to-zero"
+                },
+                credential,
+            );
+        }
+        assert_eq!(requests[0].body, Value::Null);
+        assert_eq!(
+            requests[1].body,
+            json!({"enabled": true, "environment": "staging/west"})
+        );
+        assert_eq!(requests[2].body, json!({"enabled": false}));
     }
 
     #[test]
