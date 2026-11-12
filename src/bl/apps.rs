@@ -143,7 +143,10 @@ pub fn command() -> Command {
                      or recommended. Supply a descriptive DNS-safe app ID or a human-readable \
                      name from which the control plane can derive one. If creation is interrupted \
                      after reservation, repeat the same command to reconcile the caller-owned \
-                     idle reservation and continue initialization. For owner_site_limit_reached, \
+                     idle reservation and continue initialization. An app ID whose app you \
+                     deleted is reclaimed as a new app through initialize once its cleanup \
+                     finishes, with any runtime profile and persistence; its sharing, publishers, \
+                     versions, and data are not carried over. For owner_site_limit_reached, \
                      inspect `bl apps list --scope owned` on the same control plane. Existing \
                      apps remain manageable above the limit. Retry creation explicitly only \
                      after a fresh server response confirms capacity; do not retry automatically \
@@ -203,7 +206,8 @@ pub fn command() -> Command {
                 .long_about("Inspect an existing app, plan its requested settings, and initialize \
                     that exact app without reserving another identity. Use for initialization \
                     recovery or an explicitly requested persistence update. MySQL requires \
-                    --runtime-profile process or fetch-js. This does not migrate database engines or reclaim deleted apps.")
+                    --runtime-profile process or fetch-js. This does not migrate database engines; \
+                    to reuse a deleted app's ID, run `bl apps create`.")
                 .arg(Arg::new("app-id").value_name("APP_ID").required(true)
                     .help("Exact existing app identifier returned by list, get, or create"))
                 .arg(Arg::new("environment").long("environment").value_name("ENVIRONMENT")
@@ -1285,26 +1289,41 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         }
     }
     let mutation_request = mutation_request_from_plan(&plan);
-    let (reservation, reservation_reconciled) =
+    let (reservation, outcome) =
         reconcile_create_reservation(&client, &credential, &app_id, &plan, &mutation_request)?;
-    // Private is applied before initialization so a private app is never visible.
-    let visibility = if matches.get_flag("private") {
+    let reclaimed = outcome == Reservation::Reclaim;
+    let make_private = || -> Result<Option<Value>> {
+        if !matches.get_flag("private") {
+            return Ok(None);
+        }
         let environment = mutation_request.get("environment").and_then(Value::as_str);
         let response = client
             .set_visibility(&credential, &app_id, PRIVATE_VISIBILITY, environment)
             .and_then(|response| require_visibility(&app_id, PRIVATE_VISIBILITY, response))
             .with_context(|| {
-                format!("Apps Platform reserved app_id {app_id:?}, but did not make it private. Do not deploy it. After fixing the error, run `bl apps visibility {app_id} private` or retry the same `bl apps create --private` command.")
+                // A reclaimed app is no longer a fresh reservation, so create cannot resume it.
+                let retry = if reclaimed { "" } else { " or retry the same `bl apps create --private` command" };
+                format!("Apps Platform reserved app_id {app_id:?}, but did not make it private. Do not deploy it. After fixing the error, run `bl apps visibility {app_id} private`{retry}.")
             })?;
-        Some(response)
-    } else {
-        None
+        Ok(Some(response))
     };
-    let initialize = if plan_requests_initialize {
+    // Private is applied before initialization so a private app is never
+    // visible. A deleted app has no live route to change until initialize
+    // reclaims it, which publishes no version.
+    let mut visibility = if reclaimed { None } else { make_private()? };
+    // Only initialize reclaims a deleted app ID, including a static one.
+    let initialize = if plan_requests_initialize || reclaimed {
         let response = client
             .initialize(&credential, &app_id, &mutation_request)
             .with_context(|| {
-                if mysql_requested {
+                if reclaimed {
+                    let private = if matches.get_flag("private") {
+                        format!(" Then run `bl apps visibility {app_id} private` before deploying.")
+                    } else {
+                        String::new()
+                    };
+                    format!("Apps Platform did not reclaim deleted app_id {app_id:?}. If it reported app_deleted, the deleted app's cleanup is still finishing: wait a few minutes, then retry the same `bl apps create` command. Otherwise inspect it with `bl apps get {app_id}`; once it is no longer deleted, resume with `bl apps initialize {app_id}` using the same --runtime-profile and --persistence.{private}")
+                } else if mysql_requested {
                     let profile = request.runtime_profile.expect("validated MySQL runtime");
                     format!("Apps Platform reserved app_id {app_id:?}, but MySQL initialization did not complete. Inspect it with `bl apps get`, then resume the same app with `bl apps initialize` using the same endpoint, environment, --runtime-profile {profile} and --persistence mysql.")
                 } else {
@@ -1320,6 +1339,9 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     } else {
         None
     };
+    if reclaimed {
+        visibility = make_private()?;
+    }
     let effective_external_url = match initialize.as_ref() {
         Some(response) => Value::String(
             required_response_string(response, "external_url", "Apps Platform initialize")?
@@ -1335,7 +1357,8 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         "app_id": app_id,
         "external_url": effective_external_url,
         "reserved": true,
-        "reservation_reconciled": reservation_reconciled,
+        "reservation_reconciled": outcome == Reservation::Reconciled,
+        "reclaimed": reclaimed,
         "initialized": initialize.is_some(),
         "plan": plan,
         "reservation": reservation,
@@ -1376,11 +1399,9 @@ fn run_initialize(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let observed_id = required_response_string(app, "app_id", "Apps Platform get")?;
     require_exact_app_id("get", app_id, observed_id)
         .map_err(|error| correlate_response_error(error, &existing))?;
-    if !value_is_absent_or_empty_text(app.get("deleted_at"))
-        || app.get("status").and_then(Value::as_str) == Some("deleted")
-    {
+    if is_deleted_app(&existing, app_id) {
         anyhow::bail!(
-            "Apps Platform initialize cannot reclaim a deleted app; select an active app"
+            "Apps Platform initialize does not reclaim deleted app {app_id:?}; run `bl apps create --app-id {app_id}` with the runtime profile and persistence the new app needs"
         );
     }
     let request = PlanRequest {
@@ -1410,20 +1431,28 @@ fn run_initialize(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         "external_url":response.get("external_url"), "plan":plan, "initialize":response}))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Reservation {
+    Reserved,
+    Reconciled,
+    /// The app ID belongs to a deleted app; initialize reclaims it.
+    Reclaim,
+}
+
 fn reconcile_create_reservation(
     client: &ControlPlaneClient,
     credential: &ComposeSessionCredential,
     app_id: &str,
     plan: &Value,
     mutation_request: &Value,
-) -> Result<(Value, bool)> {
+) -> Result<(Value, Reservation)> {
     match client.reserve(credential, app_id, mutation_request) {
         Ok(reservation) => {
             let reserved_app_id =
                 required_response_string(&reservation, "app_id", "Apps Platform reserve")?;
             require_exact_app_id("reserve", app_id, reserved_app_id)
                 .map_err(|error| correlate_response_error(error, &reservation))?;
-            Ok((reservation, false))
+            Ok((reservation, Reservation::Reserved))
         }
         Err(reserve_error) => {
             let environment = mutation_request.get("environment").and_then(Value::as_str);
@@ -1445,7 +1474,26 @@ fn reconcile_create_reservation(
                     if let Some(trace_id) = failure_trace_id(&reserve_error) {
                         reservation["reserve_trace_id"] = json!(trace_id);
                     }
-                    Ok((reservation, true))
+                    Ok((reservation, Reservation::Reconciled))
+                }
+                // Reserve never reclaims: newer servers answer app_deleted and
+                // older ones app_id_collision, so inspect rather than match codes.
+                Ok(existing)
+                    if reserve_found_existing_route(&reserve_error)
+                        && is_deleted_app(&existing, app_id) =>
+                {
+                    let mut reservation = json!({
+                        "ok": true,
+                        "app_id": app_id,
+                        "external_url": plan.get("external_url").cloned().unwrap_or(Value::Null),
+                        "reclaim": true,
+                        "app": existing.get("app").cloned().unwrap_or(Value::Null),
+                    });
+                    retain_response_trace_id(
+                        &mut reservation,
+                        response_value_trace_id(&existing).as_deref(),
+                    );
+                    Ok((reservation, Reservation::Reclaim))
                 }
                 Ok(existing) if reservation_outcome_is_unknown(&reserve_error) => {
                     let mismatch = correlate_response_error(
@@ -1513,6 +1561,22 @@ fn is_matching_incomplete_reservation(
             .and_then(Value::as_str)
             .is_none_or(|expected| app.get(app_field).and_then(Value::as_str) == Some(expected))
     })
+}
+
+fn reserve_found_existing_route(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CliFailure>())
+        .is_some_and(|failure| matches!(failure.code.as_str(), "app_deleted" | "app_id_collision"))
+}
+
+fn is_deleted_app(response: &Value, app_id: &str) -> bool {
+    let Some(app) = response.get("app") else {
+        return false;
+    };
+    app.get("app_id").and_then(Value::as_str) == Some(app_id)
+        && (!value_is_absent_or_empty_text(app.get("deleted_at"))
+            || app.get("status").and_then(Value::as_str) == Some("deleted"))
 }
 
 fn value_is_absent_or_empty_text(value: Option<&Value>) -> bool {
@@ -6629,6 +6693,230 @@ mod tests {
             "/v1/agent/apps/merchant-lookup?environment=staging",
             credential,
         );
+    }
+
+    fn deleted_app_response() -> Value {
+        json!({
+            "ok": true,
+            "app": {
+                "app_id": "merchant-lookup",
+                "environment": "staging",
+                "runtime_profile": "static",
+                "role": "owner",
+                "status": "deleted",
+                "route_status": "idle",
+                "deleted_at": "2026-11-11T22:31:00Z"
+            },
+            "versions": []
+        })
+    }
+
+    fn reclaim_create(
+        plan: Value,
+        reserve_code: &str,
+        initialize: ProcessResponse,
+        extra_args: &[&str],
+        visibility: Option<ProcessResponse>,
+    ) -> (std::process::Output, Vec<ProcessRequest>) {
+        let credential = "apps-e2e-only.reclaim.session+credential";
+        let mut responses = vec![
+            ProcessResponse::json(plan),
+            ProcessResponse::json_status(
+                409,
+                json!({"ok": false, "error": {"code": reserve_code, "message": "deleted"}}),
+            ),
+            ProcessResponse::json(deleted_app_response()),
+            initialize,
+        ];
+        responses.extend(visibility);
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(responses);
+        let mut args = vec![
+            "apps",
+            "create",
+            "--app-id",
+            "merchant-lookup",
+            "--environment",
+            "staging",
+        ];
+        args.extend_from_slice(extra_args);
+        args.extend_from_slice(&["--base-url", APPROVED_TEST_BASE_URL, "--json"]);
+        let output = process_command(&auth_server, &control_plane, &args, credential)
+            .output()
+            .expect("run Apps create process command");
+        auth_server.finish();
+        (output, control_plane.finish())
+    }
+
+    fn request_order(requests: &[ProcessRequest]) -> Vec<(&str, &str)> {
+        requests
+            .iter()
+            .map(|request| (request.method.as_str(), request.path.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn bl_apps_create_reclaims_deleted_app_through_initialize() {
+        let plan = json!({
+            "app_id": "merchant-lookup",
+            "environment": "staging",
+            "persistence": "mysql",
+            "runtime_profile": "fetch-js",
+            "runtime_class": "default",
+            "external_url": "https://merchant-lookup--bpsites.example/",
+            "initialize": {"required": true, "recommended": true}
+        });
+        let initialized = json!({
+            "app_id": "merchant-lookup",
+            "persistence": "mysql",
+            "external_url": "https://merchant-lookup--bpsites.example/"
+        });
+        let (output, requests) = reclaim_create(
+            plan,
+            "app_deleted",
+            ProcessResponse::json(initialized.clone()),
+            &["--runtime-profile", "fetch-js", "--persistence", "mysql"],
+            None,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = serde_json::from_str::<Value>(&process_stdout(&output)).unwrap();
+        assert_eq!(value["reclaimed"], true);
+        assert_eq!(value["reservation_reconciled"], false);
+        assert_eq!(value["initialize"], initialized);
+        assert_eq!(
+            request_order(&requests),
+            [
+                ("POST", APPS_PLAN_PATH),
+                ("POST", "/v1/agent/apps/merchant-lookup/reserve"),
+                ("GET", "/v1/agent/apps/merchant-lookup?environment=staging"),
+                ("POST", "/v1/agent/apps/merchant-lookup/initialize"),
+            ]
+        );
+        assert_eq!(requests[3].body["runtime_profile"], "fetch-js");
+        assert_eq!(requests[3].body["persistence"], "mysql");
+    }
+
+    // An older server reports the tombstone as a collision and plans a static
+    // site without initialize, but only initialize can reclaim it.
+    #[test]
+    fn bl_apps_create_reclaims_static_app_from_older_server_collision() {
+        let plan = json!({
+            "app_id": "merchant-lookup",
+            "environment": "staging",
+            "persistence": "none",
+            "runtime_profile": "static",
+            "runtime_class": "default",
+            "initialize": {"required": false, "recommended": false}
+        });
+        let (output, requests) = reclaim_create(
+            plan,
+            "app_id_collision",
+            ProcessResponse::json(json!({
+                "app_id": "merchant-lookup",
+                "external_url": "https://merchant-lookup--bpsites.example/"
+            })),
+            &["--runtime-profile", "static"],
+            None,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = serde_json::from_str::<Value>(&process_stdout(&output)).unwrap();
+        assert_eq!(value["reclaimed"], true);
+        assert_eq!(value["initialized"], true);
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[3].path,
+            "/v1/agent/apps/merchant-lookup/initialize"
+        );
+    }
+
+    #[test]
+    fn bl_apps_create_reports_reclaim_while_cleanup_is_running() {
+        let (output, requests) = reclaim_create(
+            private_create_plan(),
+            "app_deleted",
+            ProcessResponse::json_status(
+                409,
+                json!({"ok": false, "error": {"code": "app_deleted", "message": "cleanup has not completed"}}),
+            ),
+            &["--private"],
+            None,
+        );
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("did not reclaim deleted app_id")
+                && stderr.contains("wait a few minutes")
+                && stderr.contains("`bl apps visibility merchant-lookup private` before deploying"),
+            "{stderr}"
+        );
+        assert_eq!(requests.len(), 4, "no visibility change or retry");
+    }
+
+    #[test]
+    fn bl_apps_create_private_reclaim_sets_visibility_after_initialize() {
+        let visibility = json!({
+            "ok": true,
+            "app_id": "merchant-lookup",
+            "visibility": "restricted",
+            "viewers": [],
+        });
+        let (output, requests) = reclaim_create(
+            private_create_plan(),
+            "app_deleted",
+            ProcessResponse::json(json!({
+                "app_id": "merchant-lookup",
+                "external_url": "https://merchant-lookup--bpsites.example/"
+            })),
+            &["--private"],
+            Some(ProcessResponse::json(visibility.clone())),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = serde_json::from_str::<Value>(&process_stdout(&output)).unwrap();
+        assert_eq!(value["visibility"], visibility);
+        assert_eq!(
+            request_order(&requests)[3..],
+            [
+                ("POST", "/v1/agent/apps/merchant-lookup/initialize"),
+                ("PUT", "/v1/agent/apps/merchant-lookup/visibility"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bl_apps_create_private_reclaim_visibility_failure_does_not_suggest_create_retry() {
+        let (output, requests) = reclaim_create(
+            private_create_plan(),
+            "app_deleted",
+            ProcessResponse::json(json!({
+                "app_id": "merchant-lookup",
+                "external_url": "https://merchant-lookup--bpsites.example/"
+            })),
+            &["--private"],
+            Some(ProcessResponse::json_status(
+                503,
+                json!({"ok": false, "error": {"code": "access_policy_update_failed"}}),
+            )),
+        );
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("run `bl apps visibility merchant-lookup private`")
+                && !stderr.contains("retry the same `bl apps create --private` command"),
+            "{stderr}"
+        );
+        assert_eq!(requests.len(), 5);
     }
 
     #[test]

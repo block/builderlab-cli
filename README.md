@@ -102,6 +102,18 @@ selected endpoint and environment throughout. Check the returned
 `initialize.persistence` is `mysql` before deploying the matching runtime artifact.
 Deleting a MySQL app revokes its database access, but the database data is retained.
 
+To reuse a deleted app's ID, for example to give a deleted `static` site's URL a
+database, run `bl apps create` with the new runtime and persistence:
+
+```bash
+bl apps create --app-id inventory --runtime-profile fetch-js --persistence mysql --json
+```
+
+Once the deleted app's cleanup finishes, `create` reclaims the ID as a new app
+and reports `reclaimed: true`; its sharing, publishers, versions, and data are
+not carried over. Until then it fails with `app_deleted`; retry a few minutes
+later.
+
 For inherited Apps Platform trace context and failure correlation, see
 [Apps operation correlation](docs/apps-operation-correlation.md).
 
