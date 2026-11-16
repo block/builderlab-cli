@@ -1255,6 +1255,7 @@ fn bl_root_description_lists_apps_not_appkit() {
         .filter_map(|command| command["name"].as_str())
         .collect::<Vec<_>>();
     assert!(command_names.contains(&"apps"));
+    assert!(command_names.contains(&"whoami"));
     assert!(!command_names.contains(&"appkit"));
 }
 
