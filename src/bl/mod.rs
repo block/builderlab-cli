@@ -19,4 +19,5 @@ pub mod skills_install;
 pub mod skills_models;
 pub mod skills_slug;
 pub mod skills_targets;
+pub mod static_site;
 pub mod workspace;

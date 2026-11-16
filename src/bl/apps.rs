@@ -36,6 +36,7 @@ use super::runner;
 use super::skills_api::failure_info;
 use super::skills_api::{exit_codes, failure, failure_trace_id, with_failure_trace_id, CliFailure};
 use super::skills_config::{kgoose_service_url, SkillsConfig};
+use super::static_site::{package_static_dir, NotFoundHandling};
 
 const APPS_BASE_URL_ENV_VAR: &str = "BL_APPS_CONTROL_PLANE_URL";
 // Set to `enabled` by Blox workstations whose proxy asks Kgoose for a
@@ -216,10 +217,20 @@ pub fn command() -> Command {
         ))
         .subcommand(control_plane_args(
             Command::new("deploy")
-                .about("Deploy a prebuilt app artifact")
+                .about("Deploy a prebuilt app artifact or a built static site directory")
                 .long_about(
-                    "Upload a prebuilt Hot Pod artifact.tar.gz to Apps Platform. The response \
+                    "Upload a prebuilt Hot Pod artifact.tar.gz to Apps Platform, or pass --dir \
+                     with a built static site (a folder with index.html at its root, such as \
+                     dist/) and the CLI packages it as a static artifact first. The app must use \
+                     the static runtime profile (`bl apps create --runtime-profile static`). \
+                     Unknown paths return 404 with the site's root 404.html when present; pass \
+                     --spa to serve index.html instead for client-side routing. The response \
                      includes the deployed URL and control-plane readiness and diagnostics endpoints.",
+                )
+                .group(
+                    ArgGroup::new("deploy-source")
+                        .args(["artifact", "dir"])
+                        .required(true),
                 )
                 .arg(
                     Arg::new("app-id")
@@ -230,9 +241,22 @@ pub fn command() -> Command {
                 .arg(
                     Arg::new("artifact")
                         .value_name("ARTIFACT_TAR_GZ")
-                        .required(true)
                         .value_parser(clap::value_parser!(PathBuf))
                         .help("Path to the prebuilt artifact.tar.gz"),
+                )
+                .arg(
+                    Arg::new("dir")
+                        .long("dir")
+                        .value_name("DIR")
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .help("Built static site directory to package and deploy (index.html at its root)"),
+                )
+                .arg(
+                    Arg::new("spa")
+                        .long("spa")
+                        .conflicts_with("artifact")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("With --dir, serve index.html for unknown paths (single-page app routing)"),
                 )
                 .arg(
                     Arg::new("environment")
@@ -1565,20 +1589,42 @@ fn require_exact_app_id(stage: &str, expected: &str, actual: &str) -> Result<()>
 }
 
 fn run_deploy(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
-    let artifact = matches
-        .get_one::<PathBuf>("artifact")
-        .context("expected artifact.tar.gz path")?;
-    validate_artifact_path(artifact)?;
     let app_id = matches
         .get_one::<String>("app-id")
         .context("expected app id")?;
+    // The packaged site lives in a temporary file that is removed on drop.
+    let packaged = match matches.get_one::<PathBuf>("dir") {
+        Some(dir) => {
+            let not_found_handling = if matches.get_flag("spa") {
+                NotFoundHandling::Spa
+            } else {
+                NotFoundHandling::NotFound
+            };
+            let site = package_static_dir(dir, app_id, not_found_handling)?;
+            Some((dir, site))
+        }
+        None => None,
+    };
+    let artifact = match packaged.as_ref() {
+        Some((_, site)) => site.path(),
+        None => {
+            let artifact = matches
+                .get_one::<PathBuf>("artifact")
+                .context("expected artifact.tar.gz path or --dir")?;
+            validate_artifact_path(artifact)?;
+            artifact.as_path()
+        }
+    };
     let options = DeployOptions {
         environment: matches.get_one::<String>("environment").cloned(),
         version_id: matches.get_one::<String>("version-id").cloned(),
         deployment_id: matches.get_one::<String>("deployment-id").cloned(),
     };
     let (client, credential) = control_plane_context(config, matches)?;
-    let response = client.deploy(&credential, app_id, artifact, &options)?;
+    let mut response = client.deploy(&credential, app_id, artifact, &options)?;
+    if let (Some((dir, site)), Some(object)) = (packaged.as_ref(), response.as_object_mut()) {
+        object.insert("packaged_site".to_string(), site.summary(dir));
+    }
     print_json(&response)
 }
 
@@ -7391,6 +7437,173 @@ mod tests {
         ] {
             assert!(body.contains(expected), "multipart omitted {expected:?}");
         }
+    }
+
+    #[test]
+    fn bl_apps_deploy_dir_packages_static_site_and_uploads_it() {
+        let credential = "apps-e2e-only.deploy-dir.session+credential";
+        let deployed = json!({
+            "ok": true,
+            "app_id": "docs-site",
+            "version_id": "ver-123",
+            "status": "pending_validation"
+        });
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![ProcessResponse::json(deployed.clone())]);
+        let site = tempfile::tempdir().expect("create static site directory");
+        fs::write(site.path().join("index.html"), "deploy-dir-index-marker").unwrap();
+        fs::write(site.path().join("._index.html"), "appledouble").unwrap();
+        let site_text = site.path().to_str().expect("site path UTF-8");
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "deploy",
+                "docs-site",
+                "--dir",
+                site_text,
+                "--spa",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--json",
+            ],
+            credential,
+        )
+        .output()
+        .expect("run Apps deploy --dir process command");
+        assert!(output.status.success());
+
+        let printed: Value = serde_json::from_str(&process_stdout(&output))
+            .expect("parse deploy --dir process output");
+        assert_eq!(printed["version_id"], "ver-123");
+        assert_eq!(
+            printed["packaged_site"],
+            json!({
+                "source_dir": site_text,
+                "runtime_profile": "static",
+                "not_found_handling": "spa",
+                "files": 1,
+                "content_bytes": 23,
+                "archive_bytes": printed["packaged_site"]["archive_bytes"],
+                "skipped": ["._index.html"],
+            })
+        );
+
+        let auth_requests = auth_server.finish();
+        let requests = control_plane.finish();
+        assert_process_auth(&auth_requests[0], credential);
+        assert_eq!(requests.len(), 1);
+        assert_process_control_plane(
+            &requests[0],
+            "POST",
+            "/v1/agent/apps/docs-site/deploy",
+            credential,
+        );
+        let body = &requests[0].body_bytes;
+        assert!(String::from_utf8_lossy(body).contains("filename=\"artifact.tar.gz\""));
+        let gzip_start = body
+            .windows(2)
+            .position(|bytes| bytes == [0x1f, 0x8b])
+            .expect("multipart carries a gzip artifact");
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&body[gzip_start..]));
+        let mut entries = BTreeMap::new();
+        for entry in archive.entries().expect("read uploaded artifact") {
+            let mut entry = entry.expect("read uploaded artifact entry");
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            entries.insert(name, contents);
+        }
+        assert_eq!(
+            entries.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["hotpod.manifest.json", "public/", "public/index.html"]
+        );
+        assert_eq!(entries["public/index.html"], "deploy-dir-index-marker");
+        let manifest: Value = serde_json::from_str(&entries["hotpod.manifest.json"]).unwrap();
+        assert_eq!(manifest["app"]["app_id"], "docs-site");
+        assert_eq!(manifest["runtime"]["profile"], "static");
+        assert_eq!(manifest["runtime"]["not_found_handling"], "spa");
+    }
+
+    #[test]
+    fn bl_apps_deploy_dir_rejects_a_site_without_index_before_auth_or_network() {
+        let credential = "apps-e2e-only.deploy-dir-invalid.session+credential";
+        let auth_server = ProcessServer::start(vec![]);
+        let control_plane = ProcessServer::start(vec![]);
+        let project = tempfile::tempdir().expect("create project directory");
+        fs::create_dir(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/index.html"), "built").unwrap();
+        let output = process_command(
+            &auth_server,
+            &control_plane,
+            &[
+                "apps",
+                "deploy",
+                "docs-site",
+                "--dir",
+                project.path().to_str().unwrap(),
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+                "--json",
+            ],
+            credential,
+        )
+        .output()
+        .expect("run Apps deploy --dir process command");
+        assert!(!output.status.success());
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(combined.contains("no index.html at its root"), "{combined}");
+        assert!(auth_server.finish().is_empty());
+        assert!(control_plane.finish().is_empty());
+    }
+
+    #[test]
+    fn bl_apps_deploy_takes_exactly_one_source() {
+        let error = command()
+            .try_get_matches_from([
+                "apps",
+                "deploy",
+                "docs-site",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+            ])
+            .expect_err("deploy without a source must fail");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let error = command()
+            .try_get_matches_from([
+                "apps",
+                "deploy",
+                "docs-site",
+                "artifact.tar.gz",
+                "--dir",
+                "dist",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+            ])
+            .expect_err("deploy with both sources must fail");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let error = command()
+            .try_get_matches_from([
+                "apps",
+                "deploy",
+                "docs-site",
+                "artifact.tar.gz",
+                "--spa",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+            ])
+            .expect_err("--spa with a prebuilt artifact must fail");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
