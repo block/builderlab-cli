@@ -86,7 +86,9 @@ bl apps deploy docs-site --dir dist --json
 `--dir` takes the folder your build writes, with `index.html` at its root. The
 CLI writes the static manifest, packages the files under `public/`, and uploads
 the result, so no manifest or tarball is needed. It skips `.DS_Store`, `._*`
-AppleDouble files, `.git/` and `__MACOSX/`, and refuses symlinks. The same
+AppleDouble files, `__MACOSX/` and `.git`, plus `.env*`/`.envrc` files and
+`node_modules/` so `--dir .` doesn't publish secrets or dependencies, and
+refuses other symlinks. The same
 directory always produces the same archive.
 
 Unknown paths return 404. For client-side routing, pass `--spa` to serve

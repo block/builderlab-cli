@@ -112,22 +112,10 @@ pub fn package_static_dir(
     let mut skipped = Vec::new();
     collect_entries(dir, "", &mut entries, &mut skipped)?;
     let files = entries.iter().filter(|entry| !entry.is_dir).count();
-    let content_bytes = entries.iter().map(|entry| entry.size).sum();
-    if entries.len() > MAX_ENTRIES {
-        anyhow::bail!(
-            "{} has {} files and directories; Apps Platform accepts at most {MAX_ENTRIES}",
-            dir.display(),
-            entries.len()
-        );
-    }
-    if content_bytes > MAX_TOTAL_BYTES {
-        anyhow::bail!(
-            "{} holds {content_bytes} bytes; Apps Platform accepts at most {MAX_TOTAL_BYTES} bytes uncompressed",
-            dir.display()
-        );
-    }
-
+    let content_bytes: u64 = entries.iter().map(|entry| entry.size).sum();
     let manifest = manifest_bytes(app_id, not_found_handling)?;
+    check_archive_limits(dir, entries.len(), content_bytes, manifest.len() as u64)?;
+
     let mut archive = tempfile::Builder::new()
         .prefix("bl-static-site-")
         .suffix(".tar.gz")
@@ -153,6 +141,35 @@ pub fn package_static_dir(
     })
 }
 
+/// Mirrors the platform validator, which also counts the manifest and the
+/// public/ directory entry, so a site at the limit fails here rather than
+/// after upload.
+fn check_archive_limits(
+    dir: &Path,
+    site_entries: usize,
+    content_bytes: u64,
+    manifest_bytes: u64,
+) -> Result<()> {
+    let archive_entries = site_entries + 2;
+    if archive_entries > MAX_ENTRIES {
+        anyhow::bail!(
+            "{} has {site_entries} files and directories; with the manifest and {SITE_ROOT}/ \
+             that is {archive_entries} archive entries, and Apps Platform accepts at most \
+             {MAX_ENTRIES}",
+            dir.display()
+        );
+    }
+    let archive_bytes = content_bytes + manifest_bytes;
+    if archive_bytes > MAX_TOTAL_BYTES {
+        anyhow::bail!(
+            "{} holds {content_bytes} bytes; with the manifest that is {archive_bytes} bytes, \
+             and Apps Platform accepts at most {MAX_TOTAL_BYTES} bytes uncompressed",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 fn manifest_bytes(app_id: &str, not_found_handling: NotFoundHandling) -> Result<Vec<u8>> {
     let manifest = json!({
         "schema": "hotpod.manifest.v1",
@@ -168,12 +185,15 @@ fn manifest_bytes(app_id: &str, not_found_handling: NotFoundHandling) -> Result<
     Ok(bytes)
 }
 
-/// Files that build tools and macOS leave behind but a site never serves.
-fn is_skipped_name(name: &str, is_dir: bool) -> bool {
-    if is_dir {
-        return matches!(name, ".git" | "__MACOSX");
-    }
-    name == ".DS_Store" || name.starts_with("._")
+/// Names a built site never serves, matched whatever the entry type:
+/// - macOS metadata: `.DS_Store`, `._*` AppleDouble files, `__MACOSX/`;
+/// - version control: `.git`, which is a file in worktrees and submodules;
+/// - project files that `--dir .` would otherwise publish to every viewer:
+///   `.env`, `.env.*` and `.envrc` secrets, and `node_modules/`.
+fn is_skipped_name(name: &str) -> bool {
+    matches!(name, ".DS_Store" | "__MACOSX" | ".git" | "node_modules")
+        || name.starts_with("._")
+        || name.starts_with(".env")
 }
 
 fn collect_entries(
@@ -202,15 +222,15 @@ fn collect_entries(
         let metadata = fs::symlink_metadata(&source)
             .with_context(|| format!("read static site path {}", source.display()))?;
         let file_type = metadata.file_type();
+        if is_skipped_name(&name) {
+            skipped.push(relative);
+            continue;
+        }
         if file_type.is_symlink() {
             anyhow::bail!(
                 "static site path {relative} is a symlink; Apps Platform artifacts can only \
                  contain regular files. Copy the target into the build output instead."
             );
-        }
-        if is_skipped_name(&name, file_type.is_dir()) {
-            skipped.push(relative);
-            continue;
         }
         if file_type.is_dir() {
             entries.push(SiteEntry {
@@ -439,13 +459,13 @@ mod tests {
         write(dir.path(), "assets/._app.js", "x");
         write(dir.path(), ".git/HEAD", "ref");
         write(dir.path(), "__MACOSX/._index.html", "x");
+        // In a worktree or submodule, .git is a file rather than a directory.
+        write(dir.path(), "vendor/.git", "gitdir: ../.git/modules/vendor");
+        write(dir.path(), "vendor/lib.js", "lib");
         let packaged =
             package_static_dir(dir.path(), "docs-site", NotFoundHandling::NotFound).unwrap();
         let entries = read_archive(packaged.path());
-        assert!(entries.keys().all(|name| !name.contains("._")
-            && !name.contains(".DS_Store")
-            && !name.contains(".git/")
-            && !name.contains("__MACOSX")));
+        assert!(entries.contains_key("public/vendor/lib.js"));
         assert_eq!(
             packaged.skipped,
             vec![
@@ -453,9 +473,75 @@ mod tests {
                 "._index.html",
                 ".git",
                 "__MACOSX",
-                "assets/._app.js"
+                "assets/._app.js",
+                "vendor/.git",
             ]
         );
+        for skipped in &packaged.skipped {
+            let prefix = format!("public/{skipped}");
+            assert!(
+                entries.keys().all(|name| !name.starts_with(&prefix)),
+                "{skipped} was packaged"
+            );
+        }
+    }
+
+    #[test]
+    fn skips_secrets_and_dependencies_when_given_a_project_directory() {
+        let dir = site();
+        write(dir.path(), ".env", "TOKEN=secret");
+        write(dir.path(), ".env.local", "TOKEN=secret");
+        write(dir.path(), ".envrc", "export TOKEN=secret");
+        write(
+            dir.path(),
+            "node_modules/left-pad/index.js",
+            "module.exports = 1",
+        );
+        write(dir.path(), "assets/node_modules/x.js", "x");
+        let packaged =
+            package_static_dir(dir.path(), "docs-site", NotFoundHandling::NotFound).unwrap();
+        let entries = read_archive(packaged.path());
+        assert!(entries
+            .keys()
+            .all(|name| !name.contains(".env") && !name.contains("node_modules")));
+        assert_eq!(
+            packaged.skipped,
+            vec![
+                ".env",
+                ".env.local",
+                ".envrc",
+                "assets/node_modules",
+                "node_modules",
+            ]
+        );
+        assert_eq!(packaged.files, 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlinked_dependencies_instead_of_failing() {
+        let dir = site();
+        let store = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(store.path(), dir.path().join("node_modules")).unwrap();
+        let packaged =
+            package_static_dir(dir.path(), "docs-site", NotFoundHandling::NotFound).unwrap();
+        assert_eq!(packaged.skipped, vec!["node_modules"]);
+    }
+
+    #[test]
+    fn limits_count_the_manifest_and_public_entries() {
+        let dir = Path::new("dist");
+        check_archive_limits(dir, MAX_ENTRIES - 2, 0, 200).unwrap();
+        let error = check_archive_limits(dir, MAX_ENTRIES - 1, 0, 200)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("100001 archive entries"), "{error}");
+
+        check_archive_limits(dir, 10, MAX_TOTAL_BYTES - 200, 200).unwrap();
+        let error = check_archive_limits(dir, 10, MAX_TOTAL_BYTES - 199, 200)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("accepts at most"), "{error}");
     }
 
     #[test]
