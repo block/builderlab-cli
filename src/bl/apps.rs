@@ -221,11 +221,16 @@ pub fn command() -> Command {
                 .long_about(
                     "Upload a prebuilt Hot Pod artifact.tar.gz to Apps Platform, or pass --dir \
                      with a built static site (a folder with index.html at its root, such as \
-                     dist/) and the CLI packages it as a static artifact first. The app must use \
-                     the static runtime profile (`bl apps create --runtime-profile static`). \
+                     dist/) and the CLI packages it as a static artifact first. A --dir deploy needs \
+                     an app created with `bl apps create --runtime-profile static`. \
                      Unknown paths return 404 with the site's root 404.html when present; pass \
                      --spa to serve index.html instead for client-side routing. The response \
                      includes the deployed URL and control-plane readiness and diagnostics endpoints.",
+                )
+                // A required group would otherwise print before APP_ID, but
+                // parsing expects APP_ID first.
+                .override_usage(
+                    "bl apps deploy [OPTIONS] --base-url <URL> <APP_ID> <ARTIFACT_TAR_GZ|--dir <DIR>>",
                 )
                 .group(
                     ArgGroup::new("deploy-source")
@@ -7560,6 +7565,20 @@ mod tests {
         assert!(combined.contains("no index.html at its root"), "{combined}");
         assert!(auth_server.finish().is_empty());
         assert!(control_plane.finish().is_empty());
+    }
+
+    #[test]
+    fn bl_apps_deploy_usage_puts_app_id_before_the_source() {
+        let mut apps = command();
+        let deploy = apps
+            .find_subcommand_mut("deploy")
+            .expect("deploy subcommand");
+        let usage = deploy.render_usage().to_string();
+        let app_id = usage.find("<APP_ID>").expect("usage names APP_ID");
+        let source = usage
+            .find("<ARTIFACT_TAR_GZ|--dir <DIR>>")
+            .expect("usage names the deploy source");
+        assert!(app_id < source, "{usage}");
     }
 
     #[test]
