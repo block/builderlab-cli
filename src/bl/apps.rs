@@ -519,7 +519,8 @@ pub fn command() -> Command {
                         .long_about(
                             "List the Buzz communities your linked Buzz identity has joined, with the \
                              COMMUNITY_ID that `bl apps community grant` takes. Needs `bl auth login`, except on a \
-                             Blox workstation set up for community sharing.",
+                             Blox workstation set up for community sharing. Other Blox workstations \
+                             can't share with communities and say so.",
                         ),
                 ),
         )
@@ -747,7 +748,10 @@ pub fn run(matches: &ArgMatches) -> Result<()> {
 }
 
 fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
-    if !uses_proxy_auth(matches) && !lists_communities_through_proxy(matches) {
+    if !uses_proxy_auth(matches)
+        && !lists_communities_through_proxy(matches)
+        && !refuses_community_list_on_this_workstation(matches)
+    {
         runner::ensure_org_configured(config)?;
     }
     match matches.subcommand() {
@@ -1103,12 +1107,6 @@ fn share_and_manage_step(portal: Option<&url::Url>, app_id: &str) -> String {
         Some(link) => format!("Open Share & manage at {link} and choose {app_id}."),
         None => share_and_manage_without_portal(app_id),
     }
-}
-
-fn community_share_and_manage_step(app_id: &str) -> String {
-    // An unusable origin only drops the link; the failure it decorates stands.
-    let portal = configured_management_portal(None).ok().flatten();
-    share_and_manage_step(portal.as_ref(), app_id)
 }
 
 fn build_app_handoff(
@@ -1713,6 +1711,12 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         .subcommand()
         .context("expected community grant, revoke or list")?;
     if action == "list" {
+        // Without the opt-in, `list` would fall back to a local login that a
+        // workstation never has, and report `auth_required` or `org_required`
+        // as if logging in would help. Say sharing is off here instead.
+        if apps_on_blox() && !community_sharing_through_proxy() {
+            return Err(community_sharing_unavailable(Some("APP_ID")));
+        }
         return run_community_list(config);
     }
     let app_id = action_matches
@@ -1729,17 +1733,10 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     // the owner credential the proxy forwards, so stop before any request.
     if proxy_auth_for_url(base_url) && !community_sharing_through_proxy() {
         // This only runs on a Blox workstation, where the agent can't log in or
-        // pick another ingress, so the owner's way forward is the browser.
-        let next_action = community_share_and_manage_step(app_id);
-        let mut error = CliFailure::new(
-            exit_codes::GENERAL,
-            "community_sharing_unavailable_through_proxy",
-            format!(
-                "Community sharing isn't available through this Blox workstation's proxy.\nnext_action: {next_action}"
-            ),
-        );
-        error.next_action = Some(json!(next_action));
-        return Err(anyhow::Error::new(error));
+        // pick another ingress. Workspace visibility is the way to widen access,
+        // so only a grant points there; widening is the opposite of a revoke.
+        let widen = (action == "grant").then_some(app_id.as_str());
+        return Err(community_sharing_unavailable(widen));
     }
     let (client, credential) = control_plane_context(config, action_matches)?;
     // Kgoose replaces the session with a credential bound to the owner, app and
@@ -1862,11 +1859,21 @@ fn proxied_joined_communities_service_url(config: &SkillsConfig) -> Option<Strin
     Some(kgoose_service_url(&base_url, &config.kgoose_service_path))
 }
 
-fn lists_communities_through_proxy(matches: &ArgMatches) -> bool {
+fn is_community_list(matches: &ArgMatches) -> bool {
     matches
         .subcommand()
         .filter(|(name, _)| *name == "community")
         .is_some_and(|(_, community)| community.subcommand_name() == Some("list"))
+}
+
+// `run_community` refuses `list` on an Apps workstation without the opt-in;
+// let it, rather than stopping first on a local org the workstation never has.
+fn refuses_community_list_on_this_workstation(matches: &ArgMatches) -> bool {
+    is_community_list(matches) && apps_on_blox() && !community_sharing_through_proxy()
+}
+
+fn lists_communities_through_proxy(matches: &ArgMatches) -> bool {
+    is_community_list(matches)
         && community_sharing_through_proxy()
         && super::workspace::workstation_base_url()
             .ok()
@@ -3306,6 +3313,40 @@ fn is_blox_control_plane_url(url: &url::Url) -> bool {
             .ok()
             .and_then(|configured| url::Url::parse(&configured).ok())
             .is_some_and(|configured| configured.origin() == url.origin())
+}
+
+// A Blox workstation the operator set up for Apps: Roxy authenticates the
+// control plane, and the agent can't log in.
+fn apps_on_blox() -> bool {
+    on_blox() && std::env::var(APPS_BASE_URL_ENV_VAR).is_ok_and(|url| !url.trim().is_empty())
+}
+
+fn workspace_visibility_command(app_id: &str) -> String {
+    format!("bl apps visibility {app_id} workspace")
+}
+
+/// `widen_app_id` names the app to suggest workspace visibility for. Pass `None`
+/// when the user is narrowing access (a revoke), where widening would be wrong.
+fn community_sharing_unavailable(widen_app_id: Option<&str>) -> anyhow::Error {
+    let message = "Community sharing isn't available on this Blox workstation.";
+    let Some(app_id) = widen_app_id else {
+        return anyhow::Error::new(CliFailure::new(
+            exit_codes::GENERAL,
+            "community_sharing_unavailable_through_proxy",
+            message.to_string(),
+        ));
+    };
+    let next_action = format!(
+        "To let everyone in the app's workspace open it, run `{}`.",
+        workspace_visibility_command(app_id)
+    );
+    let mut error = CliFailure::new(
+        exit_codes::GENERAL,
+        "community_sharing_unavailable_through_proxy",
+        format!("{message}\nnext_action: {next_action}"),
+    );
+    error.next_action = Some(json!(next_action));
+    anyhow::Error::new(error)
 }
 
 fn community_sharing_through_proxy() -> bool {
@@ -10216,15 +10257,24 @@ mod tests {
                 error["error"]["code"],
                 "community_sharing_unavailable_through_proxy"
             );
-            let next_action = error["next_action"].as_str().unwrap();
-            assert!(next_action.contains("Share & manage"), "{next_action}");
+            let message = error["error"]["message"].as_str().unwrap();
+            if action == "grant" {
+                let next_action = error["next_action"].as_str().unwrap();
+                assert!(
+                    next_action.contains("bl apps visibility my-app workspace"),
+                    "{next_action}"
+                );
+            } else {
+                // Widening to the workspace is the opposite of a revoke.
+                assert!(error["next_action"].is_null(), "{error}");
+                assert!(!message.contains("bl apps visibility"), "{message}");
+            }
             // A workstation agent can't log in or choose another base URL.
             for advice in ["bl auth login", "--base-url"] {
-                assert!(!next_action.contains(advice), "{next_action}");
-                assert!(
-                    !error["error"]["message"].as_str().unwrap().contains(advice),
-                    "{error}"
-                );
+                assert!(!message.contains(advice), "{error}");
+                if let Some(next_action) = error["next_action"].as_str() {
+                    assert!(!next_action.contains(advice), "{next_action}");
+                }
             }
             assert!(auth_server.finish().is_empty());
             assert!(control_plane.finish().is_empty());
@@ -10374,6 +10424,46 @@ mod tests {
     }
 
     #[test]
+    fn bl_apps_community_list_says_sharing_is_off_on_an_apps_workstation_without_the_opt_in() {
+        // An Apps workstation that hasn't opted in (bb-block) can't list
+        // communities. Say so instead of reporting a login the agent can't do.
+        for value in [None, Some(""), Some("true"), Some("disabled")] {
+            let kgoose = ProcessServer::start(vec![]);
+            let control_plane = ProcessServer::start(vec![]);
+            let mut command = process_command(
+                &kgoose,
+                &control_plane,
+                &["apps", "community", "list", "--json"],
+                "apps-e2e-only.unused",
+            );
+            command
+                .env("BL_APPS_E2E_PROXY", "true")
+                .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
+                .env("BL_TOOLS_BASE_URL", &kgoose.base_url);
+            if let Some(value) = value {
+                command.env(APPS_COMMUNITY_SHARING_ENV_VAR, value);
+            }
+            let output = command.output().expect("run community list process");
+            assert_eq!(output.status.code(), Some(exit_codes::GENERAL), "{value:?}");
+            let error = process_error(&output);
+            assert_eq!(
+                error["error"]["code"],
+                "community_sharing_unavailable_through_proxy"
+            );
+            let next_action = error["next_action"].as_str().unwrap();
+            assert!(
+                next_action.contains("bl apps visibility APP_ID workspace"),
+                "{next_action}"
+            );
+            for advice in ["bl auth login", "--base-url"] {
+                assert!(!error.to_string().contains(advice), "{error}");
+            }
+            assert!(kgoose.finish().is_empty(), "{value:?}");
+            assert!(control_plane.finish().is_empty());
+        }
+    }
+
+    #[test]
     fn bl_apps_community_list_stays_off_the_blox_proxy_without_the_exact_opt_in() {
         for value in [None, Some(""), Some("true"), Some("disabled")] {
             let kgoose = ProcessServer::start(vec![]);
@@ -10488,77 +10578,53 @@ mod tests {
     }
 
     #[test]
-    fn bl_apps_community_proxy_refusal_links_share_and_manage_when_the_portal_is_known() {
-        let auth_server = ProcessServer::start(vec![]);
-        let control_plane = ProcessServer::start(vec![]);
-        let output = process_command(
-            &auth_server,
-            &control_plane,
-            &[
-                "apps",
-                "community",
-                "grant",
-                "my-app",
-                "buzz-alpha",
-                "--json",
-            ],
-            "apps-e2e-only.unused",
-        )
-        .env("BL_APPS_E2E_PROXY", "true")
-        .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
-        .env("BL_APPS_MANAGEMENT_BASE_URL", "https://app.builderlab.xyz")
-        .output()
-        .expect("run proxied community process");
-        let error = process_error(&output);
-        assert_eq!(
-            error["error"]["code"],
-            "community_sharing_unavailable_through_proxy"
-        );
-        let next_action = error["next_action"].as_str().unwrap();
-        // The portal only opens an app's dialog when it also gets the workspace.
-        assert!(next_action.contains(
-            "Open Share & manage at https://app.builderlab.xyz/hosted-apps and choose my-app."
-        ));
-        assert!(!next_action.contains("app="));
-        assert!(error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains(next_action));
-        assert!(auth_server.finish().is_empty());
-        assert!(control_plane.finish().is_empty());
-    }
-
-    #[test]
-    fn bl_apps_community_proxy_refusal_points_to_the_browser_dialog_without_a_portal() {
-        let auth_server = ProcessServer::start(vec![]);
-        let control_plane = ProcessServer::start(vec![]);
-        let output = process_command(
-            &auth_server,
-            &control_plane,
-            &[
-                "apps",
-                "community",
-                "grant",
-                "my-app",
-                "buzz-alpha",
-                "--json",
-            ],
-            "apps-e2e-only.unused",
-        )
-        .env("BL_APPS_E2E_PROXY", "true")
-        .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example")
-        .output()
-        .expect("run proxied community process");
-        let error = process_error(&output);
-        let next_action = error["next_action"].as_str().unwrap();
-        assert!(next_action.contains(
-            "Open Hosted Apps in the BuilderLab portal and use Share & manage on my-app."
-        ));
-        assert!(!next_action.contains("https://"));
-        assert!(error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains(next_action));
+    fn bl_apps_community_proxy_refusal_points_to_workspace_visibility_not_the_portal() {
+        // Share & manage can't share with communities where the workstation
+        // can't either, so the refusal names workspace visibility even when the
+        // portal is known.
+        for portal in [Some("https://app.builderlab.xyz"), None] {
+            let auth_server = ProcessServer::start(vec![]);
+            let control_plane = ProcessServer::start(vec![]);
+            let mut command = process_command(
+                &auth_server,
+                &control_plane,
+                &[
+                    "apps",
+                    "community",
+                    "grant",
+                    "my-app",
+                    "buzz-alpha",
+                    "--json",
+                ],
+                "apps-e2e-only.unused",
+            );
+            command
+                .env("BL_APPS_E2E_PROXY", "true")
+                .env(APPS_BASE_URL_ENV_VAR, "http://compose.mesh.example");
+            if let Some(portal) = portal {
+                command.env("BL_APPS_MANAGEMENT_BASE_URL", portal);
+            }
+            let output = command.output().expect("run proxied community process");
+            let error = process_error(&output);
+            assert_eq!(
+                error["error"]["code"],
+                "community_sharing_unavailable_through_proxy"
+            );
+            let next_action = error["next_action"].as_str().unwrap();
+            assert_eq!(
+                next_action,
+                "To let everyone in the app's workspace open it, run \
+                 `bl apps visibility my-app workspace`.",
+                "{portal:?}"
+            );
+            assert!(!next_action.contains("Share & manage"), "{portal:?}");
+            assert!(error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(next_action));
+            assert!(auth_server.finish().is_empty());
+            assert!(control_plane.finish().is_empty());
+        }
     }
 
     #[test]
