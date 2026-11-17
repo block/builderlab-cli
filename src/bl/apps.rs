@@ -1300,21 +1300,26 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         CreateOptions {
             private,
             mysql_requested,
-            retry_command: if private {
-                "bl apps create --private"
-            } else {
-                "bl apps create"
-            },
+            caller: CreateCaller::Create,
         },
     )?;
     print_json(&created)
 }
 
-struct CreateOptions<'a> {
+struct CreateOptions {
     private: bool,
     mysql_requested: bool,
-    /// The command a user reruns to resume an interrupted creation.
-    retry_command: &'a str,
+    caller: CreateCaller,
+}
+
+/// Which command is creating the app, so recovery steps name commands that
+/// actually resume it. Rerunning `bl apps create` reconciles an interrupted
+/// reservation; rerunning `bl apps deploy` finds the reservation and only
+/// deploys, so it cannot finish private or initialize steps itself.
+#[derive(Clone, Copy)]
+enum CreateCaller {
+    Create,
+    Deploy,
 }
 
 /// Plans, reserves, optionally makes private, and initializes one app,
@@ -1323,12 +1328,12 @@ fn create_app(
     client: &ControlPlaneClient,
     credential: &ComposeSessionCredential,
     request: &PlanRequest<'_>,
-    options: CreateOptions<'_>,
+    options: CreateOptions,
 ) -> Result<Value> {
     let CreateOptions {
         private,
         mysql_requested,
-        retry_command,
+        caller,
     } = options;
     let plan = client.plan(credential, request)?;
     let app_id = required_response_string(&plan, "app_id", "Apps Platform plan")?.to_string();
@@ -1367,8 +1372,9 @@ fn create_app(
         let response = client
             .set_visibility(credential, &app_id, PRIVATE_VISIBILITY, environment)
             .and_then(|response| require_visibility(&app_id, PRIVATE_VISIBILITY, response))
-            .with_context(|| {
-                format!("Apps Platform reserved app_id {app_id:?}, but did not make it private. Do not deploy it. After fixing the error, run `bl apps visibility {app_id} private` or retry the same `{retry_command}` command.")
+            .with_context(|| match caller {
+                CreateCaller::Create => format!("Apps Platform reserved app_id {app_id:?}, but did not make it private. Do not deploy it. After fixing the error, run `bl apps visibility {app_id} private` or retry the same `bl apps create --private` command."),
+                CreateCaller::Deploy => format!("Apps Platform reserved app_id {app_id:?}, but did not make it private, so nothing was deployed. After fixing the error, run `bl apps visibility {app_id} private`, then run the same `bl apps deploy` command."),
             })?;
         Some(response)
     } else {
@@ -1382,7 +1388,10 @@ fn create_app(
                     let profile = request.runtime_profile.expect("validated MySQL runtime");
                     format!("Apps Platform reserved app_id {app_id:?}, but MySQL initialization did not complete. Inspect it with `bl apps get`, then resume the same app with `bl apps initialize` using the same endpoint, environment, --runtime-profile {profile} and --persistence mysql.")
                 } else {
-                    format!("Apps Platform reserved app_id {app_id:?}, but initialization did not complete. Retry the same `{retry_command}` command to reconcile the reservation and continue initialization.")
+                    match caller {
+                        CreateCaller::Create => format!("Apps Platform reserved app_id {app_id:?}, but initialization did not complete. Retry the same `bl apps create` command to reconcile the reservation and continue initialization."),
+                        CreateCaller::Deploy => format!("Apps Platform reserved app_id {app_id:?}, but initialization did not complete, so nothing was deployed. Run `bl apps initialize {app_id}` with the same endpoint and environment, then run the same `bl apps deploy` command."),
+                    }
                 }
             })?;
         let initialized_app_id =
@@ -1746,7 +1755,7 @@ fn ensure_static_app(
                 CreateOptions {
                     private,
                     mysql_requested: false,
-                    retry_command: "bl apps deploy",
+                    caller: CreateCaller::Deploy,
                 },
             )
             .with_context(|| {
@@ -1756,8 +1765,10 @@ fn ensure_static_app(
                 .get("external_url")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            // A mistyped ID creates a new app instead of failing, so say so
+            // plainly and name the way back.
             eprintln!(
-                "Created new app {}{}{}",
+                "Created new app {}{}{}. No app with that ID existed; if the ID was a typo, remove the new app with `bl apps delete`.",
                 terminal_safe_text(app_id),
                 if url.is_empty() { "" } else { " at " },
                 terminal_safe_text(url)
@@ -7771,6 +7782,7 @@ mod tests {
             stderr.contains("Created new app docs-site at https://docs-site--bpsites.example/"),
             "{stderr}"
         );
+        assert!(stderr.contains("if the ID was a typo"), "{stderr}");
         let printed: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
         assert_eq!(printed["version_id"], "ver-1");
         assert_eq!(printed["created"], true);
@@ -7883,6 +7895,43 @@ mod tests {
                 ("POST", APPS_PLAN_PATH),
                 ("POST", "/v1/agent/apps/docs-site/reserve"),
                 ("GET", "/v1/agent/apps/docs-site?environment=staging"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bl_apps_deploy_dir_points_at_initialize_when_first_initialize_fails() {
+        let credential = "apps-e2e-only.deploy-dir-init-fail.session+credential";
+        let mut plan = static_plan("docs-site");
+        plan["initialize"] = json!({"required": true, "recommended": true});
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json_status(404, json!({"error": {"code": "app_not_found"}})),
+            ProcessResponse::json(plan),
+            ProcessResponse::json(json!({"app_id": "docs-site"})),
+            ProcessResponse::json_status(503, json!({"error": {"code": "initialize_unavailable"}})),
+        ]);
+        let site = static_site_dir();
+        let output = deploy_dir_command(&auth_server, &control_plane, &site, &[], credential)
+            .output()
+            .expect("run Apps deploy --dir process command");
+        assert!(!output.status.success());
+        let error = process_error(&output);
+        assert_eq!(error["error"]["code"], "initialize_unavailable");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("Run `bl apps initialize docs-site`"),
+            "{message}"
+        );
+        assert!(!message.contains("reconcile the reservation"), "{message}");
+        assert_process_auth(&auth_server.finish()[0], credential);
+        assert_eq!(
+            request_order(&control_plane.finish()),
+            [
+                ("GET", "/v1/agent/apps/docs-site"),
+                ("POST", APPS_PLAN_PATH),
+                ("POST", "/v1/agent/apps/docs-site/reserve"),
+                ("POST", "/v1/agent/apps/docs-site/initialize"),
             ]
         );
     }

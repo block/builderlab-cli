@@ -83,9 +83,11 @@ bl apps deploy docs-site --dir dist --json
 ```
 
 If you have no app with that ID, the first deploy creates it as a static app,
-prints `Created new app docs-site at <url>` on stderr, and reports
+says so on stderr (`Created new app docs-site at <url>`), and reports
 `"created": true` with the creation details under `create`. Later deploys to the
-same ID update it. An ID someone else already owns fails before anything is
+same ID update it. Because a mistyped ID creates a new app rather than failing,
+check that line on first deploys; remove an unintended app with
+`bl apps delete`. An ID someone else already owns fails before anything is
 deployed. Pass `--private` on the first deploy to make the new app private
 before it goes live; for an app that already exists, `--private` only checks
 that it is already private.
