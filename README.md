@@ -73,6 +73,33 @@ Use `--json` for machine-readable output and `--verbose` for request
 diagnostics. Do not include credentials or other sensitive data when sharing
 verbose output.
 
+## Static sites
+
+To publish a built static site or single-page app, create a static app once,
+then deploy the build output directory:
+
+```bash
+bl apps create --app-id docs-site --runtime-profile static --json
+bl apps deploy docs-site --dir dist --json
+```
+
+`--dir` takes the folder your build writes, with `index.html` at its root. The
+CLI writes the static manifest, packages the files under `public/`, and uploads
+the result, so no manifest or tarball is needed. It skips `.DS_Store`, `._*`
+AppleDouble files, `__MACOSX/` and `.git`, plus `.env*`/`.envrc` files and
+`node_modules/` so `--dir .` doesn't publish secrets or dependencies, and
+refuses other symlinks. The same
+directory always produces the same archive.
+
+Unknown paths return 404. For client-side routing, pass `--spa` to serve
+`index.html` for unknown paths instead. Current platform static runtimes also
+serve `/about` from `about.html` and answer a 404 with the site's root
+`404.html` when present.
+
+The JSON response adds `packaged_site` with the file count, byte sizes and
+skipped paths. To deploy a prebuilt `artifact.tar.gz` instead, pass its path in
+place of `--dir`.
+
 ## Managed MySQL apps
 
 When the selected Apps Platform contract and server support managed MySQL,
