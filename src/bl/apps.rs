@@ -221,9 +221,10 @@ pub fn command() -> Command {
                 .long_about(
                     "Upload a prebuilt Hot Pod artifact.tar.gz to Apps Platform, or pass --dir \
                      with a built static site (a folder with index.html at its root, such as \
-                     dist/) and the CLI packages it as a static artifact first. A --dir deploy needs \
-                     an app created with `bl apps create --runtime-profile static`. \
-                     Unknown paths return 404 with the site's root 404.html when present; pass \
+                     dist/) and the CLI packages it as a static artifact first. A --dir deploy \
+                     creates the static app when you have none with that ID, and the response \
+                     reports `created`; an ID someone else owns fails without deploying. A \
+                     prebuilt artifact needs an app from `bl apps create`. Unknown paths return 404 with the site's root 404.html when present; pass \
                      --spa to serve index.html instead for client-side routing. The response \
                      includes the deployed URL and control-plane readiness and diagnostics endpoints.",
                 )
@@ -241,7 +242,7 @@ pub fn command() -> Command {
                     Arg::new("app-id")
                         .value_name("APP_ID")
                         .required(true)
-                        .help("App identifier returned by `bl apps create`"),
+                        .help("App identifier; with --dir, a new descriptive DNS-safe ID creates the app"),
                 )
                 .arg(
                     Arg::new("artifact")
@@ -262,6 +263,13 @@ pub fn command() -> Command {
                         .conflicts_with("artifact")
                         .action(clap::ArgAction::SetTrue)
                         .help("With --dir, serve index.html for unknown paths (single-page app routing)"),
+                )
+                .arg(
+                    Arg::new("private")
+                        .long("private")
+                        .conflicts_with("artifact")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("With --dir, make a newly created app private before its first deploy; an existing app must already be private"),
                 )
                 .arg(
                     Arg::new("environment")
@@ -1274,9 +1282,9 @@ fn validate_mysql_runtime(matches: &ArgMatches) -> Result<bool> {
 fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let mysql_requested = validate_mysql_runtime(matches)?;
     let (client, credential) = control_plane_context(config, matches)?;
-    let requested_app_id = matches.get_one::<String>("app-id").map(String::as_str);
+    let private = matches.get_flag("private");
     let request = PlanRequest {
-        app_id: requested_app_id,
+        app_id: matches.get_one::<String>("app-id").map(String::as_str),
         name: matches.get_one::<String>("name").map(String::as_str),
         environment: matches.get_one::<String>("environment").map(String::as_str),
         runtime_profile: matches
@@ -1285,9 +1293,46 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         persistence: matches.get_one::<String>("persistence").map(String::as_str),
         client_version: client.client_version_text(),
     };
-    let plan = client.plan(&credential, &request)?;
+    let created = create_app(
+        &client,
+        &credential,
+        &request,
+        CreateOptions {
+            private,
+            mysql_requested,
+            retry_command: if private {
+                "bl apps create --private"
+            } else {
+                "bl apps create"
+            },
+        },
+    )?;
+    print_json(&created)
+}
+
+struct CreateOptions<'a> {
+    private: bool,
+    mysql_requested: bool,
+    /// The command a user reruns to resume an interrupted creation.
+    retry_command: &'a str,
+}
+
+/// Plans, reserves, optionally makes private, and initializes one app,
+/// returning the `bl apps create` result.
+fn create_app(
+    client: &ControlPlaneClient,
+    credential: &ComposeSessionCredential,
+    request: &PlanRequest<'_>,
+    options: CreateOptions<'_>,
+) -> Result<Value> {
+    let CreateOptions {
+        private,
+        mysql_requested,
+        retry_command,
+    } = options;
+    let plan = client.plan(credential, request)?;
     let app_id = required_response_string(&plan, "app_id", "Apps Platform plan")?.to_string();
-    if let Some(requested_app_id) = requested_app_id {
+    if let Some(requested_app_id) = request.app_id {
         require_exact_app_id("plan", requested_app_id, &app_id)
             .map_err(|error| correlate_response_error(error, &plan))?;
     }
@@ -1315,15 +1360,15 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     }
     let mutation_request = mutation_request_from_plan(&plan);
     let (reservation, reservation_reconciled) =
-        reconcile_create_reservation(&client, &credential, &app_id, &plan, &mutation_request)?;
+        reconcile_create_reservation(client, credential, &app_id, &plan, &mutation_request)?;
     // Private is applied before initialization so a private app is never visible.
-    let visibility = if matches.get_flag("private") {
+    let visibility = if private {
         let environment = mutation_request.get("environment").and_then(Value::as_str);
         let response = client
-            .set_visibility(&credential, &app_id, PRIVATE_VISIBILITY, environment)
+            .set_visibility(credential, &app_id, PRIVATE_VISIBILITY, environment)
             .and_then(|response| require_visibility(&app_id, PRIVATE_VISIBILITY, response))
             .with_context(|| {
-                format!("Apps Platform reserved app_id {app_id:?}, but did not make it private. Do not deploy it. After fixing the error, run `bl apps visibility {app_id} private` or retry the same `bl apps create --private` command.")
+                format!("Apps Platform reserved app_id {app_id:?}, but did not make it private. Do not deploy it. After fixing the error, run `bl apps visibility {app_id} private` or retry the same `{retry_command}` command.")
             })?;
         Some(response)
     } else {
@@ -1331,13 +1376,13 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     };
     let initialize = if plan_requests_initialize {
         let response = client
-            .initialize(&credential, &app_id, &mutation_request)
+            .initialize(credential, &app_id, &mutation_request)
             .with_context(|| {
                 if mysql_requested {
                     let profile = request.runtime_profile.expect("validated MySQL runtime");
                     format!("Apps Platform reserved app_id {app_id:?}, but MySQL initialization did not complete. Inspect it with `bl apps get`, then resume the same app with `bl apps initialize` using the same endpoint, environment, --runtime-profile {profile} and --persistence mysql.")
                 } else {
-                    format!("Apps Platform reserved app_id {app_id:?}, but initialization did not complete. Retry the same `bl apps create` command to reconcile the reservation and continue initialization.")
+                    format!("Apps Platform reserved app_id {app_id:?}, but initialization did not complete. Retry the same `{retry_command}` command to reconcile the reservation and continue initialization.")
                 }
             })?;
         let initialized_app_id =
@@ -1359,7 +1404,7 @@ fn run_create(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
             .cloned()
             .unwrap_or(Value::Null),
     };
-    print_json(&json!({
+    Ok(json!({
         "ok": true,
         "app_id": app_id,
         "external_url": effective_external_url,
@@ -1626,11 +1671,116 @@ fn run_deploy(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         deployment_id: matches.get_one::<String>("deployment-id").cloned(),
     };
     let (client, credential) = control_plane_context(config, matches)?;
-    let mut response = client.deploy(&credential, app_id, artifact, &options)?;
+    // A static site deploy creates its app on first use; a prebuilt artifact
+    // still needs `bl apps create` because its runtime is not known here.
+    let created = if packaged.is_some() {
+        ensure_static_app(
+            &client,
+            &credential,
+            app_id,
+            options.environment.as_deref(),
+            matches.get_flag("private"),
+        )?
+    } else {
+        None
+    };
+    let mut response = client
+        .deploy(&credential, app_id, artifact, &options)
+        .map_err(|error| match created {
+            Some(_) => error.context(format!(
+                "Created app {app_id:?}, but its first deploy failed. Fix the error, then run the same command again to deploy to it."
+            )),
+            None => error,
+        })?;
     if let (Some((dir, site)), Some(object)) = (packaged.as_ref(), response.as_object_mut()) {
+        object.insert("created".to_string(), Value::Bool(created.is_some()));
+        if let Some(created) = created {
+            object.insert("create".to_string(), created);
+        }
         object.insert("packaged_site".to_string(), site.summary(dir));
     }
     print_json(&response)
+}
+
+/// Creates a static app when the caller has none with this ID, returning the
+/// create result, or `None` when the app already exists. With `private`, an
+/// existing app must already be private so a deploy never publishes a site
+/// the caller asked to keep private.
+fn ensure_static_app(
+    client: &ControlPlaneClient,
+    credential: &ComposeSessionCredential,
+    app_id: &str,
+    environment: Option<&str>,
+    private: bool,
+) -> Result<Option<Value>> {
+    match client.get_app(credential, app_id, environment) {
+        Ok(_) => {
+            if private {
+                let access = client.get_access(credential, app_id, environment)?;
+                let visibility = access.get("visibility").and_then(Value::as_str);
+                if visibility != Some(PRIVATE_VISIBILITY) {
+                    return Err(anyhow::Error::new(CliFailure::new(
+                        exit_codes::GENERAL,
+                        "app_not_private",
+                        format!(
+                            "App {app_id:?} already exists and is not private, so nothing was deployed. --private only applies when deploy creates the app.\nnext_action: Run `bl apps visibility {app_id} private`, then deploy again."
+                        ),
+                    )));
+                }
+            }
+            Ok(None)
+        }
+        Err(error) if is_app_not_found(&error) => {
+            let request = PlanRequest {
+                app_id: Some(app_id),
+                name: None,
+                environment,
+                runtime_profile: Some("static"),
+                persistence: None,
+                client_version: client.client_version_text(),
+            };
+            let created = create_app(
+                client,
+                credential,
+                &request,
+                CreateOptions {
+                    private,
+                    mysql_requested: false,
+                    retry_command: "bl apps deploy",
+                },
+            )
+            .with_context(|| {
+                format!("You have no app {app_id:?}, so deploy tried to create it, but creation failed. Nothing was deployed.")
+            })?;
+            let url = created
+                .get("external_url")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            eprintln!(
+                "Created new app {}{}{}",
+                terminal_safe_text(app_id),
+                if url.is_empty() { "" } else { " at " },
+                terminal_safe_text(url)
+            );
+            Ok(Some(created))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_app_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CliFailure>())
+        .is_some_and(|failure| {
+            failure.code == "app_not_found"
+                && failure
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("http_status"))
+                    .and_then(Value::as_u64)
+                    == Some(404)
+        })
 }
 
 fn run_rollback(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
@@ -7454,7 +7604,10 @@ mod tests {
             "status": "pending_validation"
         });
         let auth_server = ProcessServer::start(vec![process_auth_response()]);
-        let control_plane = ProcessServer::start(vec![ProcessResponse::json(deployed.clone())]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(existing_static_app("docs-site")),
+            ProcessResponse::json(deployed.clone()),
+        ]);
         let site = tempfile::tempdir().expect("create static site directory");
         fs::write(site.path().join("index.html"), "deploy-dir-index-marker").unwrap();
         fs::write(site.path().join("._index.html"), "appledouble").unwrap();
@@ -7482,6 +7635,8 @@ mod tests {
         let printed: Value = serde_json::from_str(&process_stdout(&output))
             .expect("parse deploy --dir process output");
         assert_eq!(printed["version_id"], "ver-123");
+        assert_eq!(printed["created"], false);
+        assert!(printed.get("create").is_none());
         assert_eq!(
             printed["packaged_site"],
             json!({
@@ -7498,14 +7653,15 @@ mod tests {
         let auth_requests = auth_server.finish();
         let requests = control_plane.finish();
         assert_process_auth(&auth_requests[0], credential);
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
+        assert_process_control_plane(&requests[0], "GET", "/v1/agent/apps/docs-site", credential);
         assert_process_control_plane(
-            &requests[0],
+            &requests[1],
             "POST",
             "/v1/agent/apps/docs-site/deploy",
             credential,
         );
-        let body = &requests[0].body_bytes;
+        let body = &requests[1].body_bytes;
         assert!(String::from_utf8_lossy(body).contains("filename=\"artifact.tar.gz\""));
         let gzip_start = body
             .windows(2)
@@ -7529,6 +7685,331 @@ mod tests {
         assert_eq!(manifest["app"]["app_id"], "docs-site");
         assert_eq!(manifest["runtime"]["profile"], "static");
         assert_eq!(manifest["runtime"]["not_found_handling"], "spa");
+    }
+
+    fn existing_static_app(app_id: &str) -> Value {
+        json!({
+            "ok": true,
+            "app": {"app_id": app_id, "runtime_profile": "static"},
+            "versions": [],
+        })
+    }
+
+    fn static_site_dir() -> tempfile::TempDir {
+        let site = tempfile::tempdir().expect("create static site directory");
+        fs::write(site.path().join("index.html"), "first-deploy").unwrap();
+        site
+    }
+
+    fn deploy_dir_command(
+        auth_server: &ProcessServer,
+        control_plane: &ProcessServer,
+        site: &tempfile::TempDir,
+        extra: &[&str],
+        credential: &str,
+    ) -> ProcessCommand {
+        let mut args = vec![
+            "apps",
+            "deploy",
+            "docs-site",
+            "--dir",
+            site.path().to_str().expect("site path UTF-8"),
+        ];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&[
+            "--base-url",
+            APPROVED_TEST_BASE_URL,
+            "--client-version",
+            "0.2.0",
+            "--json",
+        ]);
+        process_command(auth_server, control_plane, &args, credential)
+    }
+
+    fn static_plan(app_id: &str) -> Value {
+        json!({
+            "app_id": app_id,
+            "environment": "staging",
+            "persistence": "none",
+            "runtime_class": "default",
+            "runtime_profile": "static",
+            "external_url": format!("https://{app_id}--bpsites.example/"),
+            "initialize": {"required": false, "recommended": false}
+        })
+    }
+
+    fn request_order(requests: &[ProcessRequest]) -> Vec<(&str, &str)> {
+        requests
+            .iter()
+            .map(|request| (request.method.as_str(), request.path.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn bl_apps_deploy_dir_creates_a_missing_static_app_then_deploys() {
+        let credential = "apps-e2e-only.deploy-dir-create.session+credential";
+        let reservation = json!({
+            "app_id": "docs-site",
+            "external_url": "https://docs-site--bpsites.example/"
+        });
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json_status(404, json!({"error": {"code": "app_not_found"}})),
+            ProcessResponse::json(static_plan("docs-site")),
+            ProcessResponse::json(reservation.clone()),
+            ProcessResponse::json(
+                json!({"ok": true, "app_id": "docs-site", "version_id": "ver-1"}),
+            ),
+        ]);
+        let site = static_site_dir();
+        let output = deploy_dir_command(&auth_server, &control_plane, &site, &[], credential)
+            .output()
+            .expect("run Apps deploy --dir process command");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("Created new app docs-site at https://docs-site--bpsites.example/"),
+            "{stderr}"
+        );
+        let printed: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
+        assert_eq!(printed["version_id"], "ver-1");
+        assert_eq!(printed["created"], true);
+        assert_eq!(printed["create"]["app_id"], "docs-site");
+        assert_eq!(printed["create"]["reservation"], reservation);
+        assert_eq!(printed["create"]["initialized"], false);
+        assert_eq!(printed["create"]["visibility"], Value::Null);
+
+        assert_process_auth(&auth_server.finish()[0], credential);
+        let requests = control_plane.finish();
+        assert_eq!(
+            request_order(&requests),
+            [
+                ("GET", "/v1/agent/apps/docs-site"),
+                ("POST", APPS_PLAN_PATH),
+                ("POST", "/v1/agent/apps/docs-site/reserve"),
+                ("POST", "/v1/agent/apps/docs-site/deploy"),
+            ]
+        );
+        assert_eq!(requests[1].body["app_id"], "docs-site");
+        assert_eq!(requests[1].body["runtime_profile"], "static");
+        assert!(requests[1].body.get("name").is_none());
+        assert!(requests[1].body.get("persistence").is_none());
+        assert_eq!(requests[2].body["runtime_profile"], "static");
+    }
+
+    #[test]
+    fn bl_apps_deploy_dir_private_makes_a_new_app_private_before_deploying() {
+        let credential = "apps-e2e-only.deploy-dir-private.session+credential";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json_status(404, json!({"error": {"code": "app_not_found"}})),
+            ProcessResponse::json(static_plan("docs-site")),
+            ProcessResponse::json(json!({"app_id": "docs-site"})),
+            ProcessResponse::json(json!({
+                "ok": true,
+                "app_id": "docs-site",
+                "visibility": "restricted",
+                "viewers": [],
+            })),
+            ProcessResponse::json(
+                json!({"ok": true, "app_id": "docs-site", "version_id": "ver-1"}),
+            ),
+        ]);
+        let site = static_site_dir();
+        let output = deploy_dir_command(
+            &auth_server,
+            &control_plane,
+            &site,
+            &["--private", "--environment", "staging"],
+            credential,
+        )
+        .output()
+        .expect("run Apps deploy --dir --private process command");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let printed: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
+        assert_eq!(printed["created"], true);
+        assert_eq!(printed["create"]["visibility"]["visibility"], "restricted");
+        assert_process_auth(&auth_server.finish()[0], credential);
+        let requests = control_plane.finish();
+        assert_eq!(
+            request_order(&requests),
+            [
+                ("GET", "/v1/agent/apps/docs-site?environment=staging"),
+                ("POST", APPS_PLAN_PATH),
+                ("POST", "/v1/agent/apps/docs-site/reserve"),
+                ("PUT", "/v1/agent/apps/docs-site/visibility"),
+                ("POST", "/v1/agent/apps/docs-site/deploy"),
+            ]
+        );
+        assert_eq!(requests[1].body["environment"], "staging");
+        assert_eq!(
+            requests[3].body,
+            json!({"visibility": "restricted", "environment": "staging"})
+        );
+    }
+
+    #[test]
+    fn bl_apps_deploy_dir_does_not_deploy_when_someone_else_owns_the_id() {
+        let credential = "apps-e2e-only.deploy-dir-collision.session+credential";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json_status(404, json!({"error": {"code": "app_not_found"}})),
+            ProcessResponse::json(static_plan("docs-site")),
+            ProcessResponse::json_status(
+                409,
+                json!({"ok": false, "error": {"code": "app_id_collision", "message": "app_id is already reserved"}}),
+            ),
+            ProcessResponse::json_status(404, json!({"error": {"code": "app_not_found"}})),
+        ]);
+        let site = static_site_dir();
+        let output = deploy_dir_command(&auth_server, &control_plane, &site, &[], credential)
+            .output()
+            .expect("run Apps deploy --dir process command");
+        assert!(!output.status.success());
+        let error = process_error(&output);
+        assert_eq!(error["error"]["code"], "app_id_collision");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Nothing was deployed"), "{message}");
+        assert_process_auth(&auth_server.finish()[0], credential);
+        let requests = control_plane.finish();
+        assert_eq!(
+            request_order(&requests),
+            [
+                ("GET", "/v1/agent/apps/docs-site"),
+                ("POST", APPS_PLAN_PATH),
+                ("POST", "/v1/agent/apps/docs-site/reserve"),
+                ("GET", "/v1/agent/apps/docs-site?environment=staging"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bl_apps_deploy_dir_private_refuses_an_existing_public_app() {
+        let credential = "apps-e2e-only.deploy-dir-public.session+credential";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(existing_static_app("docs-site")),
+            ProcessResponse::json(json!({
+                "ok": true,
+                "app_id": "docs-site",
+                "visibility": "organization",
+                "viewers": [],
+            })),
+        ]);
+        let site = static_site_dir();
+        let output = deploy_dir_command(
+            &auth_server,
+            &control_plane,
+            &site,
+            &["--private"],
+            credential,
+        )
+        .output()
+        .expect("run Apps deploy --dir --private process command");
+        assert!(!output.status.success());
+        let error = process_error(&output);
+        assert_eq!(error["error"]["code"], "app_not_private");
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("bl apps visibility docs-site private"));
+        assert_process_auth(&auth_server.finish()[0], credential);
+        assert_eq!(
+            request_order(&control_plane.finish()),
+            [
+                ("GET", "/v1/agent/apps/docs-site"),
+                ("GET", "/v1/agent/apps/docs-site/access"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bl_apps_deploy_dir_private_deploys_to_an_existing_private_app() {
+        let credential = "apps-e2e-only.deploy-dir-existing-private.session+credential";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json(existing_static_app("docs-site")),
+            ProcessResponse::json(json!({
+                "ok": true,
+                "app_id": "docs-site",
+                "visibility": "restricted",
+                "viewers": [],
+            })),
+            ProcessResponse::json(
+                json!({"ok": true, "app_id": "docs-site", "version_id": "ver-2"}),
+            ),
+        ]);
+        let site = static_site_dir();
+        let output = deploy_dir_command(
+            &auth_server,
+            &control_plane,
+            &site,
+            &["--private"],
+            credential,
+        )
+        .output()
+        .expect("run Apps deploy --dir --private process command");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let printed: Value = serde_json::from_str(&process_stdout(&output)).unwrap();
+        assert_eq!(printed["created"], false);
+        assert_process_auth(&auth_server.finish()[0], credential);
+        assert_eq!(
+            request_order(&control_plane.finish()),
+            [
+                ("GET", "/v1/agent/apps/docs-site"),
+                ("GET", "/v1/agent/apps/docs-site/access"),
+                ("POST", "/v1/agent/apps/docs-site/deploy"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bl_apps_deploy_dir_reports_a_failed_first_deploy_as_resumable() {
+        let credential = "apps-e2e-only.deploy-dir-first-fail.session+credential";
+        let auth_server = ProcessServer::start(vec![process_auth_response()]);
+        let control_plane = ProcessServer::start(vec![
+            ProcessResponse::json_status(404, json!({"error": {"code": "app_not_found"}})),
+            ProcessResponse::json(static_plan("docs-site")),
+            ProcessResponse::json(json!({"app_id": "docs-site"})),
+            ProcessResponse::json_status(503, json!({"error": {"code": "deploy_unavailable"}})),
+        ]);
+        let site = static_site_dir();
+        let output = deploy_dir_command(&auth_server, &control_plane, &site, &[], credential)
+            .output()
+            .expect("run Apps deploy --dir process command");
+        assert!(!output.status.success());
+        let error = process_error(&output);
+        assert_eq!(error["error"]["code"], "deploy_unavailable");
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("run the same command again"));
+        assert_process_auth(&auth_server.finish()[0], credential);
+        assert_eq!(control_plane.finish().len(), 4);
+    }
+
+    #[test]
+    fn bl_apps_deploy_artifact_does_not_create_apps() {
+        let error = command()
+            .try_get_matches_from([
+                "apps",
+                "deploy",
+                "docs-site",
+                "artifact.tar.gz",
+                "--private",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+            ])
+            .expect_err("--private needs --dir");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

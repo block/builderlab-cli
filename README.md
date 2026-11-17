@@ -75,13 +75,20 @@ verbose output.
 
 ## Static sites
 
-To publish a built static site or single-page app, create a static app once,
-then deploy the build output directory:
+To publish a built static site or single-page app, deploy the build output
+directory:
 
 ```bash
-bl apps create --app-id docs-site --runtime-profile static --json
 bl apps deploy docs-site --dir dist --json
 ```
+
+If you have no app with that ID, the first deploy creates it as a static app,
+prints `Created new app docs-site at <url>` on stderr, and reports
+`"created": true` with the creation details under `create`. Later deploys to the
+same ID update it. An ID someone else already owns fails before anything is
+deployed. Pass `--private` on the first deploy to make the new app private
+before it goes live; for an app that already exists, `--private` only checks
+that it is already private.
 
 `--dir` takes the folder your build writes, with `index.html` at its root. The
 CLI writes the static manifest, packages the files under `public/`, and uploads
@@ -96,9 +103,9 @@ Unknown paths return 404. For client-side routing, pass `--spa` to serve
 serve `/about` from `about.html` and answer a 404 with the site's root
 `404.html` when present.
 
-The JSON response adds `packaged_site` with the file count, byte sizes and
-skipped paths. To deploy a prebuilt `artifact.tar.gz` instead, pass its path in
-place of `--dir`.
+The JSON response adds `created` and `packaged_site` with the file count, byte
+sizes and skipped paths. To deploy a prebuilt `artifact.tar.gz` instead, pass
+its path in place of `--dir`; that needs an app from `bl apps create` first.
 
 ## Managed MySQL apps
 
