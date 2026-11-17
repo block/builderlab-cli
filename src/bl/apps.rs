@@ -1664,7 +1664,7 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         // workstation never has, and report `auth_required` or `org_required`
         // as if logging in would help. Say sharing is off here instead.
         if apps_on_blox() && !community_sharing_through_proxy() {
-            return Err(community_sharing_unavailable("APP_ID"));
+            return Err(community_sharing_unavailable(Some("APP_ID")));
         }
         return run_community_list(config);
     }
@@ -1682,8 +1682,10 @@ fn run_community(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     // the owner credential the proxy forwards, so stop before any request.
     if proxy_auth_for_url(base_url) && !community_sharing_through_proxy() {
         // This only runs on a Blox workstation, where the agent can't log in or
-        // pick another ingress. Workspace visibility is the way to widen access.
-        return Err(community_sharing_unavailable(app_id));
+        // pick another ingress. Workspace visibility is the way to widen access,
+        // so only a grant points there; widening is the opposite of a revoke.
+        let widen = (action == "grant").then_some(app_id.as_str());
+        return Err(community_sharing_unavailable(widen));
     }
     let (client, credential) = control_plane_context(config, action_matches)?;
     // Kgoose replaces the session with a credential bound to the owner, app and
@@ -3272,7 +3274,17 @@ fn workspace_visibility_command(app_id: &str) -> String {
     format!("bl apps visibility {app_id} workspace")
 }
 
-fn community_sharing_unavailable(app_id: &str) -> anyhow::Error {
+/// `widen_app_id` names the app to suggest workspace visibility for. Pass `None`
+/// when the user is narrowing access (a revoke), where widening would be wrong.
+fn community_sharing_unavailable(widen_app_id: Option<&str>) -> anyhow::Error {
+    let message = "Community sharing isn't available on this Blox workstation.";
+    let Some(app_id) = widen_app_id else {
+        return anyhow::Error::new(CliFailure::new(
+            exit_codes::GENERAL,
+            "community_sharing_unavailable_through_proxy",
+            message.to_string(),
+        ));
+    };
     let next_action = format!(
         "To let everyone in the app's workspace open it, run `{}`.",
         workspace_visibility_command(app_id)
@@ -3280,9 +3292,7 @@ fn community_sharing_unavailable(app_id: &str) -> anyhow::Error {
     let mut error = CliFailure::new(
         exit_codes::GENERAL,
         "community_sharing_unavailable_through_proxy",
-        format!(
-            "Community sharing isn't available on this Blox workstation.\nnext_action: {next_action}"
-        ),
+        format!("{message}\nnext_action: {next_action}"),
     );
     error.next_action = Some(json!(next_action));
     anyhow::Error::new(error)
@@ -10015,18 +10025,24 @@ mod tests {
                 error["error"]["code"],
                 "community_sharing_unavailable_through_proxy"
             );
-            let next_action = error["next_action"].as_str().unwrap();
-            assert!(
-                next_action.contains("bl apps visibility my-app workspace"),
-                "{next_action}"
-            );
+            let message = error["error"]["message"].as_str().unwrap();
+            if action == "grant" {
+                let next_action = error["next_action"].as_str().unwrap();
+                assert!(
+                    next_action.contains("bl apps visibility my-app workspace"),
+                    "{next_action}"
+                );
+            } else {
+                // Widening to the workspace is the opposite of a revoke.
+                assert!(error["next_action"].is_null(), "{error}");
+                assert!(!message.contains("bl apps visibility"), "{message}");
+            }
             // A workstation agent can't log in or choose another base URL.
             for advice in ["bl auth login", "--base-url"] {
-                assert!(!next_action.contains(advice), "{next_action}");
-                assert!(
-                    !error["error"]["message"].as_str().unwrap().contains(advice),
-                    "{error}"
-                );
+                assert!(!message.contains(advice), "{error}");
+                if let Some(next_action) = error["next_action"].as_str() {
+                    assert!(!next_action.contains(advice), "{next_action}");
+                }
             }
             assert!(auth_server.finish().is_empty());
             assert!(control_plane.finish().is_empty());
