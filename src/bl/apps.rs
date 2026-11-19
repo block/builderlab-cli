@@ -54,6 +54,9 @@ const APPS_E2E_AUTH_URL_ENV_VAR: &str = "BL_APPS_E2E_AUTH_URL";
 const APPS_E2E_CREDENTIAL_ENV_VAR: &str = "BL_APPS_E2E_CREDENTIAL";
 const APPS_CONTRACT_PATH: &str = "/v1/agent/contract";
 const APPS_PLAN_PATH: &str = "/v1/agent/apps/plan";
+// Current-user discovery. Its `caller` is the verified control-plane user ID;
+// one row is enough because `bl whoami` reads only the caller.
+const APPS_ME_PATH: &str = "/v1/apps/me";
 const MAX_DEBUG_TAIL_LINES: u16 = 1000;
 const HOTPOD_AGENT_CLIENT_VERSION_HEADER: &str = "X-Hotpod-Agent-Client-Version";
 const HOTPOD_TRACE_ID_HEADER: &str = "X-Hotpod-Trace-Id";
@@ -749,6 +752,61 @@ fn control_plane_args(command: Command) -> Command {
 
 pub fn describe_commands() -> Value {
     super::description::describe_command_tree(&command())
+}
+
+/// Top-level `bl whoami`: the Apps Platform user ID for the current session.
+pub fn whoami_command() -> Command {
+    control_plane_args(
+        Command::new("whoami")
+            .about("Print your BuilderLab user ID (user-*)")
+            .long_about(
+                "Print the user ID the Apps Platform control plane verifies for your \
+                 session. This is the `user-*` ID shown as an app's owner and in \
+                 publisher lists, and the one to give someone who is adding you as a \
+                 publisher. With --json, prints it with the control-plane environment.",
+            ),
+    )
+}
+
+pub fn describe_whoami_command() -> Value {
+    super::description::describe_command_tree(&whoami_command())
+}
+
+pub fn run_whoami(matches: &ArgMatches) -> Result<()> {
+    runner::run(matches, dispatch_whoami)
+}
+
+fn dispatch_whoami(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    if !uses_proxy_auth(matches) {
+        runner::ensure_org_configured(config)?;
+    }
+    let (client, credential) = control_plane_context(config, matches)?;
+    let response = client.current_user(&credential)?;
+    let user_id = response
+        .get("caller")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|caller| !caller.is_empty())
+        .ok_or_else(|| {
+            failure(
+                exit_codes::GENERAL,
+                "caller_missing",
+                "the Apps Platform control plane did not return your user ID",
+            )
+        })?;
+    if config.json {
+        let mut output = Map::new();
+        output.insert("user_id".to_string(), Value::String(user_id.to_string()));
+        if let Some(environment) = response
+            .get("environment")
+            .filter(|value| value.is_string())
+        {
+            output.insert("environment".to_string(), environment.clone());
+        }
+        return print_json(&Value::Object(output));
+    }
+    println!("{}", terminal_safe_text(user_id));
+    Ok(())
 }
 
 pub fn run(matches: &ArgMatches) -> Result<()> {
@@ -2767,6 +2825,12 @@ impl ControlPlaneClient {
                 .build()
                 .context("build Apps Platform plan request")
         })
+    }
+
+    fn current_user(&self, credential: &ComposeSessionCredential) -> Result<Value> {
+        let mut url = self.endpoint(APPS_ME_PATH)?;
+        url.query_pairs_mut().append_pair("limit", "1");
+        self.get_url(credential, url)
     }
 
     fn list_apps(
@@ -5026,6 +5090,71 @@ mod tests {
         );
         assert_eq!(auth_server.finish().len(), 1);
         assert_eq!(control_plane.finish().len(), 2);
+    }
+
+    #[test]
+    fn bl_whoami_process_prints_the_verified_caller() {
+        let credential = "apps-e2e-only.whoami.session";
+        let me = json!({
+            "ok": true, "caller": "user-Alice", "environment": "production",
+            "captured_at": "2026-11-16T12:00:00Z", "count": 1,
+            "apps": [{"app_id": "team-notes"}], "next_cursor": "opaque"
+        });
+        for (json_output, expected) in [
+            (false, None),
+            (
+                true,
+                Some(json!({"user_id": "user-Alice", "environment": "production"})),
+            ),
+        ] {
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![ProcessResponse::json(me.clone())]);
+            let mut args = vec!["whoami", "--base-url", APPROVED_TEST_BASE_URL];
+            if json_output {
+                args.push("--json");
+            }
+            let output = process_command(&auth_server, &control_plane, &args, credential)
+                .output()
+                .expect("run whoami");
+            assert!(output.status.success(), "{:?}", output);
+            let stdout = process_stdout(&output);
+            match expected {
+                Some(expected) => {
+                    assert_eq!(serde_json::from_str::<Value>(&stdout).unwrap(), expected)
+                }
+                None => assert_eq!(stdout, "user-Alice"),
+            }
+            auth_server.finish();
+            let requests = control_plane.finish();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(requests[0].path, "/v1/apps/me?limit=1");
+        }
+    }
+
+    #[test]
+    fn bl_whoami_process_fails_without_a_caller() {
+        let credential = "apps-e2e-only.whoami-missing.session";
+        for body in [
+            json!({"ok": true, "apps": []}),
+            json!({"ok": true, "caller": "  ", "apps": []}),
+        ] {
+            let auth_server = ProcessServer::start(vec![process_auth_response()]);
+            let control_plane = ProcessServer::start(vec![ProcessResponse::json(body)]);
+            let output = process_command(
+                &auth_server,
+                &control_plane,
+                &["whoami", "--base-url", APPROVED_TEST_BASE_URL, "--json"],
+                credential,
+            )
+            .output()
+            .expect("run whoami without caller");
+            assert!(!output.status.success());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains("caller_missing"), "{stderr}");
+            auth_server.finish();
+            assert_eq!(control_plane.finish().len(), 1);
+        }
     }
 
     #[test]

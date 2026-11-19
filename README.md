@@ -148,6 +148,15 @@ from KGoose for the workstation owner and injects it on the wire. Any other
 URL, including an explicit `--base-url` outside that origin, must be an
 approved HTTPS ingress and requires `bl auth login`.
 
+## Your user ID
+
+`bl whoami` prints the `user-*` ID the Apps Platform control plane verifies
+for your session: the ID shown as an app's `owner` and in publisher lists, and
+the one to give someone adding you as a publisher. `bl whoami --json` prints
+`{"user_id": "...", "environment": "..."}`. It uses the same control plane
+and authentication as `bl apps`, so it needs `BL_APPS_CONTROL_PLANE_URL` or
+`--base-url`.
+
 ## Calling protected hosted apps
 
 Hosted apps (`https://<app>.apps.<org>.builderlab.xyz`) accept only the
