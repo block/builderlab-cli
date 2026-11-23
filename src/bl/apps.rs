@@ -25,7 +25,7 @@ use reqwest::blocking::{multipart, Client, Request, RequestBuilder, Response};
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use reqwest::redirect::Policy;
 use reqwest::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use super::auth_login::verify_stored_session;
@@ -510,6 +510,39 @@ pub fn command() -> Command {
                 )),
         )
         .subcommand(
+            Command::new("egress")
+                .about("List or edit an app's outbound host allowlist")
+                .long_about(
+                    "Manage an Apps Platform app's self-serve egress allowlist: the exact hosts \
+                     the app may reach over HTTPS (port 443). The owner and approved publishers \
+                     may list, add, and remove hosts. Platform-managed global hosts are shown \
+                     read-only, and each app has a limited number of its own hosts. Static-profile \
+                     apps do not support egress. The control plane normalizes and validates each \
+                     host; re-adding an existing host or removing an absent host is a no-op.",
+                )
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .disable_help_subcommand(true)
+                .subcommand(control_plane_args(
+                    Command::new("list")
+                        .about("List an app's egress hosts and the read-only global hosts")
+                        .arg(
+                            Arg::new("app-id")
+                                .value_name("APP_ID")
+                                .required(true)
+                                .help("App identifier returned by `bl apps list` or `bl apps create`"),
+                        )
+                        .arg(
+                            Arg::new("environment")
+                                .long("environment")
+                                .value_name("ENVIRONMENT")
+                                .help("Optional Compose environment override"),
+                        ),
+                ))
+                .subcommand(egress_host_command("add"))
+                .subcommand(egress_host_command("remove")),
+        )
+        .subcommand(
             Command::new("community")
                 .about("Share an app with a Buzz community")
                 .long_about(
@@ -727,6 +760,45 @@ fn community_action_command(action: &'static str) -> Command {
     )
 }
 
+fn egress_host_command(action: &'static str) -> Command {
+    control_plane_args(
+        Command::new(action)
+            .about(if action == "add" {
+                "Allow an app to reach one more outbound HTTPS host"
+            } else {
+                "Stop allowing an app to reach an outbound HTTPS host"
+            })
+            .long_about(if action == "add" {
+                "Add one exact host (HTTPS, port 443) to an app's egress allowlist. HOST is sent \
+                 exactly as given; the control plane normalizes and validates it and rejects \
+                 hosts beyond the per-app limit. Adding a host that is already allowed changes \
+                 nothing. Static-profile apps do not support egress."
+            } else {
+                "Remove one exact host from an app's egress allowlist. HOST is sent exactly as \
+                 given; the control plane normalizes and validates it. Removing a host that is \
+                 not in the app's list changes nothing. Static-profile apps do not support egress."
+            })
+            .arg(
+                Arg::new("app-id")
+                    .value_name("APP_ID")
+                    .required(true)
+                    .help("App identifier returned by `bl apps list` or `bl apps create`"),
+            )
+            .arg(
+                Arg::new("host")
+                    .value_name("HOST")
+                    .required(true)
+                    .help("Exact outbound host, such as api.example.com"),
+            )
+            .arg(
+                Arg::new("environment")
+                    .long("environment")
+                    .value_name("ENVIRONMENT")
+                    .help("Optional Compose environment override"),
+            ),
+    )
+}
+
 fn control_plane_args(command: Command) -> Command {
     command
         .arg(
@@ -836,6 +908,7 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("ready", ready_matches)) => run_ready(config, ready_matches),
         Some(("debug", debug_matches)) => run_debug(config, debug_matches),
         Some(("access", access_matches)) => run_access(config, access_matches),
+        Some(("egress", egress_matches)) => run_egress(config, egress_matches),
         Some(("community", community_matches)) => run_community(config, community_matches),
         Some(("visibility", visibility_matches)) => run_visibility(config, visibility_matches),
         Some(("publishers", publishers_matches)) => run_publishers(config, publishers_matches),
@@ -2348,6 +2421,102 @@ fn publishers_unsupported_failure(error: anyhow::Error) -> anyhow::Error {
     with_failure_trace_id(anyhow::Error::new(unsupported), trace_id.as_deref())
 }
 
+fn run_egress(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let (action, action_matches) = matches
+        .subcommand()
+        .context("expected egress list, add, or remove")?;
+    let app_id = action_matches
+        .get_one::<String>("app-id")
+        .context("expected app id")?;
+    let environment = action_matches
+        .get_one::<String>("environment")
+        .map(String::as_str);
+    let host = action_matches.get_one::<String>("host").map(String::as_str);
+    let (client, credential) = control_plane_context(config, action_matches)?;
+    let response = match action {
+        "list" => client.get_egress(&credential, app_id, environment)?,
+        "add" | "remove" => {
+            let host = host.context("expected egress host")?;
+            let request = EgressRequest { host, environment };
+            client.update_egress(&credential, app_id, action, &request)?
+        }
+        _ => anyhow::bail!("expected an egress subcommand"),
+    };
+    if config.json {
+        return print_json(&response);
+    }
+    let parsed: EgressResponse =
+        serde_json::from_value(response).context("parse Apps Platform egress response")?;
+    print_egress(&config.style, action, host, &parsed);
+    Ok(())
+}
+
+fn print_egress(
+    style: &Style,
+    action: &str,
+    requested_host: Option<&str>,
+    response: &EgressResponse,
+) {
+    let environment = if response.environment.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", terminal_safe_text(&response.environment))
+    };
+    let app_label = format!("{}{environment}", terminal_safe_text(&response.app_id));
+    if action == "add" || action == "remove" {
+        let host = if response.host.is_empty() {
+            requested_host.unwrap_or_default()
+        } else {
+            response.host.as_str()
+        };
+        let verb = if action == "add" { "Added" } else { "Removed" };
+        style.success(&format!(
+            "{verb} egress host {} for {app_label}",
+            style.slug(&terminal_safe_text(host))
+        ));
+    } else {
+        println!("{} {app_label}", style.bold("Egress hosts for"));
+    }
+    println!(
+        "{} {}/{}",
+        style.label("app hosts:"),
+        response.app_hosts.len(),
+        response.max_app_hosts
+    );
+    if response.app_hosts.is_empty() {
+        println!("  {}", style.dim("(none)"));
+    }
+    for entry in &response.app_hosts {
+        let mut line = format!("  {}", style.slug(&terminal_safe_text(&entry.host)));
+        if !entry.added_by.is_empty() {
+            line.push_str(&format!(
+                " added by {}",
+                terminal_safe_text(&entry.added_by)
+            ));
+        }
+        if !entry.added_at.is_empty() {
+            line.push_str(&format!(" at {}", terminal_safe_text(&entry.added_at)));
+        }
+        println!("{line}");
+    }
+    println!(
+        "{} {}",
+        style.label("global hosts:"),
+        style.dim("(platform-managed, read-only)")
+    );
+    if response.global_hosts.is_empty() {
+        println!("  {}", style.dim("(none)"));
+    }
+    for host in &response.global_hosts {
+        println!("  {}", terminal_safe_text(host));
+    }
+    println!(
+        "{} {}",
+        style.label("max app hosts:"),
+        response.max_app_hosts
+    );
+}
+
 fn run_access_get(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
     let app_id = matches
         .get_one::<String>("app-id")
@@ -2500,6 +2669,38 @@ struct PublisherRequest<'a> {
     publisher: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     environment: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct EgressRequest<'a> {
+    host: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct EgressResponse {
+    #[serde(default)]
+    app_id: String,
+    #[serde(default)]
+    environment: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    global_hosts: Vec<String>,
+    #[serde(default)]
+    app_hosts: Vec<EgressAppHost>,
+    #[serde(default)]
+    max_app_hosts: u64,
+}
+
+#[derive(Deserialize)]
+struct EgressAppHost {
+    host: String,
+    #[serde(default)]
+    added_by: String,
+    #[serde(default)]
+    added_at: String,
 }
 
 #[derive(Default)]
@@ -3055,6 +3256,46 @@ impl ControlPlaneClient {
                 .json(request)
                 .build()
                 .context("build Apps Platform access update request")
+        })
+    }
+
+    fn get_egress(
+        &self,
+        credential: &ComposeSessionCredential,
+        app_id: &str,
+        environment: Option<&str>,
+    ) -> Result<Value> {
+        let query = environment
+            .map(|environment| vec![("environment", environment.to_string())])
+            .unwrap_or_default();
+        self.get_app_resource(credential, app_id, "egress", &query)
+    }
+
+    fn update_egress(
+        &self,
+        credential: &ComposeSessionCredential,
+        app_id: &str,
+        action: &str,
+        request: &EgressRequest<'_>,
+    ) -> Result<Value> {
+        let method = match action {
+            "add" => "POST",
+            "remove" => "DELETE",
+            _ => anyhow::bail!("unsupported egress action"),
+        };
+        // Egress mutations read `environment` from the JSON body, not the query.
+        let url = self.app_resource_url(app_id, "egress", &[])?;
+        let path = request_path(&url);
+        self.authorized_json_request(credential, method, &path, |authorization| {
+            let builder = if method == "POST" {
+                self.client.post(url.clone())
+            } else {
+                self.client.delete(url.clone())
+            };
+            self.standard_request(builder, authorization)
+                .json(request)
+                .build()
+                .context("build Apps Platform egress update request")
         })
     }
 
@@ -10535,6 +10776,322 @@ mod tests {
         }
 
         server_thread.join().expect("join control-plane server");
+    }
+
+    fn egress_fixture(host: Option<&str>, hosts: &[&str]) -> Value {
+        let mut response = json!({
+            "ok": true,
+            "app_id": "eks-az-map",
+            "environment": "production",
+            "owner": "auth0|owner",
+            "global_hosts": ["api.github.com"],
+            "app_hosts": hosts
+                .iter()
+                .map(|host| json!({
+                    "host": host,
+                    "added_by": "auth0|owner",
+                    "added_at": "2026-11-23T10:00:00Z"
+                }))
+                .collect::<Vec<_>>(),
+            "max_app_hosts": 20
+        });
+        if let Some(host) = host {
+            response["host"] = json!(host);
+        }
+        response
+    }
+
+    #[test]
+    fn egress_list_uses_query_and_mutations_send_environment_in_the_body() {
+        let server = Server::http("127.0.0.1:0").expect("bind control-plane server");
+        let base_url = format!("http://{}", server.server_addr());
+        let server_thread = thread::spawn(move || {
+            for (index, (method, expected_path, expected_body)) in [
+                ("GET", "/v1/agent/apps/eks-az-map/egress", None),
+                (
+                    "GET",
+                    "/v1/agent/apps/eks-az-map/egress?environment=production",
+                    None,
+                ),
+                (
+                    "POST",
+                    "/v1/agent/apps/eks-az-map/egress",
+                    Some(json!({"host": "cloudflare-dns.com", "environment": "production"})),
+                ),
+                (
+                    "POST",
+                    "/v1/agent/apps/eks-az-map/egress",
+                    Some(json!({"host": "cloudflare-dns.com"})),
+                ),
+                (
+                    "DELETE",
+                    "/v1/agent/apps/eks-az-map/egress",
+                    Some(json!({"host": "Cloudflare-DNS.com.", "environment": "staging/west"})),
+                ),
+                (
+                    "DELETE",
+                    "/v1/agent/apps/eks-az-map/egress",
+                    Some(json!({"host": "Cloudflare-DNS.com."})),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut request = server.recv().expect("receive egress request");
+                assert_eq!(request.method().as_str(), method);
+                assert_eq!(request.url(), expected_path);
+                let mut body = String::new();
+                request
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .expect("read egress request body");
+                match expected_body {
+                    Some(expected_body) => assert_eq!(
+                        serde_json::from_str::<Value>(&body).expect("parse egress request body"),
+                        expected_body
+                    ),
+                    None => assert!(body.is_empty(), "GET egress body was: {body}"),
+                }
+                request
+                    .respond(
+                        Response::from_string(format!(r#"{{"request":{index}}}"#)).with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("build content type"),
+                        ),
+                    )
+                    .expect("respond to egress request");
+            }
+        });
+        let client = test_control_plane_client(&base_url, Duration::from_secs(2));
+        let credential = test_credential("egress_session_credential_1234567890123");
+
+        let responses = [
+            client.get_egress(&credential, "eks-az-map", None),
+            client.get_egress(&credential, "eks-az-map", Some("production")),
+            client.update_egress(
+                &credential,
+                "eks-az-map",
+                "add",
+                &EgressRequest {
+                    host: "cloudflare-dns.com",
+                    environment: Some("production"),
+                },
+            ),
+            client.update_egress(
+                &credential,
+                "eks-az-map",
+                "add",
+                &EgressRequest {
+                    host: "cloudflare-dns.com",
+                    environment: None,
+                },
+            ),
+            client.update_egress(
+                &credential,
+                "eks-az-map",
+                "remove",
+                &EgressRequest {
+                    host: "Cloudflare-DNS.com.",
+                    environment: Some("staging/west"),
+                },
+            ),
+            client.update_egress(
+                &credential,
+                "eks-az-map",
+                "remove",
+                &EgressRequest {
+                    host: "Cloudflare-DNS.com.",
+                    environment: None,
+                },
+            ),
+        ];
+        for (index, response) in responses.into_iter().enumerate() {
+            assert_eq!(response.expect("request egress response")["request"], index);
+        }
+
+        server_thread.join().expect("join control-plane server");
+    }
+
+    #[test]
+    fn egress_add_is_idempotent_and_responses_deserialize() {
+        let listed = egress_fixture(None, &["cloudflare-dns.com"]);
+        let added = egress_fixture(Some("cloudflare-dns.com"), &["cloudflare-dns.com"]);
+        let server = Server::http("127.0.0.1:0").expect("bind control-plane server");
+        let base_url = format!("http://{}", server.server_addr());
+        let responses = vec![added.clone(), added.clone()];
+        let server_thread = thread::spawn(move || {
+            for response in responses {
+                let request = server.recv().expect("receive egress add request");
+                assert_eq!(request.method().as_str(), "POST");
+                assert_eq!(request.url(), "/v1/agent/apps/eks-az-map/egress");
+                request
+                    .respond(
+                        Response::from_string(response.to_string()).with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("build content type"),
+                        ),
+                    )
+                    .expect("respond to egress add request");
+            }
+        });
+        let client = test_control_plane_client(&base_url, Duration::from_secs(2));
+        let credential = test_credential("egress_idempotent_credential_123456789");
+        let request = EgressRequest {
+            host: "cloudflare-dns.com",
+            environment: None,
+        };
+
+        let first = client
+            .update_egress(&credential, "eks-az-map", "add", &request)
+            .expect("first add");
+        let second = client
+            .update_egress(&credential, "eks-az-map", "add", &request)
+            .expect("repeated add succeeds");
+        assert_eq!(first, second);
+        assert_eq!(second["app_hosts"], listed["app_hosts"]);
+
+        let parsed: EgressResponse = serde_json::from_value(second).expect("parse egress response");
+        assert_eq!(parsed.host, "cloudflare-dns.com");
+        assert_eq!(parsed.app_hosts.len(), 1);
+        assert_eq!(parsed.app_hosts[0].added_by, "auth0|owner");
+        assert_eq!(parsed.global_hosts, ["api.github.com"]);
+        assert_eq!(parsed.max_app_hosts, 20);
+
+        let minimal: EgressResponse = serde_json::from_value(json!({
+            "ok": true,
+            "app_id": "eks-az-map",
+            "environment": "production",
+            "owner": "auth0|owner",
+            "global_hosts": [],
+            "app_hosts": [{"host": "example.com"}],
+            "max_app_hosts": 20
+        }))
+        .expect("parse response without omit-empty fields");
+        assert!(minimal.host.is_empty());
+        assert!(minimal.app_hosts[0].added_by.is_empty());
+
+        server_thread.join().expect("join control-plane server");
+    }
+
+    #[test]
+    fn egress_host_limit_and_static_profile_errors_surface_server_codes() {
+        let server = Server::http("127.0.0.1:0").expect("bind control-plane server");
+        let base_url = format!("http://{}", server.server_addr());
+        let server_thread = thread::spawn(move || {
+            for (status, code, next_action) in [
+                (
+                    409,
+                    "egress_host_limit_reached",
+                    "Remove an unused host with `bl apps egress remove` before adding another.",
+                ),
+                (
+                    400,
+                    "egress_unsupported_runtime_profile",
+                    "Static apps cannot make outbound requests.",
+                ),
+            ] {
+                let request = server.recv().expect("receive egress request");
+                assert_eq!(request.method().as_str(), "POST");
+                request
+                    .respond(
+                        Response::from_string(
+                            json!({
+                                "ok": false,
+                                "error": {"code": code, "message": "rejected"},
+                                "next_action": next_action
+                            })
+                            .to_string(),
+                        )
+                        .with_status_code(status)
+                        .with_header(
+                            Header::from_bytes("Content-Type", "application/json")
+                                .expect("build content type"),
+                        ),
+                    )
+                    .expect("respond with egress error");
+            }
+        });
+        let client = test_control_plane_client(&base_url, Duration::from_secs(2));
+        let credential = test_credential("egress_error_credential_12345678901234");
+        let request = EgressRequest {
+            host: "example.com",
+            environment: None,
+        };
+
+        let limit = client
+            .update_egress(&credential, "eks-az-map", "add", &request)
+            .expect_err("reject add beyond host limit");
+        let (exit_code, payload) = failure_info(&limit);
+        assert_eq!(exit_code, exit_codes::GENERAL);
+        assert_eq!(payload["error"]["code"], "egress_host_limit_reached");
+        assert!(payload["error"]["message"]
+            .as_str()
+            .expect("limit error message")
+            .contains("bl apps egress remove"));
+
+        let unsupported = client
+            .update_egress(&credential, "eks-az-map", "add", &request)
+            .expect_err("reject egress on static-profile app");
+        let (exit_code, payload) = failure_info(&unsupported);
+        assert_eq!(exit_code, exit_codes::GENERAL);
+        assert_eq!(
+            payload["error"]["code"],
+            "egress_unsupported_runtime_profile"
+        );
+        assert!(payload["error"]["message"]
+            .as_str()
+            .expect("unsupported error message")
+            .contains("Static apps"));
+
+        server_thread.join().expect("join control-plane server");
+    }
+
+    #[test]
+    fn egress_add_and_remove_require_a_host_and_pass_it_through_verbatim() {
+        for action in ["add", "remove"] {
+            let error = command()
+                .try_get_matches_from([
+                    "apps",
+                    "egress",
+                    action,
+                    "app",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                ])
+                .expect_err("require egress host");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+
+            let matches = command()
+                .try_get_matches_from([
+                    "apps",
+                    "egress",
+                    action,
+                    "app",
+                    " Mixed-Case.Example.com. ",
+                    "--base-url",
+                    APPROVED_TEST_BASE_URL,
+                ])
+                .expect("accept unvalidated egress host");
+            let (_, action_matches) = matches.subcommand().expect("egress subcommand");
+            let (_, action_matches) = action_matches.subcommand().expect("egress action");
+            assert_eq!(
+                action_matches.get_one::<String>("host").map(String::as_str),
+                Some(" Mixed-Case.Example.com. ")
+            );
+        }
+        command()
+            .try_get_matches_from([
+                "apps",
+                "egress",
+                "list",
+                "app",
+                "--base-url",
+                APPROVED_TEST_BASE_URL,
+            ])
+            .expect("list needs no host");
     }
 
     #[test]
