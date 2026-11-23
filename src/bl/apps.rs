@@ -1469,6 +1469,11 @@ fn create_app(
                     }
                 }
             })?;
+        // The reclaim exists once initialize succeeds, so make it private
+        // before any response check can end the command.
+        if reclaimed {
+            visibility = make_private()?;
+        }
         let initialized_app_id =
             required_response_string(&response, "app_id", "Apps Platform initialize")?;
         require_exact_app_id("initialize", &app_id, initialized_app_id)
@@ -1478,9 +1483,6 @@ fn create_app(
     } else {
         None
     };
-    if reclaimed {
-        visibility = make_private()?;
-    }
     let effective_external_url = match initialize.as_ref() {
         Some(response) => Value::String(
             required_response_string(response, "external_url", "Apps Platform initialize")?
@@ -7128,6 +7130,55 @@ mod tests {
             .expect("run Apps create process command");
         auth_server.finish();
         (output, control_plane.finish())
+    }
+
+    // A failed check of initialize's response must not leave a reclaimed
+    // `--private` app visible: the reclaim already happened.
+    #[test]
+    fn bl_apps_create_private_reclaim_sets_visibility_before_checking_initialize() {
+        let plan = json!({
+            "app_id": "merchant-lookup",
+            "environment": "staging",
+            "persistence": "mysql",
+            "runtime_profile": "fetch-js",
+            "runtime_class": "default",
+            "initialize": {"required": true, "recommended": true}
+        });
+        let visibility = json!({
+            "ok": true,
+            "app_id": "merchant-lookup",
+            "visibility": "restricted",
+            "viewers": [],
+        });
+        let (output, requests) = reclaim_create(
+            plan,
+            "app_deleted",
+            ProcessResponse::json(json!({
+                "app_id": "merchant-lookup",
+                "external_url": "https://merchant-lookup--bpsites.example/"
+            })),
+            &[
+                "--runtime-profile",
+                "fetch-js",
+                "--persistence",
+                "mysql",
+                "--private",
+            ],
+            Some(ProcessResponse::json(visibility)),
+        );
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("did not confirm mysql persistence"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            request_order(&requests)[3..],
+            [
+                ("POST", "/v1/agent/apps/merchant-lookup/initialize"),
+                ("PUT", "/v1/agent/apps/merchant-lookup/visibility"),
+            ]
+        );
     }
 
     #[test]
