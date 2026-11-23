@@ -2130,14 +2130,20 @@ fn run_background(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         reqwest::Method::GET
     };
     let response = background_access_call(config, app_id, method)?;
-    if turn_off && response["state"] == "active" {
+    // Only a revoked or never-granted state establishes that access is off. The
+    // owner can approve again while the revoke is read back, which leaves
+    // `active`, `restarting` or `paused_other_publishers`, and any state this
+    // CLI doesn't know is not proof either.
+    if turn_off && !matches!(response["state"].as_str(), Some("revoked" | "not_granted")) {
         return Err(failure(
-            exit_codes::GENERAL,
+            exit_codes::NETWORK,
             "background_off_not_confirmed",
             format!(
-                "Background tool calls for {} still report active after turning them off\n\
-                 next_action: Run `bl apps background status {}` to check, then try `off` again.",
+                "Background tool calls for {} were not confirmed off (state: {})\n\
+                 next_action: The owner may have approved them again. Run `bl apps background \
+                 status {}` to see the current state before trying `off` again.",
                 terminal_safe_text(app_id),
+                terminal_safe_text(response["state"].as_str().unwrap_or("unknown")),
                 terminal_safe_text(app_id)
             ),
         ));
@@ -2246,9 +2252,17 @@ fn background_access_response(app_id: &str, status: StatusCode, body: &str) -> R
         .and_then(|object| object.get("state"))
         .and_then(Value::as_str)
         .filter(|state| !state.is_empty());
+    // A 404 only means a missing app when Kgoose says so; anything else is the
+    // route not being there.
+    let code = code.filter(|code| status != StatusCode::NOT_FOUND || code == "app_unavailable");
     if !status.is_success() || code.is_some() || state.is_none() {
         let code = code.unwrap_or_else(|| {
-            if status.is_success() {
+            if status == StatusCode::NOT_FOUND {
+                // Kgoose only registers these routes when background tool
+                // calls are enabled, so a route-level 404 means the feature
+                // is off here. A real missing app carries `app_unavailable`.
+                "background_disabled".to_string()
+            } else if status.is_success() {
                 "background_access_invalid_response".to_string()
             } else {
                 "background_access_failed".to_string()
@@ -11437,10 +11451,35 @@ mod tests {
     }
 
     #[test]
-    fn bl_apps_background_off_fails_when_the_app_still_reports_active() {
-        let credential = "apps-e2e-only.background-still-active.session";
-        let kgoose = ProcessServer::start(vec![ProcessResponse::json(background_body(
+    fn bl_apps_background_off_is_only_confirmed_by_a_revoked_state() {
+        let credential = "apps-e2e-only.background-not-confirmed.session";
+        for state in [
             "active",
+            "restarting",
+            "paused_other_publishers",
+            "some_future_state",
+        ] {
+            let kgoose = ProcessServer::start(vec![ProcessResponse::json(background_body(
+                state,
+                json!({}),
+            ))]);
+            let output = background_process(
+                &kgoose,
+                &["apps", "background", "off", "demo", "--json"],
+                credential,
+            );
+            assert_eq!(output.status.code(), Some(exit_codes::NETWORK), "{state}");
+            let error = process_error(&output);
+            assert_eq!(error["error"]["code"], "background_off_not_confirmed");
+            let message = error["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("bl apps background status demo"),
+                "{message}"
+            );
+            assert_eq!(kgoose.finish().len(), 1);
+        }
+        let kgoose = ProcessServer::start(vec![ProcessResponse::json(background_body(
+            "not_granted",
             json!({}),
         ))]);
         let output = background_process(
@@ -11448,12 +11487,37 @@ mod tests {
             &["apps", "background", "off", "demo", "--json"],
             credential,
         );
-        assert_eq!(output.status.code(), Some(exit_codes::GENERAL));
-        assert_eq!(
-            process_error(&output)["error"]["code"],
-            "background_off_not_confirmed"
-        );
-        assert_eq!(kgoose.finish().len(), 1);
+        assert_eq!(output.status.code(), Some(0));
+        kgoose.finish();
+    }
+
+    #[test]
+    fn bl_apps_background_missing_endpoint_reads_as_disabled() {
+        let credential = "apps-e2e-only.background-route-404.session";
+        for (args, response) in [
+            (
+                ["apps", "background", "status", "demo"],
+                ProcessResponse::raw(404, "<html>Not Found</html>"),
+            ),
+            (
+                ["apps", "background", "off", "demo"],
+                ProcessResponse::json_status(404, json!({"message": "no route"})),
+            ),
+        ] {
+            let kgoose = ProcessServer::start(vec![response]);
+            let mut args = args.to_vec();
+            args.push("--json");
+            let output = background_process(&kgoose, &args, credential);
+            assert_eq!(output.status.code(), Some(exit_codes::GENERAL));
+            let error = process_error(&output);
+            assert_eq!(error["error"]["code"], "background_disabled");
+            assert!(error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Background tool calls aren't available in this environment."));
+            assert!(!error.to_string().contains("no route"));
+            kgoose.finish();
+        }
     }
 
     #[test]
@@ -11535,6 +11599,22 @@ mod tests {
                 "app_unavailable",
                 exit_codes::GENERAL,
                 "No app demo is available",
+            ),
+            // A route-level 404 has no Kgoose error code: the endpoint isn't
+            // registered because background tool calls are off here.
+            (
+                StatusCode::NOT_FOUND,
+                "<html>private upstream detail</html>".to_string(),
+                "background_disabled",
+                exit_codes::GENERAL,
+                "aren't available in this environment",
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                json!({"errorCode":"not_found"}).to_string(),
+                "background_disabled",
+                exit_codes::GENERAL,
+                "aren't available in this environment",
             ),
             (
                 StatusCode::CONFLICT,
