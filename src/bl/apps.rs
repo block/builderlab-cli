@@ -535,6 +535,26 @@ pub fn command() -> Command {
                         ),
                 ),
         )
+        .subcommand(
+            Command::new("background")
+                .about("See or turn off background tool calls for an app")
+                .long_about(
+                    "Background tool calls let a hosted app you own use your read-only tools, \
+                     such as Jira or Slack reads, when nobody is signed in to it, for example \
+                     from a schedule. Only the app's owner can turn them on, and only in the \
+                     browser: this CLI cannot approve. `status` shows where things stand and, \
+                     when approval is needed, prints the link to open in your browser. `off` \
+                     turns background tool calls off. To use them the app becomes owner-only: \
+                     only you can deploy it, and calls pause while any other publisher exists. \
+                     Only process runtime apps are supported. Where background tool calls \
+                     aren't enabled, these commands say so.",
+                )
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .disable_help_subcommand(true)
+                .subcommand(background_command("status"))
+                .subcommand(background_command("off")),
+        )
         .subcommand(control_plane_args(
             Command::new("visibility")
                 .about("Switch an app between its workspace and private audiences")
@@ -654,6 +674,36 @@ fn app_get_command(name: &'static str) -> Command {
                 .long("management-base-url")
                 .value_name("HTTPS_PORTAL_ORIGIN")
                 .help("BuilderLab portal origin used to build the Share & manage link"),
+        )
+}
+
+fn background_command(action: &'static str) -> Command {
+    let (about, long_about) = if action == "status" {
+        (
+            "Show an app's background tool call state and the approval link",
+            "Show whether background tool calls are on for an app you own, whether you are its \
+             only publisher, whether it is ready, and which read-only tools are approved or \
+             waiting for approval. When approval is needed, prints `Approve in your browser: \
+             <link>`. Open that link as the app's owner; approval is browser-only and this CLI \
+             never approves. Changes nothing. Add --json for the full response.",
+        )
+    } else {
+        (
+            "Turn off background tool calls for an app you own",
+            "Turn off background tool calls for an app you own and confirm the new state. It \
+             only reduces access, so it asks for no confirmation. Turning them on again takes \
+             the owner's approval in the browser; `bl apps background status` prints the link. \
+             Add --json for the full response.",
+        )
+    };
+    Command::new(action)
+        .about(about)
+        .long_about(long_about)
+        .arg(
+            Arg::new("app-id")
+                .value_name("APP_ID")
+                .required(true)
+                .help("App identifier returned by `bl apps list` or `bl apps create`"),
         )
 }
 
@@ -837,6 +887,7 @@ fn dispatch(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
         Some(("debug", debug_matches)) => run_debug(config, debug_matches),
         Some(("access", access_matches)) => run_access(config, access_matches),
         Some(("community", community_matches)) => run_community(config, community_matches),
+        Some(("background", background_matches)) => run_background(config, background_matches),
         Some(("visibility", visibility_matches)) => run_visibility(config, visibility_matches),
         Some(("publishers", publishers_matches)) => run_publishers(config, publishers_matches),
         _ => anyhow::bail!("expected an apps subcommand"),
@@ -2052,6 +2103,403 @@ fn with_missing_lifecycle_step(mut error: anyhow::Error, app_id: &str) -> anyhow
         }
     }
     error
+}
+
+const BACKGROUND_ACCESS_TIMEOUT: Duration = Duration::from_secs(30);
+const BACKGROUND_ACCESS_RESPONSE_MAX_BYTES: usize = 256 * 1024;
+
+/// `status` reads and `off` revokes an owner's background tool call access for
+/// one app, through Kgoose with the stored CLI session. Turning access on is
+/// deliberately not here: Kgoose only takes that from the owner's browser, so
+/// this prints the approval link and never approves.
+fn run_background(config: &SkillsConfig, matches: &ArgMatches) -> Result<()> {
+    let (action, action_matches) = matches
+        .subcommand()
+        .context("expected background status or off")?;
+    let app_id = action_matches
+        .get_one::<String>("app-id")
+        .context("expected app id")?;
+    let turn_off = match action {
+        "status" => false,
+        "off" => true,
+        _ => anyhow::bail!("expected background status or off"),
+    };
+    let method = if turn_off {
+        reqwest::Method::DELETE
+    } else {
+        reqwest::Method::GET
+    };
+    let response = background_access_call(config, app_id, method)?;
+    if turn_off && response["state"] == "active" {
+        return Err(failure(
+            exit_codes::GENERAL,
+            "background_off_not_confirmed",
+            format!(
+                "Background tool calls for {} still report active after turning them off\n\
+                 next_action: Run `bl apps background status {}` to check, then try `off` again.",
+                terminal_safe_text(app_id),
+                terminal_safe_text(app_id)
+            ),
+        ));
+    }
+    if config.json {
+        return print_json(&response);
+    }
+    print!("{}", background_access_text(app_id, &response, turn_off));
+    Ok(())
+}
+
+fn background_access_path(app_id: &str) -> String {
+    format!("/v1/hosted-apps/{app_id}/background-access")
+}
+
+fn background_access_url(config: &SkillsConfig, app_id: &str) -> Result<url::Url> {
+    if app_id.is_empty() || app_id == "." || app_id == ".." {
+        anyhow::bail!("APP_ID must be an app identifier returned by `bl apps list`");
+    }
+    let service_url = kgoose_service_url(&config.kgoose_base_url, &config.kgoose_service_path);
+    let mut url = url::Url::parse(&service_url).context("Kgoose URL must be absolute")?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Kgoose URL cannot carry a path"))?
+        .pop_if_empty()
+        .extend(["v1", "hosted-apps", app_id, "background-access"]);
+    Ok(url)
+}
+
+fn background_access_call(
+    config: &SkillsConfig,
+    app_id: &str,
+    method: reqwest::Method,
+) -> Result<Value> {
+    let storage = default_session_storage(config)?;
+    let session = storage
+        .get(&session_storage_key_from_config(config))?
+        .and_then(|credential| credential.session_credential_header_value())
+        .ok_or_else(auth_required_error)?;
+    let url = background_access_url(config, app_id)?;
+    let path = background_access_path(app_id);
+    let mut request = build_auth_http_client(BACKGROUND_ACCESS_TIMEOUT)?
+        .request(method.clone(), url)
+        .header(USER_AGENT, CLI_USER_AGENT)
+        .header(ACCEPT, "application/json")
+        .header(SESSION_CREDENTIAL_HEADER, &session);
+    if let Some(baggage) = playpen_baggage(config.playpen.as_deref()) {
+        request = request.header("Baggage", baggage);
+    }
+    let response = request.send().map_err(|error| {
+        if method == reqwest::Method::GET {
+            return network_failure(method.as_str(), &path, error);
+        }
+        // The turn-off may have reached Kgoose before the connection failed.
+        failure(
+            exit_codes::NETWORK,
+            "background_off_outcome_unknown",
+            format!(
+                "{} {path} failed before receiving a response: {}\n\
+                 next_action: The change may have gone through. Run `bl apps background status \
+                 {}` to check before retrying.",
+                method.as_str(),
+                error,
+                terminal_safe_text(app_id)
+            ),
+        )
+    })?;
+    let status = response.status();
+    let body = read_limited_response_body(
+        response,
+        BACKGROUND_ACCESS_RESPONSE_MAX_BYTES,
+        "background tool call access",
+    )?
+    .replace(&session, "[REDACTED]");
+    background_access_response(app_id, status, &body)
+}
+
+fn is_stable_error_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// Kgoose answers errors with `{"errorCode": "...", "message": ...}` and a
+/// matching HTTP status. Only the stable code is kept; the CLI supplies the
+/// words, because the body can be anything, such as an HTML error page.
+fn background_access_response(app_id: &str, status: StatusCode, body: &str) -> Result<Value> {
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(auth_required_error());
+    }
+    let parsed: Option<Value> = serde_json::from_str(body).ok();
+    let code = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("errorCode")
+                .or_else(|| value.get("error_code"))
+                .or_else(|| value.pointer("/error/code"))
+        })
+        .and_then(Value::as_str)
+        .filter(|code| is_stable_error_code(code))
+        .map(str::to_string);
+    let object = parsed.as_ref().and_then(Value::as_object);
+    let state = object
+        .and_then(|object| object.get("state"))
+        .and_then(Value::as_str)
+        .filter(|state| !state.is_empty());
+    if !status.is_success() || code.is_some() || state.is_none() {
+        let code = code.unwrap_or_else(|| {
+            if status.is_success() {
+                "background_access_invalid_response".to_string()
+            } else {
+                "background_access_failed".to_string()
+            }
+        });
+        return Err(background_access_failure(
+            app_id,
+            status,
+            &code,
+            parsed.as_ref(),
+        ));
+    }
+    let object = object.expect("state implies a JSON object");
+    let state = state.expect("checked above");
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|value| Value::String(value.to_string()))
+            .unwrap_or(Value::Null)
+    };
+    let flag = |key: &str| object.get(key).filter(|value| value.is_boolean());
+    let tools = |key: &str| -> Vec<Value> {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        Some(json!({
+                            "extension": item.get("extension")?.as_str()?,
+                            "access": item.get("access")?.as_str()?,
+                        }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // The link is only ever printed for the owner to open, so keep it to a
+    // plain web address.
+    let approval_url = object
+        .get("approvalUrl")
+        .or_else(|| object.get("approval_url"))
+        .and_then(Value::as_str)
+        .filter(|link| {
+            url::Url::parse(link)
+                .is_ok_and(|link| matches!(link.scheme(), "https" | "http") && link.has_host())
+        })
+        .map(|link| Value::String(link.to_string()))
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "ok": true,
+        "app_id": app_id,
+        "state": state,
+        "sole_publisher": flag("solePublisher").cloned().unwrap_or(Value::Null),
+        "ready": flag("ready").cloned().unwrap_or(Value::Null),
+        "restarting": object.get("restarting").and_then(Value::as_bool).unwrap_or(false),
+        "capabilities": tools("capabilities"),
+        "pending_capabilities": tools("pendingCapabilities"),
+        "confirmed_at": text("confirmedAt"),
+        "message": text("message"),
+        "approval_url": approval_url,
+    }))
+}
+
+fn background_access_failure(
+    app_id: &str,
+    status: StatusCode,
+    code: &str,
+    parsed: Option<&Value>,
+) -> anyhow::Error {
+    let app = terminal_safe_text(app_id);
+    let retry = "Wait a minute, then run the command again.";
+    let (exit_code, explanation, next_action) = match code {
+        "background_disabled" => (
+            exit_codes::GENERAL,
+            "Background tool calls aren't available in this environment.".to_string(),
+            "Nothing to change here. They are only enabled in some BuilderLab environments."
+                .to_string(),
+        ),
+        "not_owner" => (
+            exit_codes::FORBIDDEN,
+            "Only the app's owner can manage background tool calls.".to_string(),
+            "Run `bl auth login` as the app's owner, or ask the owner to run this.".to_string(),
+        ),
+        "app_unavailable" => (
+            exit_codes::GENERAL,
+            format!("No app {app} is available to you in this environment."),
+            "Check the ID with `bl apps list --scope owned`.".to_string(),
+        ),
+        "sandbox_unavailable" | "unsupported_runtime" => (
+            exit_codes::GENERAL,
+            "Background tool calls only work for process runtime apps; this app's runtime \
+             isn't supported."
+                .to_string(),
+            "Deploy the app with the process runtime profile to use them.".to_string(),
+        ),
+        "other_publishers" | "background_requires_sole_publisher" => (
+            exit_codes::GENERAL,
+            "Other publishers can still deploy this app, and background tool calls need it to \
+             be owner-only."
+                .to_string(),
+            format!(
+                "Remove them with `bl apps publishers remove {app} --publisher IDENTITY` (see \
+                 `bl apps publishers list {app}`), then check `bl apps background status {app}`."
+            ),
+        ),
+        "running_code_not_owner" => (
+            exit_codes::GENERAL,
+            "The running version was published by someone other than you.".to_string(),
+            format!("Deploy the app yourself with `bl apps deploy {app}`, then try again."),
+        ),
+        "rollout_pending" | "access_update_pending" | "conflict" => (
+            exit_codes::GENERAL,
+            "A deploy or access change is still in progress for this app.".to_string(),
+            retry.to_string(),
+        ),
+        "no_read_capabilities" => (
+            exit_codes::GENERAL,
+            "This app declares no read-only tools for background use.".to_string(),
+            "Declare the read tools it needs in the app, redeploy, then approve in your browser."
+                .to_string(),
+        ),
+        "declaration_changed" | "owner_consent_required" => (
+            exit_codes::GENERAL,
+            "The app's declared tools changed since they were approved.".to_string(),
+            format!(
+                "Run `bl apps background status {app}` and approve the current tools in your \
+                 browser."
+            ),
+        ),
+        "unavailable" => (
+            exit_codes::NETWORK,
+            "Background tool calls couldn't be changed right now. Retrying is safe.".to_string(),
+            retry.to_string(),
+        ),
+        _ => (
+            match status.as_u16() {
+                403 => exit_codes::FORBIDDEN,
+                500.. => exit_codes::NETWORK,
+                _ => exit_codes::GENERAL,
+            },
+            "Kgoose didn't return a usable background tool call response.".to_string(),
+            "Try again. If it keeps happening, tell the BuilderLab team.".to_string(),
+        ),
+    };
+    let path = background_access_path(app_id);
+    let mut failure = CliFailure::new(
+        exit_code,
+        code,
+        format!(
+            "{path} failed with {} ({code})\n{explanation}\nnext_action: {next_action}",
+            status.as_u16()
+        ),
+    );
+    failure.details = Some(json!({"http_status": status.as_u16()}));
+    failure.next_action = Some(json!(next_action));
+    let correlation = parsed
+        .and_then(|value| {
+            value
+                .get("correlation_id")
+                .or_else(|| value.get("correlationId"))
+        })
+        .and_then(Value::as_str)
+        .map(terminal_safe_text);
+    with_failure_trace_id(anyhow::Error::new(failure), correlation.as_deref())
+}
+
+fn background_state_text(state: &str) -> String {
+    match state {
+        "active" => "on".to_string(),
+        "not_granted" => "off (never approved)".to_string(),
+        "revoked" => "off (turned off)".to_string(),
+        "restarting" => "starting (calls are paused until the app has restarted)".to_string(),
+        "paused" | "paused_other_publishers" => {
+            "paused (calls wait while other publishers can deploy the app)".to_string()
+        }
+        other => terminal_safe_text(other),
+    }
+}
+
+fn background_tools_text(tools: &Value) -> Option<String> {
+    let names = tools
+        .as_array()?
+        .iter()
+        .filter_map(|tool| {
+            Some(format!(
+                "{} ({})",
+                terminal_safe_text(tool.get("extension")?.as_str()?),
+                terminal_safe_text(tool.get("access")?.as_str()?)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!names.is_empty()).then(|| names.join(", "))
+}
+
+fn background_access_text(app_id: &str, response: &Value, turned_off: bool) -> String {
+    let app = terminal_safe_text(app_id);
+    let state = response["state"].as_str().unwrap_or("unknown");
+    let yes_no = |value: &Value| match value.as_bool() {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    };
+    let mut text = String::new();
+    if turned_off {
+        text.push_str(&format!("Turned off background tool calls for {app}.\n"));
+    }
+    text.push_str(&format!(
+        "Background tool calls for {app}: {}\n",
+        background_state_text(state)
+    ));
+    text.push_str(&format!(
+        "Only you can publish it: {}\n",
+        yes_no(&response["sole_publisher"])
+    ));
+    let ready = match (
+        response["ready"].as_bool(),
+        response["restarting"].as_bool(),
+    ) {
+        (_, Some(true)) => "no (restarting)".to_string(),
+        (ready, _) => yes_no(&json!(ready)).to_string(),
+    };
+    text.push_str(&format!("Ready: {ready}\n"));
+    text.push_str(&format!(
+        "Approved tools: {}\n",
+        background_tools_text(&response["capabilities"]).unwrap_or_else(|| "none".to_string())
+    ));
+    if let Some(pending) = background_tools_text(&response["pending_capabilities"]) {
+        text.push_str(&format!("Waiting for your approval: {pending}\n"));
+    }
+    if let Some(confirmed_at) = response["confirmed_at"].as_str() {
+        text.push_str(&format!(
+            "Last approved: {}\n",
+            terminal_safe_text(confirmed_at)
+        ));
+    }
+    if let Some(message) = response["message"].as_str() {
+        text.push_str(&format!("Note: {}\n", terminal_safe_text(message)));
+    }
+    if let Some(link) = response["approval_url"].as_str() {
+        let label = if turned_off {
+            "To turn them on again, approve in your browser"
+        } else {
+            "Approve in your browser"
+        };
+        text.push_str(&format!("{label}: {}\n", terminal_safe_text(link)));
+    }
+    text
 }
 
 const JOINED_COMMUNITIES_PATH: &str = "/v1/buzz/joined-communities/list";
@@ -10815,6 +11263,357 @@ mod tests {
             );
             assert!(control_plane.finish().is_empty());
         }
+    }
+
+    fn background_process(
+        kgoose: &ProcessServer,
+        args: &[&str],
+        credential: &str,
+    ) -> std::process::Output {
+        let control_plane = ProcessServer::start(vec![]);
+        let output = process_command(kgoose, &control_plane, args, credential)
+            .output()
+            .expect("run background process");
+        assert!(control_plane.finish().is_empty());
+        output
+    }
+
+    fn background_body(state: &str, extra: Value) -> Value {
+        let mut body = json!({
+            "state": state,
+            "solePublisher": true,
+            "ready": state == "active",
+            "restarting": false,
+            "capabilities": [],
+            "pendingCapabilities": [],
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body
+    }
+
+    #[test]
+    fn bl_apps_background_status_prints_the_approval_link_for_the_owner_to_open() {
+        let credential = "apps-e2e-only.background-status.session";
+        let link = "https://block.builderlab.xyz/api/goose/v1/hosted-apps/my%20app/background-access/approve";
+        let body = background_body(
+            "not_granted",
+            json!({
+                "pendingCapabilities": [{"extension": "jira", "access": "read"}],
+                "approvalUrl": link,
+            }),
+        );
+        for json_output in [false, true] {
+            let kgoose = ProcessServer::start(vec![ProcessResponse::json(body.clone())]);
+            let mut args = vec!["apps", "background", "status", "my app"];
+            if json_output {
+                args.push("--json");
+            }
+            let output = background_process(&kgoose, &args, credential);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = process_stdout(&output);
+            if json_output {
+                let got: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(got["ok"], true);
+                assert_eq!(got["app_id"], "my app");
+                assert_eq!(got["state"], "not_granted");
+                assert_eq!(got["sole_publisher"], true);
+                assert_eq!(got["ready"], false);
+                assert_eq!(got["pending_capabilities"][0]["extension"], "jira");
+                assert_eq!(got["approval_url"], link);
+            } else {
+                assert_eq!(
+                    stdout,
+                    format!(
+                        "Background tool calls for my app: off (never approved)\n\
+                         Only you can publish it: yes\n\
+                         Ready: no\n\
+                         Approved tools: none\n\
+                         Waiting for your approval: jira (read)\n\
+                         Approve in your browser: {link}"
+                    )
+                );
+            }
+            let requests = kgoose.finish();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(
+                requests[0].path,
+                "/api/goose/v1/hosted-apps/my%20app/background-access"
+            );
+            assert_eq!(
+                requests[0]
+                    .headers
+                    .get("x-bb-session-credential")
+                    .map(String::as_str),
+                Some(credential)
+            );
+        }
+    }
+
+    #[test]
+    fn bl_apps_background_status_without_a_link_when_active_and_ready() {
+        let credential = "apps-e2e-only.background-active.session";
+        let body = background_body(
+            "active",
+            json!({
+                "capabilities": [
+                    {"extension": "jira", "access": "read"},
+                    {"extension": "slack", "access": "read"}
+                ],
+                "confirmedAt": "2026-11-20T10:00:00Z",
+            }),
+        );
+        let kgoose = ProcessServer::start(vec![ProcessResponse::json(body)]);
+        let output = background_process(
+            &kgoose,
+            &["apps", "background", "status", "demo"],
+            credential,
+        );
+        assert!(output.status.success());
+        let stdout = process_stdout(&output);
+        assert_eq!(
+            stdout,
+            "Background tool calls for demo: on\n\
+             Only you can publish it: yes\n\
+             Ready: yes\n\
+             Approved tools: jira (read), slack (read)\n\
+             Last approved: 2026-11-20T10:00:00Z"
+        );
+        assert!(!stdout.contains("Approve in your browser"));
+        assert_eq!(kgoose.finish().len(), 1);
+    }
+
+    #[test]
+    fn bl_apps_background_off_revokes_and_confirms_the_new_state() {
+        let credential = "apps-e2e-only.background-off.session";
+        let link =
+            "https://block.builderlab.xyz/api/goose/v1/hosted-apps/demo/background-access/approve";
+        let body = background_body("revoked", json!({"approvalUrl": link}));
+        for json_output in [false, true] {
+            let kgoose = ProcessServer::start(vec![ProcessResponse::json(body.clone())]);
+            let mut args = vec!["apps", "background", "off", "demo"];
+            if json_output {
+                args.push("--json");
+            }
+            let output = background_process(&kgoose, &args, credential);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = process_stdout(&output);
+            if json_output {
+                let got: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(got["state"], "revoked");
+                assert_eq!(got["app_id"], "demo");
+            } else {
+                assert!(
+                    stdout.starts_with(
+                        "Turned off background tool calls for demo.\n\
+                         Background tool calls for demo: off (turned off)\n"
+                    ),
+                    "{stdout}"
+                );
+                // The link is for turning them back on, never a next step here.
+                assert!(!stdout.contains("\nApprove in your browser"), "{stdout}");
+                assert!(stdout.contains(&format!(
+                    "To turn them on again, approve in your browser: {link}"
+                )));
+            }
+            let requests = kgoose.finish();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, "DELETE");
+            assert_eq!(
+                requests[0].path,
+                "/api/goose/v1/hosted-apps/demo/background-access"
+            );
+        }
+    }
+
+    #[test]
+    fn bl_apps_background_off_fails_when_the_app_still_reports_active() {
+        let credential = "apps-e2e-only.background-still-active.session";
+        let kgoose = ProcessServer::start(vec![ProcessResponse::json(background_body(
+            "active",
+            json!({}),
+        ))]);
+        let output = background_process(
+            &kgoose,
+            &["apps", "background", "off", "demo", "--json"],
+            credential,
+        );
+        assert_eq!(output.status.code(), Some(exit_codes::GENERAL));
+        assert_eq!(
+            process_error(&output)["error"]["code"],
+            "background_off_not_confirmed"
+        );
+        assert_eq!(kgoose.finish().len(), 1);
+    }
+
+    #[test]
+    fn bl_apps_background_disabled_says_it_is_not_available_here() {
+        let credential = "apps-e2e-only.background-disabled.session";
+        for args in [
+            ["apps", "background", "status", "demo"],
+            ["apps", "background", "off", "demo"],
+        ] {
+            let kgoose = ProcessServer::start(vec![ProcessResponse::json_status(
+                409,
+                json!({
+                    "errorCode": "background_disabled",
+                    "message": "private upstream detail"
+                }),
+            )]);
+            let mut args = args.to_vec();
+            args.push("--json");
+            let output = background_process(&kgoose, &args, credential);
+            assert_eq!(output.status.code(), Some(exit_codes::GENERAL));
+            let error = process_error(&output);
+            assert_eq!(error["error"]["code"], "background_disabled");
+            assert!(error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Background tool calls aren't available in this environment."));
+            assert!(!error.to_string().contains("private upstream detail"));
+            kgoose.finish();
+        }
+    }
+
+    #[test]
+    fn bl_apps_background_unauthenticated_asks_for_login() {
+        let credential = "apps-e2e-only.background-401.session";
+        let kgoose = ProcessServer::start(vec![ProcessResponse::raw(401, "")]);
+        let output = background_process(
+            &kgoose,
+            &["apps", "background", "status", "demo", "--json"],
+            credential,
+        );
+        assert_eq!(output.status.code(), Some(exit_codes::AUTH_REQUIRED));
+        assert_eq!(process_error(&output)["error"]["code"], "auth_required");
+        assert_eq!(kgoose.finish().len(), 1);
+    }
+
+    #[test]
+    fn bl_apps_background_without_a_stored_session_asks_for_login_before_any_request() {
+        // The Blox variant of the process helper has no login or org, so
+        // the command stops on the org check without contacting Kgoose.
+        let kgoose = ProcessServer::start(vec![]);
+        let control_plane = ProcessServer::start(vec![]);
+        let output = process_command(
+            &kgoose,
+            &control_plane,
+            &["apps", "background", "status", "demo", "--json"],
+            "apps-e2e-only.unused",
+        )
+        .env("BL_APPS_E2E_PROXY", "true")
+        .output()
+        .expect("run background process");
+        assert_eq!(output.status.code(), Some(exit_codes::AUTH_REQUIRED));
+        assert!(kgoose.finish().is_empty());
+        assert!(control_plane.finish().is_empty());
+    }
+
+    #[test]
+    fn background_access_errors_map_to_exit_codes_and_never_print_server_text() {
+        for (status, body, code, exit_code, explanation) in [
+            (
+                StatusCode::FORBIDDEN,
+                json!({"errorCode":"not_owner","message":"private upstream detail"}).to_string(),
+                "not_owner",
+                exit_codes::FORBIDDEN,
+                "Only the app's owner",
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                json!({"errorCode":"app_unavailable"}).to_string(),
+                "app_unavailable",
+                exit_codes::GENERAL,
+                "No app demo is available",
+            ),
+            (
+                StatusCode::CONFLICT,
+                json!({"errorCode":"sandbox_unavailable"}).to_string(),
+                "sandbox_unavailable",
+                exit_codes::GENERAL,
+                "only work for process runtime apps",
+            ),
+            (
+                StatusCode::CONFLICT,
+                json!({"errorCode":"other_publishers","message":"private upstream detail"})
+                    .to_string(),
+                "other_publishers",
+                exit_codes::GENERAL,
+                "Other publishers can still deploy",
+            ),
+            (
+                StatusCode::CONFLICT,
+                json!({"errorCode":"rollout_pending"}).to_string(),
+                "rollout_pending",
+                exit_codes::GENERAL,
+                "still in progress",
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"errorCode":"unavailable","message":"private upstream detail"}).to_string(),
+                "unavailable",
+                exit_codes::NETWORK,
+                "Retrying is safe",
+            ),
+            (
+                StatusCode::BAD_GATEWAY,
+                "<html>private upstream detail</html>".to_string(),
+                "background_access_failed",
+                exit_codes::NETWORK,
+                "didn't return a usable",
+            ),
+            // A login or proxy page that answers 200 must not read as a state.
+            (
+                StatusCode::OK,
+                "<html>private upstream detail</html>".to_string(),
+                "background_access_invalid_response",
+                exit_codes::GENERAL,
+                "didn't return a usable",
+            ),
+        ] {
+            let error = background_access_response("demo", status, &body).unwrap_err();
+            let (exit, payload) = failure_info(&error);
+            assert_eq!(exit, exit_code, "{body}");
+            assert_eq!(payload["error"]["code"], code, "{body}");
+            let message = payload["error"]["message"].as_str().unwrap();
+            assert!(message.contains(explanation), "{message}");
+            assert!(payload["next_action"].is_string(), "{payload}");
+            assert!(!payload.to_string().contains("private upstream detail"));
+        }
+        let error = background_access_response("demo", StatusCode::UNAUTHORIZED, "").unwrap_err();
+        assert_eq!(failure_info(&error).0, exit_codes::AUTH_REQUIRED);
+    }
+
+    #[test]
+    fn background_access_response_normalizes_and_drops_unsafe_links() {
+        let body = background_body(
+            "paused_other_publishers",
+            json!({
+                "solePublisher": false,
+                "message": "Calls are paused.",
+                "approvalUrl": "javascript:alert(1)",
+            }),
+        )
+        .to_string();
+        let got = background_access_response("demo", StatusCode::OK, &body).unwrap();
+        assert_eq!(got["sole_publisher"], false);
+        assert_eq!(got["message"], "Calls are paused.");
+        assert!(got["approval_url"].is_null());
+        let text = background_access_text("demo", &got, false);
+        assert!(text.contains("paused (calls wait while other publishers can deploy the app)"));
+        assert!(text.contains("Only you can publish it: no\n"));
+        assert!(text.contains("Note: Calls are paused.\n"));
+        assert!(!text.contains("Approve in your browser"));
     }
 
     #[test]
