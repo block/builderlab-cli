@@ -419,6 +419,35 @@ recipient browser acceptance. `get` performs no sharing, session switch, or depl
 If policy inspection is unavailable, the audience is reported as unknown.
 Portal deep links require the matching portal and Kgoose workspace-selection changes.
 
+### Background tool calls
+
+An app you own can use your read-only tools (for example Jira or Slack reads) when
+nobody is signed in to it, such as from a schedule. This is available only where
+the environment enables it (bb-block), and only for process runtime apps.
+
+```sh
+bl apps background status APP_ID
+bl apps background off APP_ID
+```
+
+Approval is browser-only by design. Only the app's owner can turn background tool
+calls on, and only from the approval page: `bl apps background status` prints
+`Approve in your browser: <link>` when approval is needed, and the CLI never
+approves. Turning them on makes the app owner-only, so only you can deploy it
+and calls pause while any other publisher exists. `status` shows whether you are the
+sole publisher, whether the app is ready or restarting, and which tools are
+approved or waiting for approval. `off` turns them off and confirms the new state;
+it only reduces access, so it asks for no confirmation. `--json` prints `ok`,
+`app_id`, `state`, `sole_publisher`, `ready`, `restarting`, `capabilities`,
+`pending_capabilities`, `confirmed_at`, `message` and `approval_url`.
+
+Both commands use your `bl auth login` session, with the same Kgoose settings as
+`bl apps community list`, and need no `--base-url`. Exit codes follow the other `bl`
+commands: 3 when you need to log in, 4 when you are not the app's owner, 5 for a
+network or server failure, and 1 for refusals such as `background_disabled` (not
+available in this environment), `other_publishers` or an unsupported runtime. Each
+refusal carries a `next_action`.
+
 ### App lifetime inspection and renewal
 
 When the selected control plane advertises lifetime operations, read the exact
